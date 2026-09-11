@@ -11,8 +11,11 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 import os
 from pathlib import Path
-
+from datetime import timedelta
 from dotenv import load_dotenv
+import dj_database_url
+import psycopg
+
 
 load_dotenv()
 
@@ -94,18 +97,104 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 
 
+def postgres_est_disponible():
+    """
+    Vérifie si PostgreSQL est accessible.
+    Cette vérification est utilisée uniquement en développement.
+    """
+    try:
+        with psycopg.connect(
+            dbname=os.getenv("POSTGRES_DB", "ecoscan"),
+            user=os.getenv("POSTGRES_USER", "ecoscan"),
+            password=os.getenv("POSTGRES_PASSWORD", ""),
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=os.getenv("POSTGRES_PORT", "5432"),
+            connect_timeout=2,
+        ):
+            return True
+
+    except psycopg.Error:
+        return False
 
 
-DATABASES = {
-    "default": {
-        "ENGINE": os.getenv("django.db.backends.postgresql", 'django.db.backends.sqlite3'),
-        "NAME": os.getenv("POSTGRES_DB", BASE_DIR / 'db.sqlite3'),
-        "USER": os.getenv("POSTGRES_USER", ""),
+if DEBUG:
+    choix_db_local = os.getenv(
+        "DB_BACKEND",
+        "postgresql",
+    ).lower()
+
+    fallback_sqlite = os.getenv(
+        "DB_ALLOW_SQLITE_FALLBACK",
+        "True",
+    ).lower() == "true"
+
+    configuration_postgresql = {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("POSTGRES_DB", "ecoscan"),
+        "USER": os.getenv("POSTGRES_USER", "ecoscan"),
         "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
         "HOST": os.getenv("POSTGRES_HOST", "localhost"),
         "PORT": os.getenv("POSTGRES_PORT", "5432"),
     }
-}
+
+    configuration_sqlite = {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
+    }
+
+    if choix_db_local == "sqlite":
+        DATABASES = {
+            "default": configuration_sqlite,
+        }
+
+        print(
+            "[BASE DE DONNÉES] "
+            "SQLite est utilisé volontairement."
+        )
+
+    elif fallback_sqlite and not postgres_est_disponible():
+        DATABASES = {
+            "default": configuration_sqlite,
+        }
+
+        print(
+            "[AVERTISSEMENT] PostgreSQL est indisponible."
+        )
+        print(
+            "[BASE DE DONNÉES] "
+            "Bascule automatique vers SQLite."
+        )
+
+    else:
+        DATABASES = {
+            "default": configuration_postgresql,
+        }
+
+        print(
+            "[BASE DE DONNÉES] "
+            "PostgreSQL local est utilisé."
+        )
+
+else:
+    DATABASE_URL = os.getenv("DATABASE_URL")
+
+    if not DATABASE_URL:
+        raise ValueError(
+            "DATABASE_URL doit être définie en production."
+        )
+
+    DATABASES = {
+        "default": dj_database_url.config(
+            default=DATABASE_URL,
+            conn_max_age=600,
+            ssl_require=True,
+        )
+    }
+
+    print(
+        "[BASE DE DONNÉES] "
+        "PostgreSQL Supabase est utilisé."
+    )
 
 
 
@@ -118,6 +207,9 @@ AUTH_PASSWORD_VALIDATORS = [
     },
     {
         'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+         'OPTIONS': {
+            'min_length': 8, 
+        }
     },
     {
         'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
@@ -127,6 +219,48 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+AUTH_PASSWORD_VALIDATORS = []
+LANGUAGE_CODE = "fr-fr"
+TIME_ZONE = "Africa/Dakar"
+USE_I18N = True
+USE_TZ = True
+STATIC_URL = "static/"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+AUTH_USER_MODEL = "accounts.Utilisateur"
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+    "DEFAULT_PERMISSION_CLASSES": (
+        "rest_framework.permissions.IsAuthenticated",
+    ),
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+    "ORDERING_PARAM": "ordering",
+    
+    # Activation et limitation du nombre de requêtes (Rate Limiting)
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",  # Pour les utilisateurs non connectés (Onboarding, Login)
+        "rest_framework.throttling.UserRateThrottle",  # Pour les utilisateurs connectés
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "10/minute",  # Max 10 requêtes par minute pour un anonyme / une IP
+        "user": "100/minute", # Max 100 requêtes par minute pour un membre connecté
+        "invitation_validation": "5/minute", # Limitation spécifique pour les tentatives d'activation
+    }
+}
+
+# --- Configuration de l'expiration des tokens de sécurité ---
+# Durée de validité du lien d'invitation/activation (default_token_generator)
+PASSWORD_RESET_TIMEOUT = 172800  # 48 heures exprimées en secondes (48 * 3600)
+
+# --- Configuration des durées des jetons de Session (JWT) ---
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),   # Session active de 15 minutes
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),     # Possibilité de rester connecté 7 jours
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_REVOKED_TOKENS": True,
+}
 
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/
