@@ -94,7 +94,7 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 DATABASES = {
     "default": {
