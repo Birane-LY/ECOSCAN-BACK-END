@@ -8,7 +8,6 @@ class Organisation(models.Model):
     """Représente une entité légale ou une entreprise cliente sur la plateforme."""
 
     class Statut(models.TextChoices):
-        """Statuts définissant le cycle de vie et les accès d'une organisation."""
         EN_ATTENTE = "EN_ATTENTE", "En attente"
         ACTIVE = "ACTIVE", "Active"
         SUSPENDUE = "SUSPENDUE", "Suspendue"
@@ -22,65 +21,16 @@ class Organisation(models.Model):
     statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.EN_ATTENTE)
 
     def __str__(self):
-        """Renvoie le nom de l'organisation comme représentation textuelle."""
         return self.nom
-
-
-class Permission(models.Model):
-    """Définit une autorisation atomique basée sur une ressource et une action précise."""
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    nom = models.CharField(max_length=100)
-    ressource = models.CharField(max_length=100)
-    action = models.CharField(max_length=50)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=("ressource", "action"), name="permission_ressource_action_unique"),
-        ]
-
-    def __str__(self):
-        """Renvoie le nom de la permission."""
-        return self.nom
-
-
-class Role(models.Model):
-    """Définit un profil ou un niveau d'accès au sein des organisations."""
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    nom = models.CharField(max_length=100)
-    description = models.TextField(blank=True)
-    
-    # Déclaration standardisée de la relation Many-to-Many
-    permissions_associees = models.ManyToManyField(
-        Permission,
-        through="RolePermission",
-        related_name="roles_associes"
-    )
-
-    def __str__(self):
-        """Renvoie le nom du rôle."""
-        return self.nom
-
-
-class RolePermission(models.Model):
-    """Table de liaison associant les permissions aux différents rôles."""
-
-    role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="permissions")
-    permission = models.ForeignKey(Permission, on_delete=models.CASCADE, related_name="roles")
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=("role", "permission"), name="role_permission_unique"),
-        ]
 
 
 class UtilisateurOrganisation(models.Model):
-    """Table de liaison unissant un utilisateur à une organisation.
-    
-    Le rôle applicatif et le statut d'activation restent centralisés dans 
-    le modèle Utilisateur principal pour garantir la robustesse des permissions JWT.
+    """Table de liaison unissant un utilisateur physique à une organisation.
+
+    Le rôle applicatif (Admin, Consultant, etc.) et le statut d'activation du compte
+    restent centralisés dans le modèle Utilisateur principal pour la sécurité JWT.
     """
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organisation = models.ForeignKey(Organisation, on_delete=models.CASCADE, related_name="membres")
     utilisateur = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="organisations_membres")
@@ -91,12 +41,28 @@ class UtilisateurOrganisation(models.Model):
             models.UniqueConstraint(fields=("organisation", "utilisateur"), name="utilisateur_organisation_unique"),
         ]
 
+    def __str__(self):
+        return f"{self.utilisateur.email} <-> {self.organisation.nom}"
+
+
+class Site(models.Model):
+    """Représente un établissement physique ou géographique rattaché à une organisation."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey(Organisation, on_delete=models.CASCADE, related_name="sites")
+    nom = models.CharField(max_length=150)
+    adresse = models.CharField(max_length=255)
+    pays = models.CharField(max_length=100)
+    fuseau_horaire = models.CharField(max_length=80)
+
+    def __str__(self):
+        return self.nom
+
 
 class FicheProjet(models.Model):
     """Représente une étude, un projet ou un audit mené au sein d'une organisation."""
 
     class Statut(models.TextChoices):
-        """Cycle de vie d'une fiche projet."""
         BROUILLON = "BROUILLON", "Brouillon"
         ACTIF = "ACTIF", "Actif"
         TERMINE = "TERMINE", "Terminé"
@@ -112,14 +78,15 @@ class FicheProjet(models.Model):
     perimetre_analyse = models.TextField(blank=True)
 
     def creer(self):
-        """Fait passer la fiche projet du statut brouillon au statut actif."""
         self.statut = self.Statut.ACTIF
         self.save(update_fields=("statut",))
 
     def archiver(self):
-        """Archive la fiche projet pour restreindre ses modifications futures."""
         self.statut = self.Statut.ARCHIVE
         self.save(update_fields=("statut",))
+
+    def __str__(self):
+        return self.nom
 
 
 class Activite(models.Model):
@@ -131,6 +98,9 @@ class Activite(models.Model):
     categorie = models.CharField(max_length=100)
     description = models.TextField(blank=True)
     statut = models.CharField(max_length=50)
+
+    def __str__(self):
+        return self.nom
 
 
 class Compteur(models.Model):
@@ -147,5 +117,4 @@ class Compteur(models.Model):
     derniere_synchronisation = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
-        """Renvoie la référence unique du compteur."""
         return self.reference
