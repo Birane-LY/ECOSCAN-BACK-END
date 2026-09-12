@@ -76,42 +76,20 @@ class RolePermission(models.Model):
 
 
 class UtilisateurOrganisation(models.Model):
-    """Gère l'affectation, le rôle et le statut d'un utilisateur au sein d'une organisation."""
-
-    class Statut(models.TextChoices):
-        """États de l'affiliation d'un collaborateur à une organisation."""
-        INVITE = "INVITE", "Invité"
-        ACTIF = "ACTIF", "Actif"
-        REFUSE = "REFUSE", "Refusé"
-        RETIRE = "RETIRE", "Retiré"
-
+    """Table de liaison unissant un utilisateur à une organisation.
+    
+    Le rôle applicatif et le statut d'activation restent centralisés dans 
+    le modèle Utilisateur principal pour garantir la robustesse des permissions JWT.
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organisation = models.ForeignKey(Organisation, on_delete=models.CASCADE, related_name="membres")
     utilisateur = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="organisations_membres")
-    role = models.ForeignKey(Role, on_delete=models.PROTECT, related_name="membres")
-    statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.INVITE)
-    date_invitation = models.DateTimeField(auto_now_add=True)
-    date_acceptation = models.DateTimeField(null=True, blank=True)
+    date_affiliation = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=("organisation", "utilisateur"), name="utilisateur_organisation_unique"),
         ]
-
-
-class Site(models.Model):
-    """Représente un établissement physique ou géographique rattaché à une organisation."""
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    organisation = models.ForeignKey(Organisation, on_delete=models.CASCADE, related_name="sites")
-    nom = models.CharField(max_length=150)
-    adresse = models.CharField(max_length=255)
-    pays = models.CharField(max_length=100)
-    fuseau_horaire = models.CharField(max_length=80)
-
-    def __str__(self):
-        """Renvoie le nom du site."""
-        return self.nom
 
 
 class FicheProjet(models.Model):
