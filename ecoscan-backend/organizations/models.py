@@ -19,6 +19,7 @@ class Organisation(models.Model):
     localisation = models.CharField(max_length=255)
     date_creation = models.DateTimeField(auto_now_add=True)
     statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.EN_ATTENTE)
+    defaut_paiement = models.BooleanField(default=False)
 
     def __str__(self):
         return self.nom
