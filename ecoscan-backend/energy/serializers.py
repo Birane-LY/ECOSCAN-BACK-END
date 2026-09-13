@@ -1,17 +1,16 @@
-from datetime import datetime
 from rest_framework import serializers
-from rest_framework.validators import UniqueValidator
+
 from .models import (
-    FichierSource,
-    SourceDonnee,
-    ImportDonnees,
-    FacteurEmission,
     DonneeEnergetique,
+    FacteurEmission,
+    FichierSource,
     HistoriquePerformance,
-    SyntheseFinanciere,
-    Objectif,
     Indicateur,
     IndicateurObjectif,
+    ImportDonnees,
+    Objectif,
+    SourceDonnee,
+    SyntheseFinanciere,
 )
 
 
@@ -22,6 +21,7 @@ class FichierSourceSerializer(serializers.ModelSerializer):
         model = FichierSource
         fields = (
             "id",
+            "organisation",
             "nom",
             "fichier",
             "chemin_stockage",
@@ -31,7 +31,16 @@ class FichierSourceSerializer(serializers.ModelSerializer):
             "date_depot",
             "depose_par",
         )
-        read_only_fields = ("id", "date_depot")
+        read_only_fields = (
+            "id",
+            "organisation",
+            "nom",
+            "mime_type",
+            "taille_octets",
+            "hash",
+            "date_depot",
+            "depose_par",
+        )
 
 
 class SourceDonneeSerializer(serializers.ModelSerializer):
@@ -53,7 +62,12 @@ class SourceDonneeSerializer(serializers.ModelSerializer):
 
 
 class ImportDonneesSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour le pilotage et le suivi des processus d'importation."""
+    """Sérialiseur pour le pilotage et le suivi des processus d'importation.
+
+    Inclut les champs du pipeline OCR/classification (ocr_statut, scores, données
+    extraites, rapport d'analyse) : sans eux, la réponse de l'action `lancer` ne
+    contient aucun des résultats que le pipeline vient de calculer.
+    """
 
     class Meta:
         model = ImportDonnees
@@ -71,8 +85,30 @@ class ImportDonneesSerializer(serializers.ModelSerializer):
             "score_qualite",
             "statut",
             "date_import",
+            "ocr_statut",
+            "ocr_erreur",
+            "score_lisibilite",
+            "score_pertinence",
+            "donnees_extraites",
+            "rapport_analyse",
+            "date_traitement",
         )
-        read_only_fields = ("id", "date_import")
+        # `statut` et tous les champs du pipeline ne doivent être modifiés que par
+        # ImportDonneesViewSet.lancer() / annuler_import() — jamais par un PATCH direct
+        # d'un client, qui pourrait sinon forger un import "TERMINE" sans OCR réel.
+        read_only_fields = (
+            "id",
+            "date_import",
+            "statut",
+            "score_qualite",
+            "ocr_statut",
+            "ocr_erreur",
+            "score_lisibilite",
+            "score_pertinence",
+            "donnees_extraites",
+            "rapport_analyse",
+            "date_traitement",
+        )
 
 
 class FacteurEmissionSerializer(serializers.ModelSerializer):
@@ -118,15 +154,12 @@ class DonneeEnergetiqueSerializer(serializers.ModelSerializer):
         compteur = data.get("compteur") or (self.instance.compteur if self.instance else None)
         source_donnee = data.get("source_donnee") or (self.instance.source_donnee if self.instance else None)
 
-        # 1. Validation temporelle
         if periode_debut and periode_fin and periode_fin < periode_debut:
             raise serializers.ValidationError(
                 {"periode_fin": "La date de fin de la période de consommation ne peut pas être antérieure à sa date de début."}
             )
 
-        # 2. Validation de cohérence de cloisonnement
         if compteur and source_donnee:
-            # L'organisation liée au compteur physique doit être la même que celle de la source de données
             if compteur.site.organisation != source_donnee.organisation:
                 raise serializers.ValidationError(
                     "Incohérence détectée : Le compteur et la source de données configurés doivent appartenir à la même organisation."
@@ -227,7 +260,6 @@ class IndicateurObjectifSerializer(serializers.ModelSerializer):
         list_indicateurs = data.get("indicateurs") or (list(self.instance.indicateurs.all()) if self.instance else [])
 
         if objectif and list_indicateurs:
-            # S'assure que chaque sous-indicateur pointe nativement vers le même objectif parent
             for indicateur in list_indicateurs:
                 if indicateur.objectif != objectif:
                     raise serializers.ValidationError(
