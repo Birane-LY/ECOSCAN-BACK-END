@@ -5,3 +5,6 @@ __pycache__/
 *.sqlite3
 media/
 staticfiles/
+test_upload.py
+test_ocr.py
+fichiers-sources/
