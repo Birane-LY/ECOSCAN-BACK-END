@@ -8,18 +8,29 @@ class FichierSource(models.Model):
     """Enregistre les métadonnées et le fichier physique téléversé pour l'analyse énergétique."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey(
+        "organizations.Organisation",
+        on_delete=models.CASCADE,
+        related_name="fichiers_sources",
+    )
     nom = models.CharField(max_length=255)
     fichier = models.FileField(upload_to="fichiers-sources/%Y/%m/%d/")
     chemin_stockage = models.CharField(max_length=500, blank=True)
     mime_type = models.CharField(max_length=120)
     taille_octets = models.PositiveBigIntegerField(default=0)
-    hash = models.CharField(max_length=128, unique=True)
+    hash = models.CharField(max_length=128)
+    texte_brut_cache = models.TextField(blank=True, default="")
     date_depot = models.DateTimeField(auto_now_add=True)
     depose_par = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="fichiers_sources_deposes",
     )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("hash", "organisation"), name="fichier_source_hash_organisation_unique"),
+        ]
 
     def __str__(self):
         return self.nom
@@ -51,6 +62,9 @@ class ImportDonnees(models.Model):
     class Statut(models.TextChoices):
         EN_ATTENTE = "EN_ATTENTE", "En attente"
         EN_COURS = "EN_COURS", "En cours"
+        HORS_PERIMETRE = "HORS_PERIMETRE", "Hors périmètre"
+        REVUE_REQUISE = "REVUE_REQUISE", "Revue requise"
+        INCOHERENT = "INCOHERENT", "Incohérent"
         TERMINE = "TERMINE", "Terminé"
         ECHOUE = "ECHOUE", "Échoué"
         ANNULE = "ANNULE", "Annulé"
@@ -86,6 +100,13 @@ class ImportDonnees(models.Model):
     score_qualite = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.EN_ATTENTE)
     date_import = models.DateTimeField(auto_now_add=True)
+    ocr_statut = models.CharField(max_length=30, blank=True, default="")
+    ocr_erreur = models.TextField(blank=True, default="")
+    score_lisibilite = models.DecimalField(max_digits=5, decimal_places=4, null=True, blank=True)
+    score_pertinence = models.DecimalField(max_digits=5, decimal_places=4, null=True, blank=True)
+    donnees_extraites = models.JSONField(default=dict, blank=True)
+    rapport_analyse = models.JSONField(default=dict, blank=True)
+    date_traitement = models.DateTimeField(null=True, blank=True)
 
     def lancer_import(self):
         """Déclenche le passage de l'import à l'état en cours de traitement."""
@@ -262,4 +283,5 @@ class IndicateurObjectif(models.Model):
     valeur_actuelle = models.DecimalField(max_digits=18, decimal_places=6)
     progression = models.DecimalField(max_digits=8, decimal_places=2)
 
-    def str(self):return self.nom
+    def __str__(self):
+        return self.nom
