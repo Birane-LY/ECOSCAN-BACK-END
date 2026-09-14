@@ -82,6 +82,14 @@ class Action(models.Model):
     date_echeance = models.DateTimeField(null=True, blank=True)
     date_realisation = models.DateTimeField(null=True, blank=True)
 
+    # Mesure d'impact réel (impact_service.py) — distincts de
+    # Recommandation.economie_estimee, qui reste la prévision AVANT exécution.
+    # Restent à None tant qu'aucune mesure n'a été faite : ne jamais les
+    # confondre avec "aucun impact".
+    economie_realisee_fcfa = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    taux_realisation_impact = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    date_mesure_impact = models.DateTimeField(null=True, blank=True)
+
     def suivre(self):
         """Passe l'étape opérationnelle en cours de traitement sur le terrain."""
         self.statut = self.Statut.EN_COURS
@@ -214,3 +222,175 @@ class ResultatMetrique(models.Model):
 
     def __str__(self):
         return f"{self.code_metrique} ({self.organisation_id}) : {self.valeur} {self.unite}"
+
+
+class ObservationOperationnelle(models.Model):
+    """Note de terrain (redémarrage de machines, panne, événement exceptionnel...)
+    associée à une organisation et un créneau — c'est le "contexte" que
+    context_service.py rapproche des anomalies détectées.
+
+    `valide` est délibérément séparé de la création : une observation n'entre
+    dans le contexte fourni à l'IA (hypothesis_service.py) qu'une fois confirmée
+    par un humain, jamais une note brute non vérifiée.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey("organizations.Organisation", on_delete=models.CASCADE, related_name="observations")
+    auteur = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="observations_creees")
+    texte = models.TextField()
+    date_observation = models.DateTimeField()
+    creneau = models.CharField(max_length=10, blank=True)
+    valide = models.BooleanField(default=False)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_observation",)
+
+    def __str__(self):
+        return f"{self.date_observation:%Y-%m-%d %H:%M} — {self.texte[:60]}"
+
+
+class Anomalie(models.Model):
+    """Écart statistique détecté sur une métrique — PAS une cause, PAS une erreur
+    confirmée. Les seuils (10/20/40 %) viennent du document de justification
+    partagé pour ce projet ; ils sont un point de départ, pas calibrés par
+    organisation (voir anomaly_service.py)."""
+
+    class Severite(models.TextChoices):
+        SURVEILLANCE = "SURVEILLANCE", "Surveillance"
+        ALERTE = "ALERTE", "Alerte"
+        INVESTIGATION_PRIORITAIRE = "INVESTIGATION_PRIORITAIRE", "Investigation prioritaire"
+
+    class Statut(models.TextChoices):
+        DETECTED = "DETECTED", "Détectée"
+        NEEDS_CONTEXT = "NEEDS_CONTEXT", "Contexte requis"
+        CONFIRMED = "CONFIRMED", "Confirmée"
+        DISMISSED = "DISMISSED", "Écartée"
+        ACTION_CREATED = "ACTION_CREATED", "Action créée"
+        RESOLVED = "RESOLVED", "Résolue"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey("organizations.Organisation", on_delete=models.CASCADE, related_name="anomalies")
+    resultat_metrique = models.ForeignKey(
+        ResultatMetrique, on_delete=models.SET_NULL, null=True, blank=True, related_name="anomalies"
+    )
+    type = models.CharField(max_length=50)
+    severite = models.CharField(max_length=30, choices=Severite.choices)
+    valeur_observee = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
+    valeur_attendue = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
+    ecart_pourcentage = models.DecimalField(max_digits=8, decimal_places=2)
+    statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.DETECTED)
+    date_detection = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_detection",)
+
+    def __str__(self):
+        return f"{self.type} ({self.severite}) — {self.ecart_pourcentage}%"
+
+
+class Hypothese(models.Model):
+    """Cause PROBABLE générée par l'IA à partir d'une anomalie + son contexte —
+    jamais présentée comme confirmée tant qu'un humain ne l'a pas validée.
+
+    `confiance` reste NULL tant qu'aucune estimation fiable n'existe : on
+    n'extrait pas un chiffre de confiance depuis du texte libre généré par LLM
+    (peu fiable), donc ce champ est rempli par un humain qui évalue l'hypothèse,
+    pas automatiquement par hypothesis_service.py.
+    """
+
+    class Statut(models.TextChoices):
+        PROPOSEE = "PROPOSEE", "Proposée"
+        CONFIRMEE = "CONFIRMEE", "Confirmée"
+        REJETEE = "REJETEE", "Rejetée"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    anomalie = models.ForeignKey(Anomalie, on_delete=models.CASCADE, related_name="hypotheses")
+    texte = models.TextField()
+    preuves = models.JSONField(default=list, blank=True)
+    confiance = models.DecimalField(max_digits=5, decimal_places=4, null=True, blank=True)
+    statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.PROPOSEE)
+    genere_par_ia = models.BooleanField(default=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_creation",)
+
+    def __str__(self):
+        return self.texte[:80]
+
+
+class MemoireStrategique(models.Model):
+    """Diagnostic complet et vérifié : signal -> hypothèse -> action -> résultat.
+    C'est cette table, pas les tables individuelles, qui est poussée vers le RAG
+    (voir memory_service.py et ai_client.py) : elle seule contient une histoire
+    complète et vérifiée, pas juste un fragment isolé."""
+
+    class Statut(models.TextChoices):
+        A_VERIFIER = "A_VERIFIER", "À vérifier"
+        PARTIELLEMENT_CONFIRMEE = "PARTIELLEMENT_CONFIRMEE", "Partiellement confirmée"
+        CONFIRMEE = "CONFIRMEE", "Confirmée"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey("organizations.Organisation", on_delete=models.CASCADE, related_name="memoires_strategiques")
+    anomalie = models.ForeignKey(Anomalie, on_delete=models.SET_NULL, null=True, blank=True, related_name="memoires")
+    action = models.ForeignKey(Action, on_delete=models.SET_NULL, null=True, blank=True, related_name="memoires")
+    titre = models.CharField(max_length=180)
+    signal_initial = models.TextField()
+    hypothese_texte = models.TextField(blank=True)
+    action_texte = models.TextField(blank=True)
+    impact_attendu_fcfa = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    impact_mesure_fcfa = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    taux_realisation = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    statut = models.CharField(max_length=30, choices=Statut.choices, default=Statut.A_VERIFIER)
+    sources = models.JSONField(default=list, blank=True)
+    # Traçabilité de la publication vers le RAG — permet de savoir si cette
+    # mémoire est déjà indexée sans requêter le service FastAPI à chaque fois.
+    indexee_rag = models.BooleanField(default=False)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_creation",)
+
+    def __str__(self):
+        return self.titre
+
+
+class DocumentEntreprise(models.Model):
+    """Document propre à l'organisation (politique interne, rapport, note de
+    méthodologie, dossier de subvention...) — distinct du pipeline de factures
+    Senelec (app energy). Alimente le RAG au même titre que les mémoires
+    stratégiques, mais seulement une fois `valide=True` : un document déposé
+    n'est jamais indexé automatiquement sans confirmation humaine.
+    """
+
+    class Type(models.TextChoices):
+        POLITIQUE = "POLITIQUE", "Politique interne"
+        RAPPORT = "RAPPORT", "Rapport"
+        METHODOLOGIE = "METHODOLOGIE", "Méthodologie"
+        SUBVENTION = "SUBVENTION", "Dossier de subvention"
+        AUTRE = "AUTRE", "Autre"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey("organizations.Organisation", on_delete=models.CASCADE, related_name="documents_entreprise")
+    depose_par = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_entreprise_deposes")
+    titre = models.CharField(max_length=180)
+    type = models.CharField(max_length=20, choices=Type.choices, default=Type.AUTRE)
+    contenu_texte = models.TextField()
+    valide = models.BooleanField(default=False)
+    valide_par = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_entreprise_valides")
+    date_validation = models.DateTimeField(null=True, blank=True)
+    indexe_rag = models.BooleanField(default=False)
+    date_depot = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_depot",)
+
+    def valider(self, utilisateur):
+        self.valide = True
+        self.valide_par = utilisateur
+        self.date_validation = timezone.now()
+        self.save(update_fields=("valide", "valide_par", "date_validation"))
+
+    def __str__(self):
+        return self.titre
