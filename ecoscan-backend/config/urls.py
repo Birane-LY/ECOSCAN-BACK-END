@@ -7,5 +7,6 @@ urlpatterns = [
     
     # Inclusion des routes de notre application d'authentification et de membres
     path('api/', include('accounts.urls')),
+    path('api/organisations/', include('organizations.urls')), 
 ]
 
