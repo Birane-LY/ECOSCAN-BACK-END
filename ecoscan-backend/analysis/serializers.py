@@ -1,6 +1,9 @@
 from django.utils import timezone
 from rest_framework import serializers
-from .models import Recommandation, Action, Decision, Livrable, ResultatMetrique
+from .models import (
+    Recommandation, Action, Decision, Livrable, ResultatMetrique,
+    ObservationOperationnelle, Anomalie, Hypothese, MemoireStrategique, DocumentEntreprise,
+)
 
 
 class RecommandationSerializer(serializers.ModelSerializer):
@@ -88,3 +91,57 @@ class ResultatMetriqueSerializer(serializers.ModelSerializer):
                 {"periode_debut": "Cohérence temporelle invalide : la date de début doit être strictement antérieure à la date de fin."}
             )
         return attrs
+
+
+class ObservationOperationnelleSerializer(serializers.ModelSerializer):
+    """Le contenu (texte, date, créneau) est libre à la saisie, mais `valide` est
+    verrouillé : seule une action dédiée (voir ObservationOperationnelleViewSet)
+    doit pouvoir faire passer une observation à `valide=True`, jamais un simple
+    PATCH — sinon n'importe quel auteur pourrait auto-valider sa propre note."""
+
+    class Meta:
+        model = ObservationOperationnelle
+        fields = ("id", "organisation", "auteur", "texte", "date_observation", "creneau", "valide", "date_creation")
+        read_only_fields = ("id", "auteur", "valide", "date_creation")
+
+
+class AnomalieSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Anomalie
+        fields = (
+            "id", "organisation", "resultat_metrique", "type", "severite",
+            "valeur_observee", "valeur_attendue", "ecart_pourcentage", "statut", "date_detection",
+        )
+        read_only_fields = fields  # créées uniquement par anomaly_service, jamais via l'API
+
+
+class HypotheseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Hypothese
+        fields = ("id", "anomalie", "texte", "preuves", "confiance", "statut", "genere_par_ia", "date_creation")
+        # `statut` et `confiance` ne changent que via confirmer/rejeter (voir
+        # HypotheseViewSet) — jamais par PATCH direct, pour garder une trace
+        # explicite de QUI a confirmé une hypothèse et QUAND (dans le journal
+        # d'audit), pas juste un champ modifié silencieusement.
+        read_only_fields = ("id", "texte", "preuves", "genere_par_ia", "date_creation", "statut", "confiance")
+
+
+class MemoireStrategiqueSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MemoireStrategique
+        fields = (
+            "id", "organisation", "anomalie", "action", "titre", "signal_initial",
+            "hypothese_texte", "action_texte", "impact_attendu_fcfa", "impact_mesure_fcfa",
+            "taux_realisation", "statut", "sources", "indexee_rag", "date_creation",
+        )
+        read_only_fields = fields  # créées uniquement par memory_service
+
+
+class DocumentEntrepriseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DocumentEntreprise
+        fields = (
+            "id", "organisation", "depose_par", "titre", "type", "contenu_texte",
+            "valide", "valide_par", "date_validation", "indexe_rag", "date_depot",
+        )
+        read_only_fields = ("id", "depose_par", "valide", "valide_par", "date_validation", "indexe_rag", "date_depot")
