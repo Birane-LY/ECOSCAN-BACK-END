@@ -17,7 +17,7 @@ class ActionAdmin(admin.ModelAdmin):
     """Configuration du suivi opérationnel des plans d'actions de transition."""
 
     list_display = ("titre", "recommandation", "statut", "responsable", "date_echeance", "date_realisation")
-    list_filter = ("statut", "recommandation__objective__organisation" if hasattr(Action, "recommandation") else "statut",)
+    list_filter = ("statut", "recommandation__objectif__organisation" if hasattr(Action, "recommandation") else "statut",)
     search_fields = ("titre", "description", "responsable__email")
     ordering = ("-date_echeance",)
 
