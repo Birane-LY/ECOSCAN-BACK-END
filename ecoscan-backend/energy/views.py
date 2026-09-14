@@ -1,6 +1,5 @@
 import hashlib
 import logging
-import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -54,7 +53,7 @@ MIME_AUTORISES = [
 ]
 
 
-# --- PERMISSIONS & BASE VIEWSETS ( ZERO-TRUST) ---
+# --- PERMISSIONS & BASE VIEWSETS (ZERO-TRUST) ---
 
 class EstAutoriseAuxDonneesEnergy(permissions.BasePermission):
     """Permission Zero-Trust appliquant le cloisonnement multi-tenant strict."""
@@ -99,7 +98,7 @@ class EnergieScopedViewSet(viewsets.ModelViewSet):
         return queryset.filter(**{f"{self.organisation_lookup}__in": organisations})
 
 
-# --- GATE 1 : RÉCEPTION ET PRÉSERVATION DU FICHIER BRUT  ---
+# --- GATE 1 : RÉCEPTION ET PRÉSERVATION DU FICHIER BRUT ---
 
 class FichierSourceViewSet(EnergieScopedViewSet):
     """GATE 1 : Enregistrement du fichier original, calcul SHA-256 et déduplication par tenant."""
@@ -179,7 +178,7 @@ class FichierSourceViewSet(EnergieScopedViewSet):
             )
 
 
-# --- GATE 2 : PIPELINE DE QUALIFICATION, CLASSIFICATION ET VALIDATION  ---
+# --- GATE 2 : PIPELINE DE QUALIFICATION, CLASSIFICATION ET VALIDATION ---
 
 class ImportDonneesViewSet(EnergieScopedViewSet):
     """GATE 2 : Pipeline d'extraction OCR, classification et contrôle de cohérence métier."""
@@ -230,10 +229,11 @@ class ImportDonneesViewSet(EnergieScopedViewSet):
         }
 
     def _echouer(self, import_instance: ImportDonnees, message: str) -> Response:
-        import_instance.statut = ImportDonnees.Statut.ECHOUE
-        import_instance.ocr_statut = "ECHOUE"
-        import_instance.ocr_erreur = message
-        import_instance.save()
+        with transaction.atomic():
+            import_instance.statut = ImportDonnees.Statut.ECHOUE
+            import_instance.ocr_statut = "ECHOUE"
+            import_instance.ocr_erreur = message
+            import_instance.save()
 
         return Response(
             {"erreur": f"Échec critique lors du traitement OCR : {message}"},
@@ -259,10 +259,11 @@ class ImportDonneesViewSet(EnergieScopedViewSet):
             texte_extrait = ocr.traiter_import(import_instance)
 
             if not texte_extrait or not texte_extrait.strip():
-                import_instance.statut = ImportDonnees.Statut.ECHOUE
-                import_instance.ocr_statut = "ECHOUE"
-                import_instance.ocr_erreur = "Aucun texte exploitable n'a été restitué par l'OCR."
-                import_instance.save()
+                with transaction.atomic():
+                    import_instance.statut = ImportDonnees.Statut.ECHOUE
+                    import_instance.ocr_statut = "ECHOUE"
+                    import_instance.ocr_erreur = "Aucun texte exploitable n'a été restitué par l'OCR."
+                    import_instance.save()
                 return Response(
                     self.get_serializer(import_instance).data,
                     status=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -271,25 +272,31 @@ class ImportDonneesViewSet(EnergieScopedViewSet):
             # Calculs analytiques
             score_lisibilite = ocr.calculer_score_lisibilite(texte_extrait)
             classification = ocr.classifier_document(texte_extrait)
+            pertinence = ocr.calculer_pertinence_energetique(texte_extrait)
 
             import_instance.score_lisibilite = score_lisibilite
-            import_instance.score_pertinence = classification.get("relevance_score", 0.0)
+            import_instance.score_pertinence = pertinence.get("score", classification.get("relevance_score", 0.0))
             type_doc = classification.get("type")
 
             # Condition 1 : Rejet si hors périmètre
             if type_doc == "DOCUMENT_NON_ENERGETIQUE":
-                import_instance.statut = ImportDonnees.Statut.HORS_PERIMETRE
-                import_instance.ocr_statut = "REJETE"
-                import_instance.rapport_analyse = {
-                    "classification": classification,
-                    "lisibilite": score_lisibilite,
-                }
-                import_instance.save()
+                with transaction.atomic():
+                    import_instance.statut = ImportDonnees.Statut.HORS_PERIMETRE
+                    import_instance.ocr_statut = "REJETE"
+                    import_instance.rapport_analyse = {
+                        "classification": classification,
+                        "pertinence": pertinence,
+                        "lisibilite": score_lisibilite,
+                    }
+                    import_instance.save()
                 return Response(
                     {
                         "statut": ImportDonnees.Statut.HORS_PERIMETRE,
                         "message": "Le document téléversé ne contient pas de données énergétiques valides.",
-                        "details": {"classification": classification},
+                        "details": {
+                            "classification": classification,
+                            "pertinence": pertinence,
+                        },
                     },
                     status=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 )
@@ -297,15 +304,17 @@ class ImportDonneesViewSet(EnergieScopedViewSet):
             # Condition 2 : Zone d'incertitude
             if type_doc == "DOCUMENT_ENERGETIQUE_A_REVOIR":
                 champs_provisoires = ocr.extraire_champs_energetiques(texte_extrait, type_document=type_doc)
-                import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
-                import_instance.ocr_statut = "A_VALIDER"
-                import_instance.donnees_extraites = champs_provisoires
-                import_instance.rapport_analyse = {
-                    "motif": "classification_incertaine",
-                    "classification": classification,
-                    "lisibilite": score_lisibilite,
-                }
-                import_instance.save()
+                with transaction.atomic():
+                    import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
+                    import_instance.ocr_statut = "A_VALIDER"
+                    import_instance.donnees_extraites = champs_provisoires
+                    import_instance.rapport_analyse = {
+                        "motif": "classification_incertaine",
+                        "classification": classification,
+                        "pertinence": pertinence,
+                        "lisibilite": score_lisibilite,
+                    }
+                    import_instance.save()
                 return Response(
                     self.get_serializer(import_instance).data,
                     status=status.HTTP_202_ACCEPTED,
@@ -317,39 +326,61 @@ class ImportDonneesViewSet(EnergieScopedViewSet):
 
             if not validation["valide"]:
                 codes_incoherents = {"INDEX_INCOHERENT", "CONTINUITE_ROMPUE"}
-                statut_cible = (
-                    ImportDonnees.Statut.INCOHERENT
-                    if any(e.get("code") in codes_incoherents for e in validation["erreurs"])
-                    else ImportDonnees.Statut.REVUE_REQUISE
-                )
-                import_instance.statut = statut_cible
-                import_instance.ocr_statut = "A_VALIDER"
-                import_instance.donnees_extraites = champs
-                import_instance.rapport_analyse = {
-                    "erreurs_validation": validation["erreurs"],
-                    "avertissements": validation["warnings"],
-                    "lisibilite": score_lisibilite,
-                    "classification": classification,
-                }
-                import_instance.save()
+                with transaction.atomic():
+                    statut_cible = (
+                        ImportDonnees.Statut.INCOHERENT
+                        if any(e.get("code") in codes_incoherents for e in validation["erreurs"])
+                        else ImportDonnees.Statut.REVUE_REQUISE
+                    )
+                    import_instance.statut = statut_cible
+                    import_instance.ocr_statut = "A_VALIDER"
+                    import_instance.donnees_extraites = champs
+                    import_instance.rapport_analyse = {
+                        "erreurs_validation": validation["erreurs"],
+                        "avertissements": validation["warnings"],
+                        "lisibilite": score_lisibilite,
+                        "pertinence": pertinence,
+                        "classification": classification,
+                    }
+                    import_instance.save()
                 return Response(
                     self.get_serializer(import_instance).data,
                     status=status.HTTP_202_ACCEPTED,
                 )
 
             # Condition 4 : Publication
-            import_instance.statut = ImportDonnees.Statut.TERMINE
-            import_instance.ocr_statut = "TERMINE"
-            import_instance.donnees_extraites = champs
-            import_instance.score_qualite = round(
-                (score_lisibilite * 0.4 + import_instance.score_pertinence * 0.6) * 100, 2
-            )
-            import_instance.rapport_analyse = {
-                "avertissements": validation["warnings"],
-                "classification": classification,
-            }
-            import_instance.date_traitement = timezone.now()
-            import_instance.save()
+            with transaction.atomic():
+                import_instance.statut = ImportDonnees.Statut.TERMINE
+                import_instance.ocr_statut = "TERMINE"
+                import_instance.donnees_extraites = champs
+                import_instance.score_qualite = round(
+                    (score_lisibilite * 0.4 + import_instance.score_pertinence * 0.6) * 100, 2
+                )
+                import_instance.rapport_analyse = {
+                    "avertissements": validation["warnings"],
+                    "classification": classification,
+                }
+                import_instance.date_traitement = timezone.now()
+                import_instance.save()
+
+            try:
+                from analysis.services import publier_import_termine
+                resultat_publication = publier_import_termine(import_instance)
+                if resultat_publication.statut == "review_required":
+                    logger.warning(
+                        "Import %s terminé mais publication en revue : %s",
+                        import_instance.id, resultat_publication.details,
+                    )
+                elif resultat_publication.statut == "erreur":
+                    logger.error(
+                        "Import %s terminé mais publication échouée : %s",
+                        import_instance.id, resultat_publication.details,
+                    )
+            except Exception:
+                logger.exception(
+                    "Erreur inattendue lors de la publication automatique de l'import %s vers analysis",
+                    import_instance.id,
+                )
 
             return Response(
                 self.get_serializer(import_instance).data,
@@ -425,3 +456,4 @@ class IndicateurObjectifViewSet(EnergieScopedViewSet):
     )
     serializer_class = IndicateurObjectifSerializer
     organisation_lookup = "objectif__organisation"
+
