@@ -12,5 +12,6 @@ urlpatterns = [
         "api/energies/",
         include("energy.urls", namespace="energy"),
     ),
+    path('api/analyses/', include('analysis.urls')),
 ]
 
