@@ -1,6 +1,8 @@
-from rest_framework import viewsets, permissions
+from django.db import transaction
+from rest_framework import viewsets, permissions, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from .models import (
     Organisation,
     UtilisateurOrganisation,
@@ -8,6 +10,7 @@ from .models import (
     FicheProjet,
     Activite,
     Compteur,
+    ConfigurationSecurite,
 )
 from .serializers import (
     OrganisationSerializer,
@@ -16,6 +19,7 @@ from .serializers import (
     FicheProjetSerializer,
     ActiviteSerializer,
     CompteurSerializer,
+    ConfigurationSecuriteSerializer,
 )
 
 
@@ -50,6 +54,30 @@ class EstMembreDeLOrganisation(permissions.BasePermission):
         ).exists()
 
 
+class PeutGererOrganisation(permissions.BasePermission):
+    """Permission dédiée à OrganisationViewSet — l'objet Organisation lui-même
+    (nom, secteur, statut, défaut de paiement), pas les objets métier qu'elle
+    contient.
+
+    Contrairement à EstMembreDeLOrganisation, le Super Admin PEUT accéder à
+    n'importe quelle organisation ici : valider un signup, suspendre un
+    compte impayé, changer un statut, est le rôle même de la console
+    plateforme. C'est distinct de l'accès aux données métier privées des
+    clients (sites, compteurs, fiches projet) qui reste interdit au Super
+    Admin sans affiliation, comme partout ailleurs dans ce module.
+    """
+
+    def has_permission(self, request, view):
+        return request.user and request.user.is_authenticated and request.user.actif
+
+    def has_object_permission(self, request, view, obj):
+        if getattr(request.user, "role", None) == "SUPER_ADMIN":
+            return True
+        return UtilisateurOrganisation.objects.filter(
+            organisation=obj, utilisateur=request.user
+        ).exists()
+
+
 class OrganisationScopedViewSet(viewsets.ModelViewSet):
     """Classe de base abstraite appliquant l'aveuglement par défaut.
 
@@ -76,26 +104,52 @@ class OrganisationScopedViewSet(viewsets.ModelViewSet):
 class OrganisationViewSet(viewsets.ModelViewSet):
     """Contrôleur gérant le cycle de vie des organisations clientes.
 
-    - Le Super Admin liste et modifie UNIQUEMENT le statut/défaut de paiement (Automatisable par n8n).
+    - Le Super Admin liste, consulte et modifie UNIQUEMENT le statut/défaut de
+      paiement (automatisable par n8n) de N'IMPORTE QUELLE organisation — c'est
+      la console plateforme, pas un accès aux données métier des clients.
     - La suppression physique est formellement interdite.
     """
     queryset = Organisation.objects.all().order_by("nom")
     serializer_class = OrganisationSerializer
-    permission_classes = [EstMembreDeLOrganisation]
+    permission_classes = [PeutGererOrganisation]
 
     def get_queryset(self):
         # Le Super Admin conserve le droit de lister toutes les structures de la plateforme
         if self.request.user.role == "SUPER_ADMIN":
-            return self.queryset
+            queryset = self.queryset
+            # Filtres optionnels pour le polling n8n (ex. GET .../?defaut_paiement=true
+            # pour ne récupérer que les organisations à relancer).
+            statut = self.request.query_params.get("statut")
+            if statut:
+                queryset = queryset.filter(statut=statut)
+            defaut_paiement = self.request.query_params.get("defaut_paiement")
+            if defaut_paiement is not None:
+                queryset = queryset.filter(defaut_paiement=defaut_paiement.lower() in ("true", "1"))
+            return queryset
         return self.queryset.filter(membres__utilisateur=self.request.user).distinct()
+
+    def perform_create(self, serializer):
+        """Réservé aux ADMIN_ORGANISATION — un UTILISATEUR_ORGANISATION/CONSULTANT
+        est censé être invité dans une organisation existante, jamais en créer
+        une lui-même. La création de l'Organisation ET le lien
+        UtilisateurOrganisation se font dans la même transaction : sans ça,
+        un échec entre les deux étapes laisserait une organisation orpheline
+        qu'aucun utilisateur ne pourrait jamais retrouver ni gérer."""
+        if getattr(self.request.user, "role", None) != "ADMIN_ORGANISATION":
+            raise PermissionDenied("Seul un administrateur d'organisation peut créer une nouvelle structure.")
+
+        with transaction.atomic(): # type: ignore
+            organisation = serializer.save()
+            UtilisateurOrganisation.objects.create(organisation=organisation, utilisateur=self.request.user)
 
     def update(self, request, *args, **kwargs):
         """Restreint les modifications d'accès aux seules contraintes financières (Abonnement)."""
         acteur = request.user
         instance = self.get_object()
 
-        # L'action est autorisée pour le SUPER_ADMIN connecté ou via un script authentifié (n8n)
-        if acteur.role == "SUPER_ADMIN" or request.auth: 
+        # SÉCURITÉ : Un script (n8n ou autre) qui a besoin de cette route doit 
+        # s'authentifier avec un compte de service ayant réellement le rôle SUPER_ADMIN.
+        if acteur.role == "SUPER_ADMIN":
             nouveau_statut = request.data.get("statut")
             nouveau_defaut = request.data.get("defaut_paiement")
 
@@ -125,8 +179,21 @@ class OrganisationViewSet(viewsets.ModelViewSet):
             instance.save()
             serializer = self.get_serializer(instance)
             return Response(serializer.data)
-                
-        raise PermissionDenied("Vous n'avez pas l'autorisation de modifier les données de ce client.")
+
+        # Un ADMIN_ORGANISATION membre de sa propre structure peut modifier ses
+        # informations descriptives (nom, secteur, localisation), jamais son statut.
+        est_membre = UtilisateurOrganisation.objects.filter(
+            organisation=instance, utilisateur=acteur
+        ).exists()
+        if not est_membre:
+            raise PermissionDenied("Vous n'avez pas l'autorisation de modifier les données de ce client.")
+
+        for champ in ("nom", "secteur", "localisation"):
+            if champ in request.data:
+                setattr(instance, champ, request.data[champ])
+        instance.save()
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
 
     def perform_destroy(self, instance):
         """Interdit la suppression définitive d'une organisation en production."""
@@ -166,3 +233,65 @@ class CompteurViewSet(OrganisationScopedViewSet):
     queryset = Compteur.objects.select_related("site__organisation").prefetch_related("activites").order_by("reference")
     serializer_class = CompteurSerializer
     organisation_field = "site"
+
+
+class ConfigurationSecuriteView(APIView):
+    """GET accessible à tout membre de l'organisation (pour savoir si le 2FA
+    est exigé) ; PATCH réservé aux admins."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        if organisation is None:
+            return Response({"error": "Aucune organisation associée."}, status=status.HTTP_409_CONFLICT)
+        config, _ = ConfigurationSecurite.objects.get_or_create(organisation=organisation)
+        return Response(ConfigurationSecuriteSerializer(config).data)
+
+    def patch(self, request):
+        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        if organisation is None:
+            return Response({"error": "Aucune organisation associée."}, status=status.HTTP_409_CONFLICT)
+
+        if getattr(request.user, "role", None) != "ADMIN_ORGANISATION":
+            return Response({"error": "Seul un administrateur peut modifier cette politique."}, status=status.HTTP_403_FORBIDDEN)
+
+        config, _ = ConfigurationSecurite.objects.get_or_create(organisation=organisation)
+        serializer = ConfigurationSecuriteSerializer(config, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class OnboardingSimpleView(APIView):
+    """Organisation + site + compteur en une seule transaction (mobile)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        if getattr(user, "role", None) != "ADMIN_ORGANISATION":
+            return Response({"error": "Réservé aux administrateurs d'organisation."}, status=403)
+        if Organisation.objects.filter(membres__utilisateur=user).exists():
+            return Response({"error": "Vous avez déjà une organisation."}, status=409)
+
+        d = request.data
+        reference = (d.get("reference_compteur") or "").strip()
+        if not reference:
+            return Response({"error": "Le numéro du compteur est requis."}, status=400)
+
+        with transaction.atomic():
+            org = Organisation.objects.create(
+                nom=(d.get("nom") or "").strip() or "Mon activité",
+                secteur="Commerce", localisation="Sénégal",
+                statut=Organisation.Statut.EN_ATTENTE, type_compte="SIMPLIFIE",
+            )
+            UtilisateurOrganisation.objects.create(organisation=org, utilisateur=user)
+            site = Site.objects.create(
+                organisation=org, nom="Site principal",
+                adresse=(d.get("adresse") or "").strip() or "À préciser",
+                pays="Sénégal", fuseau_horaire="Africa/Dakar",
+            )
+            compteur = Compteur.objects.create(
+                site=site, reference=reference, type_energie="ELECTRICITE",
+                unite="kWh", statut_synchronisation="MANUEL",
+            )
+        return Response({"organisation": str(org.id), "site": str(site.id), "compteur": str(compteur.id)}, status=201)

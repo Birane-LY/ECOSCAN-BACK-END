@@ -18,6 +18,8 @@ class Organisation(models.Model):
     secteur = models.CharField(max_length=120)
     localisation = models.CharField(max_length=255)
     date_creation = models.DateTimeField(auto_now_add=True)
+    type_compte = models.CharField(max_length=12, default="COMPLET",
+                               choices=[("SIMPLIFIE", "Simplifié"), ("COMPLET", "Complet")])
     statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.EN_ATTENTE)
     defaut_paiement = models.BooleanField(default=False)
 
@@ -116,6 +118,18 @@ class Compteur(models.Model):
     localisation = models.CharField(max_length=255, blank=True)
     statut_synchronisation = models.CharField(max_length=50)
     derniere_synchronisation = models.DateTimeField(null=True, blank=True)
+    puissance_souscrite_kva = models.DecimalField(
+        max_digits=8, decimal_places=2, null=True, blank=True,
+        help_text="Puissance souscrite contractuelle (kVA), telle que déclarée sur la facture ou le contrat Senelec.",
+    )
 
     def __str__(self):
         return self.reference
+
+class ConfigurationSecurite(models.Model):
+    """Politique de sécurité au niveau organisation — le 2FA obligatoire est
+    une décision d'admin, pas un choix individuel qu'un utilisateur pourrait
+    désactiver seul (même principe que ConfigurationBriefing)."""
+    organisation = models.OneToOneField(Organisation, on_delete=models.CASCADE, related_name="configuration_securite")
+    deux_facteurs_obligatoire = models.BooleanField(default=False)
+    date_maj = models.DateTimeField(auto_now=True)

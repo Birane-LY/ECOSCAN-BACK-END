@@ -7,6 +7,8 @@ from .views import (
     FicheProjetViewSet,
     ActiviteViewSet,
     CompteurViewSet,
+    ConfigurationSecuriteView,
+    OnboardingSimpleView,
 )
 
 router = SimpleRouter()
@@ -18,5 +20,7 @@ router.register(r'activites', ActiviteViewSet, basename='activite')
 router.register(r'compteurs', CompteurViewSet, basename='compteur')
 
 urlpatterns = [
+    path('configuration-securite/', ConfigurationSecuriteView.as_view(), name='configuration_securite'),
+    path('onboarding-simple/', OnboardingSimpleView.as_view(), name='onboarding_simple'),
     path('', include(router.urls)),
 ]
