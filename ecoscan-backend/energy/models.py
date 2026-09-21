@@ -107,6 +107,11 @@ class ImportDonnees(models.Model):
     donnees_extraites = models.JSONField(default=dict, blank=True)
     rapport_analyse = models.JSONField(default=dict, blank=True)
     date_traitement = models.DateTimeField(null=True, blank=True)
+    compteur = models.ForeignKey(
+        "organizations.Compteur", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="imports_donnees",
+        help_text="Compteur concerné par cet import, si connu — optionnel pour un import OCR classique sans sélection explicite.",
+    )
 
     def lancer_import(self):
         """Déclenche le passage de l'import à l'état en cours de traitement."""
@@ -285,3 +290,47 @@ class IndicateurObjectif(models.Model):
 
     def __str__(self):
         return self.nom
+
+class BaremeTarifaire(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    categorie = models.CharField(max_length=50, default="DOMESTIQUE_PETITE_PUISSANCE")
+    nom_tranche = models.CharField(max_length=80)
+    ordre = models.PositiveIntegerField()
+    kwh_min = models.DecimalField(max_digits=10, decimal_places=2)
+    kwh_max = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    prix_fcfa_par_kwh = models.DecimalField(max_digits=10, decimal_places=4)
+    date_entree_vigueur = models.DateField()
+    date_fin_vigueur = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("categorie", "ordre")
+
+
+class AchatWoyofal(models.Model):
+    class Source(models.TextChoices):
+        SAISIE = "SAISIE", "Saisie"
+        SMS = "SMS", "SMS"
+        PHOTO = "PHOTO", "Photo"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    client_id = models.UUIDField(unique=True)  # généré par le mobile : synchro idempotente
+    compteur = models.ForeignKey("organizations.Compteur", on_delete=models.CASCADE, related_name="achats_woyofal")
+    montant_fcfa = models.DecimalField(max_digits=12, decimal_places=2)
+    kwh_credites = models.DecimalField(max_digits=10, decimal_places=3)
+    kwh_predits = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    date_achat = models.DateTimeField()
+    source = models.CharField(max_length=10, choices=Source.choices, default=Source.SAISIE)
+
+    class Meta:
+        ordering = ("-date_achat",)
+
+class ReleveSolde(models.Model):
+    """Solde affiché par le compteur Woyofal à un instant donné (saisi par l'utilisateur)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    client_id = models.UUIDField(unique=True)  # généré par le mobile : synchro idempotente
+    compteur = models.ForeignKey("organizations.Compteur", on_delete=models.CASCADE, related_name="releves_solde")
+    kwh_restants = models.DecimalField(max_digits=10, decimal_places=3)
+    date_releve = models.DateTimeField()
+
+    class Meta:
+        ordering = ("-date_releve",)

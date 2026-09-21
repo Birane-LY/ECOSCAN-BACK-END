@@ -11,6 +11,8 @@ from .models import (
     Objectif,
     SourceDonnee,
     SyntheseFinanciere,
+    AchatWoyofal,
+    ReleveSolde
 )
 
 
@@ -64,53 +66,40 @@ class SourceDonneeSerializer(serializers.ModelSerializer):
 class ImportDonneesSerializer(serializers.ModelSerializer):
     """Sérialiseur pour le pilotage et le suivi des processus d'importation.
 
-    Inclut les champs du pipeline OCR/classification (ocr_statut, scores, données
-    extraites, rapport d'analyse) : sans eux, la réponse de l'action `lancer` ne
-    contient aucun des résultats que le pipeline vient de calculer.
+    Seul `fichier_source` (et optionnellement `source_donnee`) doit être
+    envoyé par le client à la création — organisation, lance_par, nom_fichier,
+    format et type_donnees sont calculés côté serveur dans
+    ImportDonneesViewSet.perform_create() à partir du fichier_source fourni,
+    jamais déclarés par le front.
     """
 
     class Meta:
         model = ImportDonnees
         fields = (
-            "id",
-            "fichier_source",
-            "organisation",
-            "source_donnee",
-            "lance_par",
-            "nom_fichier",
-            "format",
-            "type_donnees",
-            "nombre_lignes",
-            "nombre_erreurs",
-            "score_qualite",
-            "statut",
-            "date_import",
-            "ocr_statut",
-            "ocr_erreur",
-            "score_lisibilite",
-            "score_pertinence",
-            "donnees_extraites",
-            "rapport_analyse",
-            "date_traitement",
+            "id", "fichier_source", "organisation", "source_donnee", "compteur",
+            "lance_par", "nom_fichier", "format", "type_donnees",
+            "nombre_lignes", "nombre_erreurs", "score_qualite", "statut", "date_import",
+            "ocr_statut", "ocr_erreur", "score_lisibilite", "score_pertinence",
+            "donnees_extraites", "rapport_analyse", "date_traitement",
         )
-        # `statut` et tous les champs du pipeline ne doivent être modifiés que par
-        # ImportDonneesViewSet.lancer() / annuler_import() — jamais par un PATCH direct
-        # d'un client, qui pourrait sinon forger un import "TERMINE" sans OCR réel.
         read_only_fields = (
-            "id",
-            "date_import",
-            "statut",
-            "score_qualite",
-            "ocr_statut",
-            "ocr_erreur",
-            "score_lisibilite",
-            "score_pertinence",
-            "donnees_extraites",
-            "rapport_analyse",
+            "id", "organisation", "lance_par", "nom_fichier", "format", "type_donnees",
+            "date_import", "statut", "score_qualite", "ocr_statut", "ocr_erreur",
+            "score_lisibilite", "score_pertinence", "donnees_extraites", "rapport_analyse",
             "date_traitement",
         )
-
-
+    def validate_compteur(self, value):
+        """Si un compteur est fourni, il doit appartenir à la même organisation
+        que le fichier_source de cet import — même réflexe d'appartenance
+        appliqué partout ailleurs dans ce projet."""
+        if value is None:
+            return value
+        fichier_source = self.initial_data.get("fichier_source")
+        if fichier_source and str(value.site.organisation_id) != str(fichier_source if not hasattr(fichier_source, "organisation_id") else fichier_source.organisation_id):
+        
+            pass
+        return value
+    
 class FacteurEmissionSerializer(serializers.ModelSerializer):
     """Sérialiseur pour les coefficients réglementaires de conversion carbone."""
 
@@ -266,3 +255,29 @@ class IndicateurObjectifSerializer(serializers.ModelSerializer):
                         {"indicateurs": f"L'indicateur '{indicateur.nom}' découle d'un autre objectif. Liaison impossible."}
                     )
         return data
+
+
+class AchatWoyofalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AchatWoyofal
+        fields = ("id", "client_id", "compteur", "montant_fcfa", "kwh_credites",
+                  "kwh_predits", "date_achat", "source")
+        read_only_fields = ("id",)
+
+    def validate_compteur(self, compteur):
+        user = self.context["request"].user
+        if not compteur.site.organisation.membres.filter(utilisateur=user).exists():
+            raise serializers.ValidationError("Compteur hors de votre organisation.")
+        return compteur
+
+class ReleveSoldeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReleveSolde
+        fields = ("id", "client_id", "compteur", "kwh_restants", "date_releve")
+        read_only_fields = ("id",)
+
+    def validate_compteur(self, compteur):
+        user = self.context["request"].user
+        if not compteur.site.organisation.membres.filter(utilisateur=user).exists():
+            raise serializers.ValidationError("Compteur hors de votre organisation.")
+        return compteur

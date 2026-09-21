@@ -12,6 +12,14 @@ from .views import (
     ObjectifViewSet,
     SourceDonneeViewSet,
     SyntheseFinanciereViewSet,
+    PredictionAchatView,
+    EtatTrancheView,
+    AchatWoyofalListCreateView,
+    ReleveSoldeListCreateView,
+    AutonomieView,
+    CaptureImageView,
+    CreerImportDepuisCaptureView
+    
 )
 
 app_name = "energy"
@@ -79,5 +87,12 @@ router.register(
 )
 
 urlpatterns = [
+    path('capture-image/', CaptureImageView.as_view(), name='capture_image'),
+    path('capture-facture/', CreerImportDepuisCaptureView.as_view(), name='capture_facture'),
+    path('prediction-achat/', PredictionAchatView.as_view()),
+    path('etat-tranche/', EtatTrancheView.as_view()),
+    path('achats-woyofal/', AchatWoyofalListCreateView.as_view()),
+    path('releves-solde/', ReleveSoldeListCreateView.as_view()),
+    path('autonomie/', AutonomieView.as_view()),
     path("", include(router.urls)),
 ]
