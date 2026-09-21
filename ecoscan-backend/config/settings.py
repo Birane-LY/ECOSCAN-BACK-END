@@ -36,6 +36,7 @@ INSTALLED_APPS = [
 
     "rest_framework",
     "rest_framework_simplejwt",
+    "corsheaders",
 
     "accounts",
     "organizations",
@@ -46,6 +47,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -55,6 +57,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 ROOT_URLCONF = 'config.urls'
 
 TEMPLATES = [
@@ -161,6 +164,11 @@ REST_FRAMEWORK = {
     }
 }
 
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
 PASSWORD_RESET_TIMEOUT = 172800  # 48 heures
 
 SIMPLE_JWT = {
@@ -169,3 +177,7 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": False,
     "BLACKLIST_REVOKED_TOKENS": False,
 }
+
+
+WOYOFAL_PRELEVEMENTS_PCT = os.getenv("WOYOFAL_PRELEVEMENTS_PCT", "0")
+ALLOWED_HOSTS = ['192.168.1.5', 'localhost', '  https://upper-deflected-sardine.ngrok-free.dev','127.0.0.1', '*']
