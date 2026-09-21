@@ -7,9 +7,14 @@ from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from email_validator import validate_email, EmailNotValidError
 from rest_framework import serializers
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework.validators import UniqueValidator
-from .models import Utilisateur
+import logging
+from organizations.models import Organisation, UtilisateurOrganisation
+from .models import Utilisateur, PreferencesUtilisateur
+from django.db import transaction
 
+logger = logging.getLogger(__name__)
 
 class OnboardingAdminOrganisationSerializer(serializers.Serializer):
     """Sérialiseur pour la phase d'onboarding autonome d'un Admin d'organisation.
@@ -140,7 +145,6 @@ class InvitationCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ("id",)
 
     def validate_email(self, value):
-        """Vérifie la validité réelle de l'e-mail invité."""
         try:
             email_info = validate_email(value, check_deliverability=True)
             return email_info.email
@@ -159,42 +163,69 @@ class InvitationCreateSerializer(serializers.ModelSerializer):
         if acteur.role == Utilisateur.Role.ADMIN_ORGANISATION:
             if not acteur.actif:
                 raise serializers.ValidationError("Votre compte d'administrateur doit être actif pour inviter des membres.")
-            
+
             roles_autorises = [Utilisateur.Role.UTILISATEUR_ORGANISATION, Utilisateur.Role.CONSULTANT]
             if role_cible not in roles_autorises:
                 raise serializers.ValidationError("Vous pouvez uniquement inviter des Utilisateurs ou des Consultants.")
-        
+
+            organisation = Organisation.objects.filter(membres__utilisateur=acteur).first()
+            if organisation is None:
+                raise serializers.ValidationError(
+                    "Vous devez d'abord configurer votre propre organisation avant d'inviter des membres."
+                )
+            self._organisation_cible = organisation
+
         elif acteur.role == Utilisateur.Role.SUPER_ADMIN:
             if role_cible != Utilisateur.Role.SUPER_ADMIN:
                 raise serializers.ValidationError("Vous pouvez uniquement inviter des membres Super Administrateurs.")
+            self._organisation_cible = None
         else:
             raise serializers.ValidationError("Vous n'avez pas l'autorisation d'inviter des membres sur la plateforme.")
 
         return data
 
     def create(self, validated_data):
-        """Crée le compte inactif et envoie l'e-mail d'invitation."""
-        utilisateur = Utilisateur.objects.create(
-            actif=False,
-            is_staff=False,
-            **validated_data
-        )
-        utilisateur.set_unusable_password()
-        utilisateur.save()
+        """Crée le compte inactif et le rattache à l'organisation de l'inviteur.
+        L'envoi d'email est volontairement séparé de la transaction et ne doit
+        JAMAIS faire échouer la création du compte — même principe de dégradation
+        gracieuse que ai_client.py (une panne de service tiers ne bloque pas
+        l'action métier)."""
+
+        with transaction.atomic():
+            utilisateur = Utilisateur.objects.create(
+                actif=False,
+                is_staff=False,
+                **validated_data
+            )
+            utilisateur.set_unusable_password()
+            utilisateur.save()
+
+            if self._organisation_cible is not None:
+                UtilisateurOrganisation.objects.create(
+                    organisation=self._organisation_cible,
+                    utilisateur=utilisateur,
+                )
 
         uid = urlsafe_base64_encode(force_bytes(utilisateur.pk))
         token = default_token_generator.make_token(utilisateur)
         lien_activation = f"https://monapp.com/activation/?uid={uid}&token={token}"
 
-        send_mail(
-            subject="Invitation à rejoindre la plateforme",
-            message=f"Bonjour {utilisateur.nom},\n\nVous avez été invité sur la plateforme.\n"
-                    f"Veuillez finaliser la configuration de votre compte en définissant votre mot de passe "
-                    f"via ce lien unique : {lien_activation}\n\nL'équipe.",
-            from_email="noreply@monapp.com",
-            recipient_list=[utilisateur.email],
-            fail_silently=False,
-        )
+        try:
+            send_mail(
+                subject="Invitation à rejoindre la plateforme",
+                message=f"Bonjour {utilisateur.nom},\n\nVous avez été invité sur la plateforme.\n"
+                        f"Veuillez finaliser la configuration de votre compte en définissant votre mot de passe "
+                        f"via ce lien unique : {lien_activation}\n\nL'équipe.",
+                from_email="noreply@monapp.com",
+                recipient_list=[utilisateur.email],
+                fail_silently=False,
+            )
+        except Exception as exc:
+            logger.warning("Échec de l'envoi de l'email d'invitation à %s : %s", utilisateur.email, exc)
+            # Le compte et le rattachement à l'organisation restent valides même
+            # si l'email échoue — l'admin peut relancer l'envoi manuellement
+            # (via un futur endpoint "renvoyer l'invitation" si le besoin se confirme).
+
         return utilisateur
 
 
@@ -255,3 +286,69 @@ class FinaliserInscriptionSerializer(serializers.Serializer):
         utilisateur.actif = True
         utilisateur.save()
         return utilisateur
+
+
+class ConnexionSerializer(TokenObtainPairSerializer):
+    """Ajoute les informations nécessaires au front (rôle, nom) directement dans le JWT."""
+
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token['role'] = user.role
+        token['nom'] = user.nom
+        token['email'] = user.email
+        return token
+
+
+class PreferencesUtilisateurSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PreferencesUtilisateur
+        fields = (
+            "theme", "densite", "accent",
+            "alertes_email", "briefing_quotidien", "detection_anomalies", "rapport_hebdomadaire",
+            "delai_inactivite_minutes",
+        )
+
+class ChangerMotDePasseSerializer(serializers.Serializer):
+    """Exige l'ancien mot de passe pour toute modification — jamais de
+    changement silencieux sans preuve de connaissance du mot de passe actuel."""
+    ancien_mot_de_passe = serializers.CharField(write_only=True)
+    nouveau_mot_de_passe = serializers.CharField(write_only=True)
+
+    def validate_ancien_mot_de_passe(self, value):
+        utilisateur = self.context["request"].user
+        if not utilisateur.check_password(value):
+            raise serializers.ValidationError("Le mot de passe actuel est incorrect.")
+        return value
+
+    def validate_nouveau_mot_de_passe(self, value):
+        # Réutilise les mêmes règles UX déjà écrites pour FinaliserInscriptionSerializer,
+        # plutôt que d'en réinventer une version divergente ici.
+        if len(value) < 8:
+            raise serializers.ValidationError("Le mot de passe doit contenir au moins 8 caractères.")
+        if not re.match(r"^(?=.*[A-Za-z])(?=.*\d).+$", value):
+            raise serializers.ValidationError("Le mot de passe doit mélanger au moins une lettre et un chiffre.")
+
+        utilisateur = self.context["request"].user
+        try:
+            validate_password(value, user=utilisateur)
+        except DjangoValidationError as error:
+            raise serializers.ValidationError(list(error.messages))
+        return value
+
+    def save(self):
+        utilisateur = self.context["request"].user
+        utilisateur.set_password(self.validated_data["nouveau_mot_de_passe"])
+        utilisateur.save()
+        return utilisateur
+
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+class EcoscanTokenSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token["role"] = user.role
+        token["nom"] = user.nom
+        token["email"] = user.email
+        return token

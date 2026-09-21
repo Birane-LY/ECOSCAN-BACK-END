@@ -84,3 +84,43 @@ class Utilisateur(AbstractBaseUser, PermissionsMixin):
     def __str__(self):
         """Renvoie l'adresse e-mail comme représentation textuelle de l'utilisateur."""
         return self.email
+
+class PreferencesUtilisateur(models.Model):
+    """Préférences propres à un utilisateur, séparées du modèle Utilisateur
+    pour ne pas alourdir le modèle d'auth avec des champs non liés à
+    l'identité/la sécurité de connexion."""
+
+    class Theme(models.TextChoices):
+        SOMBRE = "SOMBRE", "Sombre"
+        CLAIR = "CLAIR", "Clair"
+
+    class Densite(models.TextChoices):
+        COMPACTE = "COMPACTE", "Compacte"
+        CONFORTABLE = "CONFORTABLE", "Confortable"
+        AEREE = "AEREE", "Aérée"
+
+    class Accent(models.TextChoices):
+        GREEN = "GREEN", "Émeraude Solaire"
+        CYAN = "CYAN", "Cyan Électrique"
+        AMBER = "AMBER", "Ambre Vigilance"
+
+    utilisateur = models.OneToOneField(
+        Utilisateur, on_delete=models.CASCADE, related_name="preferences"
+    )
+
+    # Apparence
+    theme = models.CharField(max_length=10, choices=Theme.choices, default=Theme.SOMBRE)
+    densite = models.CharField(max_length=15, choices=Densite.choices, default=Densite.CONFORTABLE)
+    accent = models.CharField(max_length=10, choices=Accent.choices, default=Accent.GREEN)
+
+    # Notifications
+    alertes_email = models.BooleanField(default=True)
+    briefing_quotidien = models.BooleanField(default=True)
+    detection_anomalies = models.BooleanField(default=True)
+    rapport_hebdomadaire = models.BooleanField(default=False)
+    delai_inactivite_minutes = models.PositiveIntegerField(default=30)
+
+    date_maj = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Préférences de {self.utilisateur.email}"

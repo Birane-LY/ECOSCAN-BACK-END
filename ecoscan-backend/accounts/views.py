@@ -3,13 +3,17 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import Utilisateur
+from .models import Utilisateur, PreferencesUtilisateur
 from .serializers import (
     OnboardingAdminOrganisationSerializer,
     UtilisateurSerializer,
     InvitationCreateSerializer,
-    FinaliserInscriptionSerializer
+    FinaliserInscriptionSerializer,
+    ConnexionSerializer,
+    PreferencesUtilisateurSerializer,
+    ChangerMotDePasseSerializer,
 )
 
 
@@ -137,3 +141,35 @@ class UtilisateurViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied("Vous ne pouvez supprimer que des Utilisateurs ou des Consultants.")
                 
         instance.delete()
+
+
+class ConnexionView(TokenObtainPairView):
+    """Vue de connexion utilisant un token enrichi avec le rôle de l'utilisateur."""
+    serializer_class = ConnexionSerializer
+
+class MesPreferencesView(APIView):
+    """Get/patch des préférences du user connecté — jamais celles d'un autre,
+    donc pas besoin de pk dans l'URL."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        preferences, _ = PreferencesUtilisateur.objects.get_or_create(utilisateur=request.user)
+        return Response(PreferencesUtilisateurSerializer(preferences).data)
+
+    def patch(self, request):
+        preferences, _ = PreferencesUtilisateur.objects.get_or_create(utilisateur=request.user)
+        serializer = PreferencesUtilisateurSerializer(preferences, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+class ChangerMotDePasseView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "invitation_validation"  # même limite de fréquence que les flux sensibles existants
+
+    def post(self, request):
+        serializer = ChangerMotDePasseSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response({"message": "Mot de passe modifié avec succès."}, status=status.HTTP_200_OK)
