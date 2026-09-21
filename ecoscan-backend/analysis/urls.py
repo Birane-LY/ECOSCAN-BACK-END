@@ -1,4 +1,3 @@
-# analysis/urls.py
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
@@ -12,6 +11,9 @@ from .views import (
     HypotheseViewSet,
     MemoireStrategiqueViewSet,
     DocumentEntrepriseViewSet,
+    AssistantQueryView,
+    OpportuniteFinancementViewSet,
+    OpportuniteFinancementIngestionView
 )
 from . import views
 
@@ -27,9 +29,12 @@ router.register(r'anomalies', AnomalieViewSet, basename='anomalie')
 router.register(r'hypotheses', HypotheseViewSet, basename='hypothese')
 router.register(r'memoires-strategiques', MemoireStrategiqueViewSet, basename='memoirestrategique')
 router.register(r'documents-entreprise', DocumentEntrepriseViewSet, basename='documententreprise')
+router.register(r'opportunites-financement', OpportuniteFinancementViewSet, basename='opportunitefinancement')
 
 urlpatterns = [
     # Inclut l'ensemble des routes CRUD et actions générées par le routeur
     path('integration/energy/', views.integrer_extraction_energy, name='integrer_energy'),
+    path('assistant/interroger/', AssistantQueryView.as_view(), name='assistant_interroger'),
+    path('opportunites-financement/ingestion/', OpportuniteFinancementIngestionView.as_view(), name='funding_ingestion'),
     path('', include(router.urls)),
 ]

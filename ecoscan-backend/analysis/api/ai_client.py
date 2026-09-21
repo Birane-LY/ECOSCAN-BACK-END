@@ -18,7 +18,9 @@ import logging
 import uuid
 from typing import Any, Optional
 
-import httpx
+import json
+import urllib.error
+import urllib.request
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,24 @@ AI_SERVICE_INTERNAL_TOKEN = getattr(settings, "AI_SERVICE_INTERNAL_TOKEN", "chan
 AI_SERVICE_TIMEOUT = getattr(settings, "AI_SERVICE_TIMEOUT", 15.0)
 
 _HEADERS = {"X-Internal-Service-Token": AI_SERVICE_INTERNAL_TOKEN}
+
+if AI_SERVICE_INTERNAL_TOKEN == "change-me-internal-token":
+    logger.warning(
+        "AI_SERVICE_INTERNAL_TOKEN n'est pas configuré (valeur par défaut utilisée) : "
+        "le service IA va systématiquement répondre 401 tant que cette valeur ne sera "
+        "pas exactement identique à INTERNAL_TOKEN côté service FastAPI."
+    )
+
+
+def _post_json(url: str, payload: dict) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={**_HEADERS, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=AI_SERVICE_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def indexer_document(
@@ -47,11 +67,8 @@ def indexer_document(
         "metadata": metadata or {},
     }
     try:
-        with httpx.Client(timeout=AI_SERVICE_TIMEOUT) as client:
-            r = client.post(f"{AI_SERVICE_URL}/internal/documents", json=payload, headers=_HEADERS)
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPError as exc:
+        return _post_json(f"{AI_SERVICE_URL}/internal/documents", payload)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         logger.warning("Service IA indisponible lors de l'indexation de %s : %s", document_id, exc)
         return {"_error": f"Service IA indisponible : {exc}"}
 
@@ -73,10 +90,27 @@ def demander_hypothese(question: str, organisation_id) -> dict:
         "include_live_data": False,
     }
     try:
-        with httpx.Client(timeout=AI_SERVICE_TIMEOUT) as client:
-            r = client.post(f"{AI_SERVICE_URL}/internal/query", json=payload, headers=_HEADERS)
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPError as exc:
+        return _post_json(f"{AI_SERVICE_URL}/internal/query", payload)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         logger.warning("Service IA indisponible lors de la demande d'hypothèse : %s", exc)
+        return {"_error": f"Service IA indisponible : {exc}"}
+
+
+def interroger_assistant(question: str, organisation_id, include_live_data: bool = True) -> dict:
+    """Question libre de l'utilisateur depuis l'assistant conversationnel du front.
+
+    Contrairement à demander_hypothese (scopé au contexte d'une anomalie précise),
+    autorise l'accès aux données live de l'organisation pour répondre à des
+    questions générales ("où est mon plus gros levier ?", "résume ma semaine").
+    """
+    payload = {
+        "question": question,
+        "organisation_id": str(organisation_id),
+        "limit": 5,
+        "include_live_data": include_live_data,
+    }
+    try:
+        return _post_json(f"{AI_SERVICE_URL}/internal/query", payload)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Service IA indisponible lors d'une question assistant : %s", exc)
         return {"_error": f"Service IA indisponible : {exc}"}

@@ -1,11 +1,15 @@
 import logging
-
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta
+from django.utils import timezone
 from django.core.exceptions import ValidationError
 from rest_framework import status, viewsets
+from rest_framework.views import APIView   
+from django.conf import settings
 from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-
+from rest_framework.exceptions import PermissionDenied
 from energy.models import ImportDonnees
 from organizations.models import Organisation
 
@@ -20,6 +24,7 @@ from .models import (
     ObservationOperationnelle,
     Recommandation,
     ResultatMetrique,
+    OpportuniteFinancement
 )
 from .serializers import (
     ActionSerializer,
@@ -32,9 +37,107 @@ from .serializers import (
     ObservationOperationnelleSerializer,
     RecommandationSerializer,
     ResultatMetriqueSerializer,
+    OpportuniteFinancementSerializer
+
 )
+from analysis.api.ai_client import indexer_document
+from analysis.api.ai_client import interroger_assistant
+from analysis.services.registry import obtenir_definition
+from analysis.services.memory_service import creer_memoire_depuis_hypothese
 
 logger = logging.getLogger(__name__)
+
+
+
+def _verifier_puissance_souscrite(import_instance, champs: dict) -> None:
+    """Signale un écart entre la puissance déclarée sur la facture et celle
+    enregistrée sur le compteur — ne modifie jamais rien automatiquement,
+    seulement une limite ajoutée au ResultatMetrique pour qu'un humain vérifie."""
+    puissance_facture = champs.get("puissance_souscrite") or champs.get("puissance_transfo")
+    if puissance_facture is None:
+        return None
+    try:
+        puissance_facture = Decimal(str(puissance_facture))
+    except InvalidOperation:
+        return None
+
+    return (
+        f"Puissance souscrite lue sur la facture : {puissance_facture} kVA — "
+        f"à comparer manuellement avec la valeur enregistrée sur le compteur concerné."
+    )
+
+def _publier_resultat_depuis_import(import_instance):
+    """Traduit un ImportDonnees.TERMINE en ResultatMetrique.
+
+    Idempotence désormais garantie par fichier_source (contrainte unique
+    dédiée) — plus de risque de collision entre deux factures partageant
+    la même date extraite, 
+    """
+    definition = obtenir_definition("consommation_facture_periodique")
+    champs = import_instance.donnees_extraites or {}
+    consommation = champs.get("consommation_kwh")
+
+    date_facture_str = champs.get("date_facture")
+    periode_fin = None
+    if date_facture_str:
+        try:
+            periode_fin = datetime.strptime(date_facture_str, "%d/%m/%Y").replace(
+                tzinfo=timezone.get_current_timezone()
+            )
+        except (ValueError, TypeError):
+            periode_fin = None
+    if periode_fin is None:
+        periode_fin = import_instance.date_traitement or timezone.now()
+    periode_debut = periode_fin - timedelta(days=30)
+
+    limites = list(definition.limites)
+
+    valeur_decimal = None
+    if consommation is not None:
+        try:
+            valeur_decimal = Decimal(str(consommation))
+        except InvalidOperation:
+            valeur_decimal = None
+
+    confiance = (
+        import_instance.score_qualite / Decimal("100")
+        if import_instance.score_qualite is not None
+        else None
+    )
+
+    if valeur_decimal is not None and confiance is not None and confiance >= Decimal("0.8"):
+        statut_qualite = ResultatMetrique.StatutQualite.FIABLE
+    elif valeur_decimal is not None:
+        statut_qualite = ResultatMetrique.StatutQualite.ESTIME
+    else:
+        statut_qualite = ResultatMetrique.StatutQualite.INSUFFISANT
+
+    puissance_facture = champs.get("puissance_souscrite") or champs.get("puissance_transfo")
+    if puissance_facture is not None:
+        limites.append(
+            f"Puissance souscrite lue sur la facture : {puissance_facture} kVA — "
+            f"à comparer manuellement avec la valeur enregistrée sur le compteur."
+        )
+
+    resultat, cree = ResultatMetrique.objects.get_or_create(
+        fichier_source=import_instance.fichier_source,
+        defaults={
+            "organisation": import_instance.organisation,
+            "compteur": import_instance.compteur,
+            "code_metrique": definition.code,
+            "version_metrique": definition.version,
+            "valeur": valeur_decimal,
+            "unite": definition.unite,
+            "periode_debut": periode_debut,
+            "periode_fin": periode_fin,
+            "completude": Decimal("1.0") if valeur_decimal is not None else Decimal("0.0"),
+            "statut_qualite": statut_qualite,
+            "confiance": confiance,
+            "sources": [import_instance.nom_fichier],
+            "limites": limites,
+        },
+    )
+    return resultat, cree
 
 
 class AnalyseScopedQuerySetMixin:
@@ -77,6 +180,13 @@ class RecommandationViewSet(AnalyseScopedViewSet):
     serializer_class = RecommandationSerializer
     organisation_lookup = "objectif__organisation"
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        objectif_id = self.request.query_params.get("objectif")
+        if objectif_id:
+            queryset = queryset.filter(objectif_id=objectif_id)
+        return queryset
+    
     @action(detail=True, methods=["post"])
     def generer(self, request, pk=None):
         """Déclenche la phase d'édition initiale de la recommandation d'efficacité."""
@@ -193,13 +303,7 @@ def integrer_extraction_energy(request):
             status=status.HTTP_409_CONFLICT,
         )
 
-    resultat, created = ResultatMetrique.objects.get_or_create(
-        organisation=import_instance.organisation,
-        fichier_source=import_instance.fichier_source,
-        defaults={
-            "limites": f"Importé depuis l'import {import_instance.id}",
-        }
-    )
+    resultat, created = _publier_resultat_depuis_import(import_instance)
 
     statut_http = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return Response(ResultatMetriqueSerializer(resultat).data, status=statut_http)
@@ -216,7 +320,6 @@ class ObservationOperationnelleViewSet(AnalyseScopedQuerySetMixin, viewsets.Mode
         organisations = Organisation.objects.filter(membres__utilisateur=self.request.user)
         organisation = serializer.validated_data.get("organisation")
         if organisation not in organisations:
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Organisation hors de votre périmètre.")
         serializer.save(auteur=self.request.user)
 
@@ -255,8 +358,13 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
         hypothese.statut = Hypothese.Statut.CONFIRMEE
         hypothese.confiance = confiance
         hypothese.save(update_fields=("statut", "confiance"))
-        return Response(self.get_serializer(hypothese).data, status=status.HTTP_200_OK)
 
+        # Ferme la boucle : une hypothèse confirmée devient une mémoire
+        # stratégique consultable — sinon MemoryView reste vide indéfiniment.
+        creer_memoire_depuis_hypothese(hypothese)
+
+        return Response(self.get_serializer(hypothese).data, status=status.HTTP_200_OK)
+    
     @action(detail=True, methods=["post"])
     def rejeter(self, request, pk=None):
         hypothese = self.get_object()
@@ -284,14 +392,12 @@ class DocumentEntrepriseViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSe
         organisations = Organisation.objects.filter(membres__utilisateur=self.request.user)
         organisation = serializer.validated_data.get("organisation")
         if organisation not in organisations:
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Organisation hors de votre périmètre.")
         serializer.save(depose_par=self.request.user)
 
     @action(detail=True, methods=["post"])
     def valider(self, request, pk=None):
         """Valide le document ET déclenche son indexation dans le RAG."""
-        from .ai_client import indexer_document
 
         document = self.get_object()
         document.valider(request.user)
@@ -308,3 +414,119 @@ class DocumentEntrepriseViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSe
             document.save(update_fields=("indexe_rag",))
 
         return Response(self.get_serializer(document).data, status=status.HTTP_200_OK)
+
+
+class AssistantQueryView(APIView):
+    """Point d'entrée REST pour l'assistant conversationnel du front-end.
+
+    Le SUPER_ADMIN est exclu, comme partout ailleurs dans ce module : il n'a
+    pas d'organisation dont les données pourraient nourrir une réponse.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        question = (request.data.get("question") or "").strip()
+        if not question:
+            return Response({"error": "La question ne peut pas être vide."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if getattr(request.user, "role", None) == "SUPER_ADMIN":
+            return Response(
+                {"error": "L'assistant n'est pas disponible pour ce rôle."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        if organisation is None:
+            return Response(
+                {"error": "Aucune organisation associée à ce compte."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        reponse = interroger_assistant(question, organisation.id)
+        if "_error" in reponse:
+            return Response({"error": reponse["_error"]}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response(
+            {"answer": reponse.get("answer", "Je n'ai pas pu formuler de réponse."), "sources": reponse.get("sources", [])},
+            status=status.HTTP_200_OK,
+        )
+
+
+class OpportuniteFinancementViewSet(viewsets.ReadOnlyModelViewSet):
+    """Catalogue public — lecture pour tout utilisateur connecté, y compris
+    SUPER_ADMIN (référentiel, pas une donnée tenant)."""
+    serializer_class = OpportuniteFinancementSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        statut_demande = self.request.query_params.get("statut")
+        if statut_demande == "A_VERIFIER":
+            if getattr(self.request.user, "role", None) not in ("ADMIN_ORGANISATION", "SUPER_ADMIN"):
+                return OpportuniteFinancement.objects.none()
+            return OpportuniteFinancement.objects.filter(statut="A_VERIFIER")
+        return OpportuniteFinancement.objects.filter(statut="ACTIF")
+
+    @action(detail=True, methods=["post"], url_path="valider")
+    def valider(self, request, pk=None):
+        if getattr(request.user, "role", None) not in ("ADMIN_ORGANISATION", "SUPER_ADMIN"):
+            return Response({"error": "Rôle non autorisé pour cette action."}, status=status.HTTP_403_FORBIDDEN)
+        opportunite = self.get_object()
+        if opportunite.statut != "A_VERIFIER":
+            return Response({"error": "Cette opportunité n'est pas en attente de relecture."}, status=status.HTTP_409_CONFLICT)
+        opportunite.statut = "ACTIF"
+        opportunite.save(update_fields=("statut",))
+        return Response(self.get_serializer(opportunite).data)
+
+    @action(detail=True, methods=["post"], url_path="rejeter")
+    def rejeter(self, request, pk=None):
+        if getattr(request.user, "role", None) not in ("ADMIN_ORGANISATION", "SUPER_ADMIN"):
+            return Response({"error": "Rôle non autorisé pour cette action."}, status=status.HTTP_403_FORBIDDEN)
+        opportunite = self.get_object()
+        opportunite.statut = "EXPIRE"
+        opportunite.save(update_fields=("statut",))
+        return Response(self.get_serializer(opportunite).data)
+
+
+SEUIL_CONFIANCE_AUTO_PUBLICATION = 0.75
+
+
+class OpportuniteFinancementIngestionView(APIView):
+    """Webhook n8n : reçoit un batch d'opportunités extraites, décide
+    ACTIF vs A_VERIFIER selon le score de confiance retourné par le LLM
+    (confiance_extraction) — n8n ne fait qu'extraire et scorer, jamais
+    décider du seuil de publication."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        token = request.headers.get("X-N8N-Ingestion-Token")
+        if token != getattr(settings, "N8N_INGESTION_TOKEN", None):
+            return Response({"error": "Jeton invalide."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        items = request.data if isinstance(request.data, list) else [request.data]
+        crees, maj = 0, 0
+        for item in items:
+            confiance = item.get("confiance_extraction")
+            statut_calcule = (
+                "ACTIF" if confiance is not None and float(confiance) >= SEUIL_CONFIANCE_AUTO_PUBLICATION
+                else "A_VERIFIER"
+            )
+            _, created = OpportuniteFinancement.objects.update_or_create(
+                titre=item.get("titre"), organisme=item.get("organisme"),
+                defaults={
+                    "description": item.get("description", ""),
+                    "montant_max": item.get("montant_max"),
+                    "devise": item.get("devise", "FCFA"),
+                    "taux_financement_pct": item.get("taux_financement_pct"),
+                    "criteres_eligibilite": item.get("criteres_eligibilite", ""),
+                    "secteur": item.get("secteur", ""),
+                    "date_limite": item.get("date_limite"),
+                    "url_source": item.get("url_source", ""),
+                    "statut": statut_calcule,
+                },
+            )
+            crees += 1 if created else 0
+            maj += 0 if created else 1
+
+        return Response({"crees": crees, "mis_a_jour": maj}, status=status.HTTP_200_OK)
+
+

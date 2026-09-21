@@ -46,10 +46,23 @@ class Recommandation(models.Model):
         self.save(update_fields=("statut",))
 
     def marquer_comme_decidee(self):
-        """Valide l'adoption de la recommandation et fige la date d'arbitrage."""
+        """Valide l'adoption de la recommandation, fige la date d'arbitrage, et
+        fait progresser l'Objectif lié d'autant que l'économie estimée — c'est
+        aujourd'hui la SEULE façon dont un Objectif progresse (aucun calcul
+        automatique depuis les métriques réelles n'existe encore, et ce n'est
+        pas ajouté ici pour ne pas présenter une progression déduite comme une
+        mesure certaine)."""
         self.statut = self.Statut.DECIDEE
         self.date_decision = timezone.now()
         self.save(update_fields=("statut", "date_decision"))
+
+        objectif = self.objectif
+        if objectif.unite == self.unite:
+            nouvelle_progression = (objectif.progression_actuelle or 0) + self.economie_estimee
+            objectif.mettre_a_jour_progression(nouvelle_progression)
+        # Si les unités diffèrent (ex. objectif en %, recommandation en kWh),
+        # on ne force aucune conversion arbitraire — la progression reste
+        # inchangée, à mettre à jour manuellement si besoin.
 
     def __str__(self):
         return self.titre
@@ -210,6 +223,11 @@ class ResultatMetrique(models.Model):
     limites = models.JSONField(default=list)
 
     date_calcul = models.DateTimeField(auto_now_add=True)
+    fichier_source = models.ForeignKey(
+        "energy.FichierSource", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="resultats_metriques",
+        help_text="Fichier source à l'origine de ce résultat, quand il provient d'un import OCR/capture plutôt que d'un calcul sur relevés.",
+    )
 
     class Meta:
         ordering = ("-periode_fin",)
@@ -217,6 +235,12 @@ class ResultatMetrique(models.Model):
             models.UniqueConstraint(
                 fields=("organisation", "compteur", "code_metrique", "periode_debut", "periode_fin", "version_metrique"),
                 name="resultat_metrique_unique_par_periode",
+            ),
+    
+            models.UniqueConstraint(
+                fields=("fichier_source",),
+                condition=models.Q(fichier_source__isnull=False),
+                name="resultat_metrique_unique_par_fichier_source",
             ),
         ]
 
@@ -391,6 +415,38 @@ class DocumentEntreprise(models.Model):
         self.valide_par = utilisateur
         self.date_validation = timezone.now()
         self.save(update_fields=("valide", "valide_par", "date_validation"))
+
+    def __str__(self):
+        return self.titre
+
+class OpportuniteFinancement(models.Model):
+    """Catalogue d'aides/subventions énergie & éco-responsabilité au Sénégal,
+    alimenté exclusivement par le workflow n8n d'ingestion. Aucun calcul
+    d'éligibilité automatique n'est fait — on affiche les critères et laisse
+    la PME juger."""
+
+    class Statut(models.TextChoices):
+        ACTIF = "ACTIF", "Actif"
+        A_VERIFIER = "A_VERIFIER", "À vérifier"
+        EXPIRE = "EXPIRE", "Expiré"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisme = models.CharField(max_length=200)
+    titre = models.CharField(max_length=255)
+    description = models.TextField()
+    montant_max = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    devise = models.CharField(max_length=10, default="FCFA")
+    taux_financement_pct = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    criteres_eligibilite = models.TextField()
+    secteur = models.CharField(max_length=150, blank=True)
+    date_limite = models.DateField(null=True, blank=True)
+    url_source = models.URLField(blank=True)
+    statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.A_VERIFIER)
+    date_ingestion = models.DateTimeField(auto_now=True)
+    source_ingestion = models.CharField(max_length=50, default="n8n")
+
+    class Meta:
+        ordering = ("date_limite",)
 
     def __str__(self):
         return self.titre

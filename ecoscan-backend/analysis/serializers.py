@@ -2,8 +2,9 @@ from django.utils import timezone
 from rest_framework import serializers
 from .models import (
     Recommandation, Action, Decision, Livrable, ResultatMetrique,
-    ObservationOperationnelle, Anomalie, Hypothese, MemoireStrategique, DocumentEntreprise,
+    ObservationOperationnelle, Anomalie, Hypothese, MemoireStrategique, DocumentEntreprise,OpportuniteFinancement
 )
+from accounts.serializers import UtilisateurSerializer  # ajuste le chemin si besoin
 
 
 class RecommandationSerializer(serializers.ModelSerializer):
@@ -42,6 +43,8 @@ class ActionSerializer(serializers.ModelSerializer):
 
 class DecisionSerializer(serializers.ModelSerializer):
     """Sérialiseur pour l'archivage formel des arbitrages d'investissements."""
+
+    decideur = UtilisateurSerializer(read_only=True)
 
     class Meta:
         model = Decision
@@ -145,3 +148,20 @@ class DocumentEntrepriseSerializer(serializers.ModelSerializer):
             "valide", "valide_par", "date_validation", "indexe_rag", "date_depot",
         )
         read_only_fields = ("id", "depose_par", "valide", "valide_par", "date_validation", "indexe_rag", "date_depot")
+
+
+class DecisionSerializer(serializers.ModelSerializer):
+    """Sérialiseur pour l'archivage formel des arbitrages d'investissements."""
+
+    decideur = UtilisateurSerializer(read_only=True)
+
+    class Meta:
+        model = Decision
+        fields = ("id", "recommandation", "resultat", "commentaire", "date_decision", "decideur")
+        read_only_fields = ("id", "date_decision", "decideur")
+
+class OpportuniteFinancementSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OpportuniteFinancement
+        fields = "__all__"
+        read_only_fields = ("id", "date_ingestion")
