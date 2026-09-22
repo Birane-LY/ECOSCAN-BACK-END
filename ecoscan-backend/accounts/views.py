@@ -68,9 +68,9 @@ class EstAdminOuDevOuSoiMeme(permissions.BasePermission):
         if not request.user or not request.user.is_authenticated or not request.user.actif:
             return False
         
-        # Pour lister tous les comptes (GET /api/users/) ou inviter (POST), il faut être Admin ou Dev
+        # Pour lister tous les comptes (GET /api/users/) ou inviter (POST), il faut être Admin 
         if view.action in ["list", "create"]:
-            return request.user.role in [Utilisateur.Role.SUPER_ADMIN, Utilisateur.Role.ADMIN_ORGANISATION]
+            return request.user.role == Utilisateur.Role.ADMIN_ORGANISATION
             
         # Pour les actions unitaires (GET détaillé, PUT, PATCH, DELETE sur un ID), on autorise tout le monde.
         # Le filtrage fin se fera dans `has_object_permission` et `get_queryset`.
@@ -82,11 +82,7 @@ class EstAdminOuDevOuSoiMeme(permissions.BasePermission):
         # Un utilisateur a toujours le droit de consulter ou modifier son PROPRE profil
         if acteur.id == obj.id:
             return True
-            
-        # Les Super Admins peuvent gérer les objets de leur périmètre
-        if acteur.role == Utilisateur.Role.SUPER_ADMIN:
-            return obj.role == Utilisateur.Role.SUPER_ADMIN
-            
+              
         # Les Admins d'organisation peuvent gérer les objets de leur périmètre
         if acteur.role == Utilisateur.Role.ADMIN_ORGANISATION:
             return obj.role in [Utilisateur.Role.UTILISATEUR_ORGANISATION, Utilisateur.Role.CONSULTANT]
