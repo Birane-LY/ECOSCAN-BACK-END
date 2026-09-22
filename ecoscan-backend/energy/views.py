@@ -47,17 +47,13 @@ from .services.ai_client import analyser_image
 from .services.ocr import OCRServiceError
 from .services.prediction_tranches import etat_tranche, predire_kwh
 from .services.autonomie import estimer_autonomie
+from audit.services import enregistrer_evenement 
 
 logger = logging.getLogger(__name__)
 
 
 class OrganisationScopedQuerySetMixin:
-    """Filtrage multi-tenant commun à tous les ViewSets de l'app energy.
-
-    Le rôle SUPER_ADMIN est exclu des données métiers des organisations, comme
-    partout ailleurs dans le projet (accounts, organizations, analysis) : il
-    n'a pas vocation à consulter les données énergétiques des clients.
-    """
+    """Filtrage multi-tenant commun à tous les ViewSets de l'app energy."""
 
     permission_classes = [permissions.IsAuthenticated]
     organisation_lookup = "organisation"
@@ -77,12 +73,7 @@ class OrganisationScopedQuerySetMixin:
 
 
 class FichierSourceViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
-    """Gate 1 du pipeline d'import : dépôt physique du fichier source.
-
-    L'organisation, le nom, le type MIME, la taille et le hash sont calculés
-    ici plutôt que confiés au client — ce sont des faits sur le fichier reçu,
-    pas des déclarations qu'on peut laisser forger côté front.
-    """
+    """Gate 1 du pipeline d'import : dépôt physique du fichier source."""
 
     queryset = FichierSource.objects.select_related("organisation", "depose_par").order_by("-date_depot")
     serializer_class = FichierSourceSerializer
@@ -97,13 +88,26 @@ class FichierSourceViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         contenu = fichier.read()
         fichier.seek(0)
 
-        serializer.save(
+        fichier_instance = serializer.save(
             organisation=organisation,
             depose_par=self.request.user,
             nom=fichier.name,
             mime_type=getattr(fichier, "content_type", "") or "",
             taille_octets=fichier.size,
             hash=calculer_hash_fichier(fichier),
+        )
+
+        enregistrer_evenement(
+            utilisateur=self.request.user,
+            organisation=organisation,
+            action="DEPOT_FICHIER_SOURCE",
+            details={
+                "fichier_id": fichier_instance.id,
+                "nom": fichier_instance.nom,
+                "taille_octets": fichier_instance.taille_octets,
+                "hash": fichier_instance.hash,
+            },
+            request=self.request
         )
 
 
@@ -129,12 +133,24 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         nom_fichier = fichier_source.nom
         extension = nom_fichier.rsplit(".", 1)[-1].upper() if "." in nom_fichier else ""
 
-        serializer.save(
+        import_instance = serializer.save(
             lance_par=self.request.user,
             organisation=fichier_source.organisation,
             nom_fichier=nom_fichier,
             format=extension,
             type_donnees="",
+        )
+
+        enregistrer_evenement(
+            utilisateur=self.request.user,
+            organisation=fichier_source.organisation,
+            action="CREATION_IMPORT",
+            details={
+                "import_id": import_instance.id,
+                "fichier_source_id": fichier_source.id,
+                "compteur_id": compteur.id if compteur else None,
+            },
+            request=self.request
         )
 
     @action(detail=True, methods=["post"], url_path="lancer")
@@ -143,12 +159,20 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         import_instance = self.get_object()
         import_instance.lancer_import()  # statut -> EN_COURS
 
+        enregistrer_evenement(
+            utilisateur=request.user,
+            organisation=import_instance.organisation,
+            action="LANCEMENT_PIPELINE_OCR",
+            details={"import_id": import_instance.id},
+            request=request
+        )
+
         service = OCRService()
 
         try:
             texte = service.traiter_import(import_instance)
         except OCRServiceError as erreur:
-            self._echouer(import_instance, str(erreur))
+            self._echouer(import_instance, str(erreur), request)
             return Response(self.get_serializer(import_instance).data, status=status.HTTP_200_OK)
 
         score_lisibilite = service.calculer_score_lisibilite(texte)
@@ -169,6 +193,14 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
                 "statut", "ocr_statut", "ocr_erreur", "score_lisibilite",
                 "score_pertinence", "type_donnees", "date_traitement",
             ))
+
+            enregistrer_evenement(
+                utilisateur=request.user,
+                organisation=import_instance.organisation,
+                action="REJET_DOCUMENT_HORS_PERIMETRE",
+                details={"import_id": import_instance.id, "raison": import_instance.ocr_erreur},
+                request=request
+            )
             return Response(self.get_serializer(import_instance).data, status=status.HTTP_200_OK)
 
         champs = service.extraire_champs_energetiques(texte, classification["type"])
@@ -176,8 +208,6 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
 
         import_instance.donnees_extraites = champs
         import_instance.rapport_analyse = {"classification": classification, "validation": validation}
-        # Un document énergétique traité (facture, relevé) correspond à un seul
-        # enregistrement de consommation extrait, pas à un nombre de lignes de fichier.
         import_instance.nombre_lignes = 1
         import_instance.nombre_erreurs = len(validation["erreurs"])
         import_instance.score_qualite = self._calculer_score_qualite(score_lisibilite, score_pertinence, validation)
@@ -197,28 +227,41 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
             "nombre_erreurs", "score_qualite", "date_traitement",
         ))
 
-        # Ferme la boucle avec l'app analysis : un import TERMINE doit produire
-        # le ResultatMetrique que la vue "Analyses" lit — sinon l'upload réussit
-        # mais rien n'apparaît jamais côté analyses. Uniquement dans la branche
-        # de succès (jamais pour reject/incohérent/révision).
         if import_instance.statut == ImportDonnees.Statut.TERMINE:
             from analysis.views import _publier_resultat_depuis_import
             _publier_resultat_depuis_import(import_instance)
 
+        enregistrer_evenement(
+            utilisateur=request.user,
+            organisation=import_instance.organisation,
+            action="TRAITEMENT_IMPORT_TERMINE",
+            details={
+                "import_id": import_instance.id,
+                "statut_final": import_instance.statut,
+                "score_qualite": float(import_instance.score_qualite),
+            },
+            request=request
+        )
+
         return Response(self.get_serializer(import_instance).data, status=status.HTTP_200_OK)
 
-    @staticmethod
-    def _echouer(import_instance, message):
+    def _echouer(self, import_instance, message, request=None):
         import_instance.statut = ImportDonnees.Statut.ECHOUE
         import_instance.ocr_statut = "ECHEC"
         import_instance.ocr_erreur = message
         import_instance.date_traitement = timezone.now()
         import_instance.save(update_fields=("statut", "ocr_statut", "ocr_erreur", "date_traitement"))
 
+        enregistrer_evenement(
+            utilisateur=request.user if request else import_instance.lance_par,
+            organisation=import_instance.organisation,
+            action="ECHEC_TRAITEMENT_IMPORT",
+            details={"import_id": import_instance.id, "erreur": message},
+            request=request
+        )
+
     @staticmethod
     def _calculer_score_qualite(score_lisibilite, score_pertinence, validation):
-        """Combine la lisibilité OCR et la pertinence énergétique, pénalisées par les
-        erreurs et avertissements de validation des champs extraits."""
         base = ((float(score_lisibilite) + float(score_pertinence)) / 2) * 100
         base -= len(validation["erreurs"]) * 15
         base -= len(validation["warnings"]) * 5
@@ -239,7 +282,16 @@ class SourceDonneeViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet
         ).exists()
         if not est_membre:
             raise PermissionDenied("Vous ne pouvez pas créer une source pour une organisation dont vous n'êtes pas membre.")
-        serializer.save()
+        
+        instance = serializer.save()
+
+        enregistrer_evenement(
+            utilisateur=self.request.user,
+            organisation=organisation,
+            action="CREATION_SOURCE_DONNEE",
+            details={"source_id": instance.id, "nom": instance.nom},
+            request=self.request
+        )
 
 
 class FacteurEmissionViewSet(viewsets.ReadOnlyModelViewSet):
@@ -289,7 +341,16 @@ class ObjectifViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
         ).exists()
         if not est_membre:
             raise PermissionDenied("Vous ne pouvez pas créer un objectif pour une organisation dont vous n'êtes pas membre.")
-        serializer.save()
+        
+        instance = serializer.save()
+
+        enregistrer_evenement(
+            utilisateur=self.request.user,
+            organisation=organisation,
+            action="CREATION_OBJECTIF",
+            details={"objectif_id": instance.id, "titre": getattr(instance, "titre", "")},
+            request=self.request
+        )
 
 
 class IndicateurViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
@@ -345,11 +406,28 @@ class AchatWoyofalListCreateView(generics.ListCreateAPIView):
             compteur__site__organisation__membres__utilisateur=self.request.user)
 
     def create(self, request, *args, **kwargs):
-        # Idempotence : un retry de synchro offline renvoie l'achat existant
         existant = self.get_queryset().filter(client_id=request.data.get("client_id")).first()
         if existant:
             return Response(self.get_serializer(existant).data, status=200)
-        return super().create(request, *args, **kwargs)
+
+        response = super().create(request, *args, **kwargs)
+
+        if response.status_code == status.HTTP_201_CREATED:
+            compteur = _compteur_de(request, request.data.get("compteur"))
+            enregistrer_evenement(
+                utilisateur=request.user,
+                organisation=compteur.site.organisation if compteur else None,
+                action="CREATION_ACHAT_WOYOFAL",
+                details={
+                    "client_id": request.data.get("client_id"),
+                    "montant": request.data.get("montant_fcfa"),
+                    "compteur_id": compteur.id if compteur else None,
+                },
+                request=request
+            )
+
+        return response
+
 
 class ReleveSoldeListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -363,7 +441,23 @@ class ReleveSoldeListCreateView(generics.ListCreateAPIView):
         existant = self.get_queryset().filter(client_id=request.data.get("client_id")).first()
         if existant:
             return Response(self.get_serializer(existant).data, status=200)
-        return super().create(request, *args, **kwargs)
+
+        response = super().create(request, *args, **kwargs)
+
+        if response.status_code == status.HTTP_201_CREATED:
+            compteur = _compteur_de(request, request.data.get("compteur"))
+            enregistrer_evenement(
+                utilisateur=request.user,
+                organisation=compteur.site.organisation if compteur else None,
+                action="CREATION_RELEVE_SOLDE",
+                details={
+                    "client_id": request.data.get("client_id"),
+                    "compteur_id": compteur.id if compteur else None,
+                },
+                request=request
+            )
+
+        return response
 
 
 class AutonomieView(APIView):
@@ -375,7 +469,6 @@ class AutonomieView(APIView):
             return Response({"error": "Compteur introuvable."}, status=404)
         return Response(estimer_autonomie(compteur))
 
-    
 
 CHAMPS_UTILES_CAPTURE = (
     "numero_compteur", "ancien_index", "nouveau_index",
@@ -384,12 +477,7 @@ CHAMPS_UTILES_CAPTURE = (
 
 
 class CaptureImageView(APIView):
-    """Point d'entrée pour la capture photo mobile (compteur ou facture).
-
-    Ne persiste RIEN — retourne les champs extraits pour que l'utilisateur
-    les relise et les corrige avant tout enregistrement, exactement comme
-    pour l'OCR classique (aucune photo ne devient une donnée validée sans
-    confirmation humaine)."""
+    """Point d'entrée pour la capture photo mobile (compteur ou facture)."""
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser]
 
@@ -407,17 +495,24 @@ class CaptureImageView(APIView):
         champs_bruts = resultat.get("champs", {})
         champs_utiles = {cle: champs_bruts.get(cle) for cle in CHAMPS_UTILES_CAPTURE if champs_bruts.get(cle) is not None}
 
+        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        enregistrer_evenement(
+            utilisateur=request.user,
+            organisation=organisation,
+            action="CAPTURE_IMAGE_ANALYSEE",
+            details={"nom_fichier": fichier.name, "champs_detectes": list(champs_utiles.keys())},
+            request=request
+        )
+
         return Response({
             "champs": champs_utiles,
             "champs_non_lisibles": resultat.get("champs_non_lisibles", []),
             "description": resultat.get("description", ""),
         }, status=status.HTTP_200_OK)
-    
+
 
 class CreerImportDepuisCaptureView(APIView):
-    """Transforme une capture photo de facture (déjà analysée via
-    CaptureImageView) en un ImportDonnees TERMINE — après confirmation
-    humaine des champs, jamais automatiquement à la volée."""
+    """Transforme une capture photo en ImportDonnees TERMINE après confirmation."""
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser]
 
@@ -453,5 +548,16 @@ class CreerImportDepuisCaptureView(APIView):
             )
             from analysis.views import _publier_resultat_depuis_import
             _publier_resultat_depuis_import(import_instance)
+
+            enregistrer_evenement(
+                utilisateur=request.user,
+                organisation=organisation,
+                action="CREATION_IMPORT_DEPUIS_CAPTURE",
+                details={
+                    "import_id": import_instance.id,
+                    "fichier_source_id": fichier_source.id,
+                },
+                request=request
+            )
 
         return Response(ImportDonneesSerializer(import_instance).data, status=status.HTTP_201_CREATED)
