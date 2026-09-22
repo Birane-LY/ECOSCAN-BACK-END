@@ -7,5 +7,6 @@ urlpatterns = [
     path('api/organisations/', include('organizations.urls')), 
     path("api/energies/", include("energy.urls", namespace="energy")),
     path('api/analyses/', include('analysis.urls')),
+    path('api/audits/', include('audit.urls')),
 ]
 
