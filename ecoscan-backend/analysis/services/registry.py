@@ -148,6 +148,35 @@ REGISTRE_METRIQUES = {
         proprietaire="energy_analytics",
         version="1.0",
     ),
+    "variation_facture_vs_facture_precedente": DefinitionMetrique(
+    code="variation_facture_vs_facture_precedente",
+    nom="Variation de consommation entre deux factures consécutives",
+    objectif=(
+        "Détecter une dérive ou une amélioration de consommation pour les comptes "
+        "facturés au réel, où les relevés ne sont pas assez fréquents pour une "
+        "comparaison journalière (voir variation_vs_baseline, pensée pour Woyofal "
+        "ou des capteurs automatiques)."
+    ),
+    question_metier="Notre consommation facturée augmente-t-elle ou diminue-t-elle par rapport à la période précédente ?",
+    decision_associee="Investiguer une dérive de consommation entre deux factures, ou confirmer l'effet d'une action déjà décidée.",
+    formule_description="(consommation de la facture actuelle - consommation de la facture précédente) / facture précédente × 100.",
+    unite="%",
+    frequence="par facture",
+    sources_requises=("consommation_facture_periodique",),
+    qualite_requise=QualiteRequise(completude_min=1.0, nombre_observations_min=2),
+    limites=(
+        "Compare deux périodes de facturation qui peuvent avoir des durées "
+        "légèrement différentes (30 à 60 jours selon Senelec) — la variation "
+        "n'est pas normalisée par jour, seulement par période facturée.",
+        "Une seule facture précédente sert de référence, pas une moyenne — plus "
+        "sensible à un événement exceptionnel isolé qu'une baseline sur plusieurs "
+        "semaines.",
+        "Ne tient pas compte du volume de production ou de la météo sans "
+        "normalisation externe.",
+    ),
+    proprietaire="energy_analytics",
+    version="1.0",
+),
 }
 
 

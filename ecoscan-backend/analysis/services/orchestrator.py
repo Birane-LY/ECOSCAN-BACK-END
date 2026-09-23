@@ -8,6 +8,8 @@ humain, déclenché depuis l'API avec l'objectif à associer (voir
 RecommandationViewSet), jamais depuis ce module.
 """
 
+from datetime import timedelta
+
 from analysis.services.anomaly import detecter_anomalie
 from analysis.services.context import obtenir_contexte
 from analysis.services.hypothesis import generer_hypothese
@@ -30,12 +32,16 @@ def analyser_compteur(organisation, compteur, date_jour) -> dict:
             "hypothese": None,
         }
 
+    debut_jour = date_jour.replace(hour=0, minute=0, second=0, microsecond=0)
+    fin_jour = debut_jour + timedelta(days=1)
 
     from analysis.models import ResultatMetrique
     resultat_persiste = ResultatMetrique.objects.filter(
         organisation=organisation,
         compteur=compteur,
         code_metrique="variation_vs_baseline",
+        periode_debut=debut_jour,
+        periode_fin=fin_jour,
     ).order_by("-date_calcul").first()
 
     if resultat_persiste is None:

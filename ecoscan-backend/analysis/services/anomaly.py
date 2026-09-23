@@ -32,29 +32,28 @@ def _classer_severite(ecart_absolu: Decimal) -> Optional[str]:
     return Anomalie.Severite.INVESTIGATION_PRIORITAIRE
 
 
-def detecter_anomalie(resultat_variation: ResultatMetrique) -> Optional[Anomalie]:
-    """Analyse un ResultatMetrique de type 'variation_vs_baseline' et crée (ou met
-    à jour) l'Anomalie correspondante si l'écart dépasse le seuil de surveillance.
+CODES_METRIQUES_COMPATIBLES = ("variation_vs_baseline", "variation_facture_vs_facture_precedente")
 
-    Idempotent par construction (update_or_create sur resultat_metrique) :
-    relancer la détection sur le même résultat ne crée jamais de doublon.
-    """
-    if resultat_variation.code_metrique != "variation_vs_baseline":
+
+def detecter_anomalie(resultat_variation: ResultatMetrique) -> Optional[Anomalie]:
+    """Analyse un ResultatMetrique de type variation (relevé fréquent OU facture
+    périodique) et crée/met à jour l'Anomalie correspondante si l'écart dépasse
+    le seuil de surveillance. Les deux codes de métrique partagent la même
+    logique de seuils et de sévérité — seule la façon dont la variation a été
+    calculée en amont diffère (voir metrics_service.py / _publier_resultat)."""
+    if resultat_variation.code_metrique not in CODES_METRIQUES_COMPATIBLES:
         raise ValueError(
-            f"detecter_anomalie attend un ResultatMetrique 'variation_vs_baseline', "
+            f"detecter_anomalie attend un ResultatMetrique parmi {CODES_METRIQUES_COMPATIBLES}, "
             f"reçu '{resultat_variation.code_metrique}'."
         )
     if resultat_variation.valeur is None:
-        return None  # métrique insuffisante (déjà signalé en amont par MetricsService)
+        return None
 
     ecart_pourcentage = resultat_variation.valeur
     severite = _classer_severite(abs(ecart_pourcentage))
     if severite is None:
         return None
 
-    # La consommation observée n'est pas stockée séparément sur ResultatMetrique
-    # (seul le pourcentage de variation l'est) — elle se déduit de la baseline :
-    # observee = baseline * (1 + variation / 100).
     valeur_attendue = resultat_variation.baseline_valeur
     valeur_observee = None
     if valeur_attendue is not None:

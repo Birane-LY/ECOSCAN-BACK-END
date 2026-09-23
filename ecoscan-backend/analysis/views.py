@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from django.utils import timezone
 from django.core.exceptions import ValidationError
+from django.core.files.storage import default_storage
 from rest_framework import status, viewsets
 from rest_framework.views import APIView   
 from django.conf import settings
@@ -44,6 +45,10 @@ from analysis.api.ai_client import indexer_document
 from analysis.api.ai_client import interroger_assistant
 from analysis.services.registry import obtenir_definition
 from analysis.services.memory_service import creer_memoire_depuis_hypothese
+from analysis.services.anomaly import detecter_anomalie
+from analysis.services.context import obtenir_contexte
+from analysis.services.hypothesis import generer_hypothese
+from analysis.services.report_service import generer_pdf_livrable
 from audit.services import enregistrer_evenement
 
 logger = logging.getLogger(__name__)
@@ -155,7 +160,55 @@ def _publier_resultat_depuis_import(import_instance):
             "limites": limites,
         },
     )
+
+    if cree and resultat.valeur is not None:
+        variation = _calculer_variation_facture(resultat)
+        if variation is not None:
+            anomalie = detecter_anomalie(variation)
+            if anomalie is not None:
+                contexte = obtenir_contexte(anomalie)
+                generer_hypothese(anomalie, contexte)
     return resultat, cree
+
+
+def _calculer_variation_facture(resultat_actuel: ResultatMetrique):
+    """Compare la facture publiée à la précédente pour la même organisation."""
+    precedent = (
+        ResultatMetrique.objects.filter(
+            organisation=resultat_actuel.organisation,
+            code_metrique="consommation_facture_periodique",
+        )
+        .exclude(id=resultat_actuel.id)
+        .filter(periode_fin__lt=resultat_actuel.periode_fin)
+        .order_by("-periode_fin")
+        .first()
+    )
+    if precedent is None or precedent.valeur is None or precedent.valeur == 0:
+        return None
+
+    variation_pct = ((resultat_actuel.valeur - precedent.valeur) / precedent.valeur) * 100
+    definition = obtenir_definition("variation_facture_vs_facture_precedente")
+    variation_resultat, _ = ResultatMetrique.objects.update_or_create(
+        organisation=resultat_actuel.organisation,
+        compteur=resultat_actuel.compteur,
+        code_metrique=definition.code,
+        periode_debut=precedent.periode_fin,
+        periode_fin=resultat_actuel.periode_fin,
+        version_metrique=definition.version,
+        defaults={
+            "valeur": Decimal(str(round(variation_pct, 2))),
+            "unite": definition.unite,
+            "baseline_type": "facture_precedente",
+            "baseline_valeur": precedent.valeur,
+            "baseline_nombre_observations": 1,
+            "completude": Decimal("1.0"),
+            "statut_qualite": ResultatMetrique.StatutQualite.FIABLE,
+            "confiance": Decimal("1.0"),
+            "sources": list(definition.sources_requises),
+            "limites": list(definition.limites),
+        },
+    )
+    return variation_resultat
 
 
 class AnalyseScopedQuerySetMixin:
@@ -322,7 +375,11 @@ class DecisionViewSet(AnalyseScopedViewSet):
             identifiant_ressource=str(decision.id),
             utilisateur=self.request.user,
             organisation=organisation,
-            details={"type_decision": decision.type_decision if hasattr(decision, "type_decision") else ""},
+            # CORRECTIF : "type_decision" n'existe pas sur le modèle Decision
+            # (champs réels : resultat, commentaire, date_decision, decideur) —
+            # hasattr() renvoyait toujours False, ce détail n'était donc jamais
+            # tracé dans le journal d'audit.
+            details={"resultat": decision.resultat},
             request=self.request,
         )
 
@@ -336,12 +393,37 @@ class LivrableViewSet(AnalyseScopedViewSet):
 
     @action(detail=True, methods=["post"])
     def generer(self, request, pk=None):
-        """Fige la publication formelle du livrable.
+        """Génère réellement le PDF du livrable (voir analysis/services/report_service.py)
+        puis fige la publication formelle.
+
+        CORRECTIF : Livrable.generer() (models.py) ne fait que basculer le
+        statut et la date — c'est ATTENDU, cohérent avec le reste du module où
+        les méthodes du modèle sont de simples transitions d'état et toute
+        logique avec effet de bord vit dans services/ (voir hypothesis.py,
+        memory_service.py). Ce qui manquait, c'est cet appel lui-même : rien
+        n'invoquait jamais la génération du fichier — url_fichier restait donc
+        vide indéfiniment, même après un appel "réussi" à cette action.
+
+        Si la génération du PDF échoue, le livrable reste en BROUILLON (pas de
+        statut GENERE ni de date_generation) plutôt que de mentir sur son état.
 
         Action traçée dans le journal d'audit sous la clé 'GENERER_LIVRABLE'.
         """
         livrable = self.get_object()
-        livrable.generer()
+
+        try:
+            pdf_file = generer_pdf_livrable(livrable)
+        except Exception as exc:
+            logger.exception("Échec de la génération du PDF pour le livrable %s.", livrable.id)
+            return Response(
+                {"error": f"Échec de la génération du rapport : {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        chemin_stocke = default_storage.save(f"livrables/{livrable.id}/{pdf_file.name}", pdf_file)
+        livrable.url_fichier = default_storage.url(chemin_stocke)
+        livrable.save(update_fields=("url_fichier",))
+        livrable.generer()  # statut=GENERE, date_generation=maintenant
 
         organisation = livrable.fiche_projet.organisation if livrable.fiche_projet else None
 
@@ -519,9 +601,19 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
             confiance (float): Le niveau de confiance validé par l'expert (0.0 à 1.0).
         """
         hypothese = self.get_object()
-        confiance = request.data.get("confiance")
-        if confiance is None:
+        confiance_brute = request.data.get("confiance")
+        if confiance_brute is None:
             return Response({"error": "confiance est requise (0.0 à 1.0) pour confirmer une hypothèse."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # CORRECTIF : confiance était affectée telle quelle, sans validation —
+        # une valeur non numérique ou hors [0, 1] provoquait une erreur base de
+        # données brute (DecimalField) au lieu d'une réponse 400 propre.
+        try:
+            confiance = Decimal(str(confiance_brute))
+        except InvalidOperation:
+            return Response({"error": "confiance doit être un nombre entre 0.0 et 1.0."}, status=status.HTTP_400_BAD_REQUEST)
+        if not (Decimal("0") <= confiance <= Decimal("1")):
+            return Response({"error": "confiance doit être comprise entre 0.0 et 1.0."}, status=status.HTTP_400_BAD_REQUEST)
 
         hypothese.statut = Hypothese.Statut.CONFIRMEE
         hypothese.confiance = confiance
