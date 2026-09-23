@@ -155,9 +155,8 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
 
     @action(detail=True, methods=["post"], url_path="lancer")
     def lancer(self, request, pk=None):
-        """Exécute la chaîne OCR -> classification -> extraction -> validation, et persiste le résultat."""
         import_instance = self.get_object()
-        import_instance.lancer_import()  # statut -> EN_COURS
+        import_instance.lancer_import()
 
         enregistrer_evenement(
             utilisateur=request.user,
@@ -276,14 +275,18 @@ class SourceDonneeViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet
     serializer_class = SourceDonneeSerializer
 
     def perform_create(self, serializer):
-        organisation = serializer.validated_data.get("organisation")
-        est_membre = organisation and UtilisateurOrganisation.objects.filter(
+        organisation = serializer.validated_data.get("organisation") or self._organisations_de_lutilisateur().first()
+        
+        if not organisation:
+            raise PermissionDenied("Aucune organisation associée à ce compte.")
+
+        est_membre = UtilisateurOrganisation.objects.filter(
             organisation=organisation, utilisateur=self.request.user
         ).exists()
         if not est_membre:
             raise PermissionDenied("Vous ne pouvez pas créer une source pour une organisation dont vous n'êtes pas membre.")
         
-        instance = serializer.save()
+        instance = serializer.save(organisation=organisation)
 
         enregistrer_evenement(
             utilisateur=self.request.user,
@@ -335,14 +338,17 @@ class ObjectifViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
     serializer_class = ObjectifSerializer
 
     def perform_create(self, serializer):
-        organisation = serializer.validated_data.get("organisation")
-        est_membre = organisation and UtilisateurOrganisation.objects.filter(
+        organisation = serializer.validated_data.get("organisation") or self._organisations_de_lutilisateur().first()
+        if not organisation:
+            raise PermissionDenied("Aucune organisation associée.")
+
+        est_membre = UtilisateurOrganisation.objects.filter(
             organisation=organisation, utilisateur=self.request.user
         ).exists()
         if not est_membre:
             raise PermissionDenied("Vous ne pouvez pas créer un objectif pour une organisation dont vous n'êtes pas membre.")
         
-        instance = serializer.save()
+        instance = serializer.save(organisation=organisation)
 
         enregistrer_evenement(
             utilisateur=self.request.user,
@@ -414,6 +420,18 @@ class AchatWoyofalListCreateView(generics.ListCreateAPIView):
 
         if response.status_code == status.HTTP_201_CREATED:
             compteur = _compteur_de(request, request.data.get("compteur"))
+            
+            # --- Synchronisation avec DonneeEnergetique pour alimenter le DataCenter ---
+            if compteur:
+                valeur_kwh = response.data.get("kwh_obtenus") or 0
+                if valeur_kwh:
+                    DonneeEnergetique.objects.create(
+                        compteur=compteur,
+                        valeur=Decimal(str(valeur_kwh)),
+                        periode_debut=timezone.now(),
+                        periode_fin=timezone.now(),
+                    )
+
             enregistrer_evenement(
                 utilisateur=request.user,
                 organisation=compteur.site.organisation if compteur else None,
@@ -446,6 +464,18 @@ class ReleveSoldeListCreateView(generics.ListCreateAPIView):
 
         if response.status_code == status.HTTP_201_CREATED:
             compteur = _compteur_de(request, request.data.get("compteur"))
+            
+            # --- Synchronisation avec DonneeEnergetique pour alimenter le DataCenter ---
+            if compteur:
+                valeur_index = response.data.get("valeur") or response.data.get("index_kwh")
+                if valeur_index is not None:
+                    DonneeEnergetique.objects.create(
+                        compteur=compteur,
+                        valeur=Decimal(str(valeur_index)),
+                        periode_debut=timezone.now(),
+                        periode_fin=timezone.now(),
+                    )
+
             enregistrer_evenement(
                 utilisateur=request.user,
                 organisation=compteur.site.organisation if compteur else None,
@@ -477,7 +507,6 @@ CHAMPS_UTILES_CAPTURE = (
 
 
 class CaptureImageView(APIView):
-    """Point d'entrée pour la capture photo mobile (compteur ou facture)."""
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser]
 
@@ -512,7 +541,6 @@ class CaptureImageView(APIView):
 
 
 class CreerImportDepuisCaptureView(APIView):
-    """Transforme une capture photo en ImportDonnees TERMINE après confirmation."""
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser]
 

@@ -170,6 +170,8 @@ class DonneeEnergetique(models.Model):
     )
     valeur = models.DecimalField(max_digits=18, decimal_places=6)
     unite = models.CharField(max_length=30)
+    date_releve = models.DateField()
+    creneau = models.CharField(max_length=50, blank=True, default="")
     periode_debut = models.DateTimeField()
     periode_fin = models.DateTimeField()
     statut_validation = models.CharField(
@@ -181,6 +183,13 @@ class DonneeEnergetique(models.Model):
 
     class Meta:
         ordering = ("-periode_debut",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=("compteur", "date_releve", "creneau"),
+                condition=models.Q(creneau__gt=""),
+                name="donnee_energetique_compteur_date_creneau_unique",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.compteur.reference} : {self.valeur} {self.unite}"

@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.utils import timezone
 
 from .models import (
     DonneeEnergetique,
@@ -12,7 +13,7 @@ from .models import (
     SourceDonnee,
     SyntheseFinanciere,
     AchatWoyofal,
-    ReleveSolde
+    ReleveSolde,
 )
 
 
@@ -60,48 +61,76 @@ class SourceDonneeSerializer(serializers.ModelSerializer):
             "statut_synchronisation",
             "derniere_synchronisation",
         )
-        read_only_fields = ("id", "derniere_synchronisation")
+        read_only_fields = (
+            "id",
+            "derniere_synchronisation",
+        )
+        extra_kwargs = {
+            "organisation": {
+                "required": False,
+                "allow_null": True,
+            }
+        }
 
 
 class ImportDonneesSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour le pilotage et le suivi des processus d'importation.
-
-    Seul `fichier_source` (et optionnellement `source_donnee`) doit être
-    envoyé par le client à la création — organisation, lance_par, nom_fichier,
-    format et type_donnees sont calculés côté serveur dans
-    ImportDonneesViewSet.perform_create() à partir du fichier_source fourni,
-    jamais déclarés par le front.
-    """
+    """Sérialiseur pour le pilotage et le suivi des processus d'importation."""
 
     class Meta:
         model = ImportDonnees
+
         fields = (
-            "id", "fichier_source", "organisation", "source_donnee", "compteur",
-            "lance_par", "nom_fichier", "format", "type_donnees",
-            "nombre_lignes", "nombre_erreurs", "score_qualite", "statut", "date_import",
-            "ocr_statut", "ocr_erreur", "score_lisibilite", "score_pertinence",
-            "donnees_extraites", "rapport_analyse", "date_traitement",
-        )
-        read_only_fields = (
-            "id", "organisation", "lance_par", "nom_fichier", "format", "type_donnees",
-            "date_import", "statut", "score_qualite", "ocr_statut", "ocr_erreur",
-            "score_lisibilite", "score_pertinence", "donnees_extraites", "rapport_analyse",
+            "id",
+            "fichier_source",
+            "organisation",
+            "source_donnee",
+            "compteur",
+            "lance_par",
+            "nom_fichier",
+            "format",
+            "type_donnees",
+            "nombre_lignes",
+            "nombre_erreurs",
+            "score_qualite",
+            "statut",
+            "date_import",
+            "ocr_statut",
+            "ocr_erreur",
+            "score_lisibilite",
+            "score_pertinence",
+            "donnees_extraites",
+            "rapport_analyse",
             "date_traitement",
         )
+
+        read_only_fields = (
+            "id",
+            "organisation",
+            "lance_par",
+            "nom_fichier",
+            "format",
+            "type_donnees",
+            "date_import",
+            "statut",
+            "score_qualite",
+            "ocr_statut",
+            "ocr_erreur",
+            "score_lisibilite",
+            "score_pertinence",
+            "donnees_extraites",
+            "rapport_analyse",
+            "date_traitement",
+        )
+
     def validate_compteur(self, value):
-        """Si un compteur est fourni, il doit appartenir à la même organisation
-        que le fichier_source de cet import — même réflexe d'appartenance
-        appliqué partout ailleurs dans ce projet."""
         if value is None:
             return value
-        fichier_source = self.initial_data.get("fichier_source")
-        if fichier_source and str(value.site.organisation_id) != str(fichier_source if not hasattr(fichier_source, "organisation_id") else fichier_source.organisation_id):
-        
-            pass
+
         return value
-    
+
+
 class FacteurEmissionSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour les coefficients réglementaires de conversion carbone."""
+    """Sérialiseur pour les coefficients réglementaires."""
 
     class Meta:
         model = FacteurEmission
@@ -118,56 +147,116 @@ class FacteurEmissionSerializer(serializers.ModelSerializer):
 
 
 class DonneeEnergetiqueSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour l'enregistrement et la validation des index de consommation."""
 
     class Meta:
         model = DonneeEnergetique
-        fields = (
+
+        fields = "__all__"
+
+        read_only_fields = (
             "id",
-            "compteur",
-            "source_donnee",
-            "facteur_emission",
-            "valeur",
-            "unite",
-            "periode_debut",
-            "periode_fin",
-            "statut_validation",
-            "source",
+            "date_creation",
+            "date_modification",
         )
-        read_only_fields = ("id",)
 
-    def validate(self, data):
-        """Validation temporelle et logique de la donnée de consommation."""
-        periode_debut = data.get("periode_debut") or (self.instance.periode_debut if self.instance else None)
-        periode_fin = data.get("periode_fin") or (self.instance.periode_fin if self.instance else None)
-        compteur = data.get("compteur") or (self.instance.compteur if self.instance else None)
-        source_donnee = data.get("source_donnee") or (self.instance.source_donnee if self.instance else None)
+    def validate(self, attrs):
+        """
+        Empêche l'enregistrement de plusieurs relevés
+        pour le même compteur, le même créneau et le
+        même jour.
 
-        if periode_debut and periode_fin and periode_fin < periode_debut:
-            raise serializers.ValidationError(
-                {"periode_fin": "La date de fin de la période de consommation ne peut pas être antérieure à sa date de début."}
+        Exemple :
+
+        23/09 - matin -> autorisé
+        23/09 - matin -> refusé
+        24/09 - matin -> autorisé
+        """
+
+        compteur = attrs.get("compteur")
+
+        if not compteur:
+            raise serializers.ValidationError({
+                "compteur": (
+                    "Le compteur est obligatoire."
+                )
+            })
+
+
+        creneau = attrs.get("creneau")
+
+        if not creneau:
+            raise serializers.ValidationError({
+                "creneau": (
+                    "Le créneau est obligatoire."
+                )
+            })
+
+
+        date_releve = attrs.get(
+            "date_releve"
+        )
+
+
+        if date_releve:
+            if hasattr(
+                date_releve,
+                "date",
+            ):
+                date_locale = timezone.localtime(
+                    date_releve
+                ).date()
+            else:
+                date_locale = date_releve
+
+        else:
+            date_locale = timezone.localtime(
+                timezone.now()
+            ).date()
+
+        queryset = (
+            DonneeEnergetique.objects.filter(
+                compteur=compteur,
+                date_releve=date_locale,
+                creneau=creneau,
+            )
+        )
+
+        if self.instance:
+            queryset = queryset.exclude(
+                pk=self.instance.pk
             )
 
-        if compteur and source_donnee:
-            if compteur.site.organisation != source_donnee.organisation:
-                raise serializers.ValidationError(
-                    "Incohérence détectée : Le compteur et la source de données configurés doivent appartenir à la même organisation."
+        if queryset.exists():
+            raise serializers.ValidationError({
+                "creneau": (
+                    "Ce créneau a déjà été enregistré "
+                    "aujourd'hui."
                 )
+            })
 
-        return data
+        attrs["date_releve"] = date_locale
+
+
+        return attrs
 
 
 class HistoriquePerformanceSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour les consolidations historiques de performance d'un audit."""
 
     class Meta:
         model = HistoriquePerformance
-        fields = ("id", "fiche_projet", "periode", "consommation", "emissions", "economie", "unite")
+        fields = (
+            "id",
+            "fiche_projet",
+            "periode",
+            "consommation",
+            "emissions",
+            "economie",
+            "unite",
+        )
         read_only_fields = ("id",)
 
 
 class SyntheseFinanciereSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour les indicateurs de rentabilité financière et ROI."""
 
     class Meta:
         model = SyntheseFinanciere
@@ -180,11 +269,13 @@ class SyntheseFinanciereSerializer(serializers.ModelSerializer):
             "retour_investissement",
             "date_calcul",
         )
-        read_only_fields = ("id", "date_calcul")
+        read_only_fields = (
+            "id",
+            "date_calcul",
+        )
 
 
 class ObjectifSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour le suivi des objectifs énergétiques de l'entreprise."""
 
     class Meta:
         model = Objectif
@@ -205,28 +296,62 @@ class ObjectifSerializer(serializers.ModelSerializer):
         read_only_fields = ("id",)
 
     def validate(self, data):
-        """Validation temporelle des horizons d'objectifs."""
-        date_debut = data.get("date_debut") or (self.instance.date_debut if self.instance else None)
-        date_fin = data.get("date_fin") or (self.instance.date_fin if self.instance else None)
+        date_debut = data.get(
+            "date_debut"
+        ) or (
+            self.instance.date_debut
+            if self.instance
+            else None
+        )
 
-        if date_debut and date_fin and date_fin < date_debut:
+        date_fin = data.get(
+            "date_fin"
+        ) or (
+            self.instance.date_fin
+            if self.instance
+            else None
+        )
+
+        if (
+            date_debut
+            and date_fin
+            and date_fin < date_debut
+        ):
             raise serializers.ValidationError(
-                {"date_fin": "La date d'échéance de l'objectif ne peut pas être antérieure à sa date de lancement."}
+                {
+                    "date_fin": (
+                        "La date d'échéance de "
+                        "l'objectif ne peut pas être "
+                        "antérieure à sa date de lancement."
+                    )
+                }
             )
+
         return data
 
 
 class IndicateurSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour la consultation et le suivi des KPIs énergétiques."""
 
     class Meta:
         model = Indicateur
-        fields = ("id", "objectif", "nom", "type", "valeur", "unite", "periode", "methode_calcul", "date_calcul")
-        read_only_fields = ("id", "date_calcul")
+        fields = (
+            "id",
+            "objectif",
+            "nom",
+            "type",
+            "valeur",
+            "unite",
+            "periode",
+            "methode_calcul",
+            "date_calcul",
+        )
+        read_only_fields = (
+            "id",
+            "date_calcul",
+        )
 
 
 class IndicateurObjectifSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour la consolidation de performance globale face à un objectif."""
 
     class Meta:
         model = IndicateurObjectif
@@ -244,40 +369,91 @@ class IndicateurObjectifSerializer(serializers.ModelSerializer):
         read_only_fields = ("id",)
 
     def validate(self, data):
-        """Vérifie la cohérence de l'indicateur d'objectif par rapport aux sous-indicateurs liés."""
-        objectif = data.get("objectif") or (self.instance.objectif if self.instance else None)
-        list_indicateurs = data.get("indicateurs") or (list(self.instance.indicateurs.all()) if self.instance else [])
+        objectif = data.get(
+            "objectif"
+        ) or (
+            self.instance.objectif
+            if self.instance
+            else None
+        )
+
+        list_indicateurs = data.get(
+            "indicateurs"
+        ) or (
+            list(
+                self.instance.indicateurs.all()
+            )
+            if self.instance
+            else []
+        )
 
         if objectif and list_indicateurs:
             for indicateur in list_indicateurs:
                 if indicateur.objectif != objectif:
                     raise serializers.ValidationError(
-                        {"indicateurs": f"L'indicateur '{indicateur.nom}' découle d'un autre objectif. Liaison impossible."}
+                        {
+                            "indicateurs": (
+                                f"L'indicateur "
+                                f"'{indicateur.nom}' "
+                                "découle d'un autre "
+                                "objectif. Liaison impossible."
+                            )
+                        }
                     )
+
         return data
 
 
 class AchatWoyofalSerializer(serializers.ModelSerializer):
+
     class Meta:
         model = AchatWoyofal
-        fields = ("id", "client_id", "compteur", "montant_fcfa", "kwh_credites",
-                  "kwh_predits", "date_achat", "source")
+        fields = (
+            "id",
+            "client_id",
+            "compteur",
+            "montant_fcfa",
+            "kwh_credites",
+            "kwh_predits",
+            "date_achat",
+            "source",
+        )
         read_only_fields = ("id",)
 
     def validate_compteur(self, compteur):
         user = self.context["request"].user
-        if not compteur.site.organisation.membres.filter(utilisateur=user).exists():
-            raise serializers.ValidationError("Compteur hors de votre organisation.")
+
+        if not compteur.site.organisation.membres.filter(
+            utilisateur=user
+        ).exists():
+            raise serializers.ValidationError(
+                "Compteur hors de votre organisation."
+            )
+
         return compteur
 
+
 class ReleveSoldeSerializer(serializers.ModelSerializer):
+
     class Meta:
         model = ReleveSolde
-        fields = ("id", "client_id", "compteur", "kwh_restants", "date_releve")
+        fields = (
+            "id",
+            "client_id",
+            "compteur",
+            "kwh_restants",
+            "date_releve",
+        )
         read_only_fields = ("id",)
 
     def validate_compteur(self, compteur):
         user = self.context["request"].user
-        if not compteur.site.organisation.membres.filter(utilisateur=user).exists():
-            raise serializers.ValidationError("Compteur hors de votre organisation.")
+
+        if not compteur.site.organisation.membres.filter(
+            utilisateur=user
+        ).exists():
+            raise serializers.ValidationError(
+                "Compteur hors de votre organisation."
+            )
+
         return compteur
