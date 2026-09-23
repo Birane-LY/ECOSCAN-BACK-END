@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework.decorators import action
 
 from .models import Utilisateur, PreferencesUtilisateur
 from .serializers import (
@@ -100,6 +101,12 @@ class UtilisateurViewSet(viewsets.ModelViewSet):
     queryset = Utilisateur.objects.all().order_by("email")
     permission_classes = [EstAdminOuDevOuSoiMeme]
 
+    @action(detail=False, methods=['get'], url_path='me')
+    def me(self, request):
+        """Renvoie les données du profil de l'utilisateur actuellement connecté."""
+        serializer = self.get_serializer(request.user)
+        return Response(serializer.data)
+    
     def get_serializer_class(self):
         """Bascule sur le sérialiseur d'invitation lors d'une création (POST)."""
         if self.action == "create":
