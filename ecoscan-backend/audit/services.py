@@ -32,8 +32,8 @@ def extraire_adresse_ip(request) -> Optional[str]:
 
 
 def enregistrer_evenement(
-    action: str,
-    ressource: str,
+    action: str = "",
+    ressource: str = "",
     *,
     utilisateur=None,
     organisation=None,
