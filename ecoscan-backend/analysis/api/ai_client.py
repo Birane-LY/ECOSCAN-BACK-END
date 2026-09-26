@@ -1,42 +1,55 @@
 """
 Client Django -> service FastAPI EcoScan AI/RAG.
 
-Miroir côté Django du `django_client.py` déjà écrit côté FastAPI (qui, lui, va
-dans l'autre sens : FastAPI -> Django pour le contexte métier temps réel). Les
-deux services s'appellent mutuellement via le même principe : jeton de service
-partagé, dégradation gracieuse si l'autre service est indisponible.
+Miroir côté Django du `django_client.py` côté FastAPI (qui va dans l'autre sens :
+FastAPI -> Django pour le contexte métier temps réel). Les deux services
+s'authentifient par jeton partagé et dégradent gracieusement si l'autre est
+indisponible.
 
-Politique d'indexation (reprise du document RAG partagé plus tôt dans ce
-projet) : on n'envoie à /internal/documents QUE du contenu déjà validé par un
-humain ou par les règles métier déterministes — jamais du texte OCR brut, jamais
-une hypothèse IA non confirmée, jamais une donnée REVUE_REQUISE. C'est la
-responsabilité de l'appelant (memory_service, DocumentEntreprise.valider) de ne
-transmettre à ce module QUE du contenu qui a déjà passé cette barrière.
+Politique d'indexation : on n'envoie à /internal/documents QUE du contenu déjà
+validé par un humain ou par les règles métier déterministes — jamais du texte
+OCR brut, jamais une hypothèse IA non confirmée, jamais une donnée
+REVUE_REQUISE. C'est la responsabilité de l'appelant (memory_service,
+DocumentEntrepriseViewSet.valider).
 """
 
-import logging
-import uuid
-from typing import Any, Optional
-
 import json
+import logging
 import urllib.error
 import urllib.request
+import uuid
+from typing import Optional
+
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-AI_SERVICE_URL = getattr(settings, "AI_SERVICE_URL", "http://localhost:8001")
+AI_SERVICE_URL = getattr(settings, "AI_SERVICE_URL", "http://localhost:8001").rstrip("/")
 AI_SERVICE_INTERNAL_TOKEN = getattr(settings, "AI_SERVICE_INTERNAL_TOKEN", "change-me-internal-token")
-AI_SERVICE_TIMEOUT = getattr(settings, "AI_SERVICE_TIMEOUT", 15.0)
+# La chaîne de secours FastAPI peut enchaîner plusieurs modèles (30 s chacun) :
+# un délai de 15 s coupait la requête avant la réponse. 60 s par défaut.
+AI_SERVICE_TIMEOUT = getattr(settings, "AI_SERVICE_TIMEOUT", 60.0)
 
 _HEADERS = {"X-Internal-Service-Token": AI_SERVICE_INTERNAL_TOKEN}
 
 if AI_SERVICE_INTERNAL_TOKEN == "change-me-internal-token":
     logger.warning(
-        "AI_SERVICE_INTERNAL_TOKEN n'est pas configuré (valeur par défaut utilisée) : "
-        "le service IA va systématiquement répondre 401 tant que cette valeur ne sera "
-        "pas exactement identique à INTERNAL_TOKEN côté service FastAPI."
+        "AI_SERVICE_INTERNAL_TOKEN n'est pas configuré (valeur par défaut) : le service "
+        "IA répondra 401/500 tant que cette valeur ne sera pas identique à INTERNAL_TOKEN "
+        "côté FastAPI."
     )
+
+
+def _decrire_erreur(exc: Exception) -> str:
+    """Message lisible : pour une erreur HTTP, on remonte le code ET le détail
+    renvoyé par FastAPI (401 = jeton, 500 = jeton non configuré, 422 = payload...)."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = ""
+        return f"Service IA en erreur (HTTP {exc.code}) {detail}".strip()
+    return f"Service IA indisponible : {exc}"
 
 
 def _post_json(url: str, payload: dict) -> dict:
@@ -50,13 +63,20 @@ def _post_json(url: str, payload: dict) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _appeler(url: str, payload: dict, contexte: str) -> dict:
+    try:
+        return _post_json(url, payload)
+    except (OSError, ValueError) as exc:  # URLError/HTTPError/timeout/JSON invalide
+        message = _decrire_erreur(exc)
+        logger.warning("%s : %s", contexte, message)
+        return {"_error": message}
+
+
 def indexer_document(
     organisation_id, document_id, texte: str, source: str, import_id=None, metadata: Optional[dict] = None
 ) -> dict:
     """Pousse un contenu déjà validé vers l'index RAG. Ne lève jamais d'exception :
-    une panne du service IA ne doit jamais faire échouer l'action métier qui a
-    déclenché l'indexation (mêmes principes que enregistrer_evenement côté audit
-    et publier_import_termine côté energy->analysis)."""
+    une panne du service IA ne doit jamais faire échouer l'action métier."""
     payload = {
         "event_id": str(uuid.uuid4()),
         "organisation_id": str(organisation_id),
@@ -66,51 +86,34 @@ def indexer_document(
         "texte": texte,
         "metadata": metadata or {},
     }
-    try:
-        return _post_json(f"{AI_SERVICE_URL}/internal/documents", payload)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        logger.warning("Service IA indisponible lors de l'indexation de %s : %s", document_id, exc)
-        return {"_error": f"Service IA indisponible : {exc}"}
+    return _appeler(f"{AI_SERVICE_URL}/internal/documents", payload, f"Indexation du document {document_id}")
 
 
 def demander_hypothese(question: str, organisation_id) -> dict:
     """Interroge le service IA pour formuler une hypothèse de cause probable.
 
-    Utilise /internal/query (généraliste, texte libre) plutôt qu'un endpoint
-    dédié structuré : aucune garantie de format JSON strict n'existe côté LLM,
-    donc le texte retourné doit être traité comme une explication à faire
-    valider par un humain, pas comme un objet structuré fiable. Voir
-    hypothesis_service.py pour comment ce texte est enveloppé dans une Hypothese
-    avec confiance=None (jamais déduite automatiquement d'un texte libre).
-    """
+    Le texte retourné est une explication à faire valider par un humain, pas un
+    objet structuré fiable (voir hypothesis.py : confiance=None)."""
     payload = {
         "question": question,
         "organisation_id": str(organisation_id),
         "limit": 5,
         "include_live_data": False,
     }
-    try:
-        return _post_json(f"{AI_SERVICE_URL}/internal/query", payload)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        logger.warning("Service IA indisponible lors de la demande d'hypothèse : %s", exc)
-        return {"_error": f"Service IA indisponible : {exc}"}
+    return _appeler(f"{AI_SERVICE_URL}/internal/query", payload, "Demande d'hypothèse")
 
 
-def interroger_assistant(question: str, organisation_id, include_live_data: bool = True) -> dict:
-    """Question libre de l'utilisateur depuis l'assistant conversationnel du front.
-
-    Contrairement à demander_hypothese (scopé au contexte d'une anomalie précise),
-    autorise l'accès aux données live de l'organisation pour répondre à des
-    questions générales ("où est mon plus gros levier ?", "résume ma semaine").
-    """
+def interroger_assistant(
+    question: str, organisation_id, include_live_data: bool = True, historique: Optional[list] = None
+) -> dict:
+    """Question libre depuis l'assistant conversationnel. `historique` (derniers
+    échanges) permet à l'IA de comprendre « confirme cette action » ou « montre
+    les sources » : sans lui, chaque message repartait de zéro."""
     payload = {
         "question": question,
         "organisation_id": str(organisation_id),
         "limit": 5,
         "include_live_data": include_live_data,
+        "history": historique or [],
     }
-    try:
-        return _post_json(f"{AI_SERVICE_URL}/internal/query", payload)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        logger.warning("Service IA indisponible lors d'une question assistant : %s", exc)
-        return {"_error": f"Service IA indisponible : {exc}"}
+    return _appeler(f"{AI_SERVICE_URL}/internal/query", payload, "Question assistant")

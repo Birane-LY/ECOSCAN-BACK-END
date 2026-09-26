@@ -1,22 +1,23 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+
 from .views import (
-    RecommandationViewSet,
     ActionViewSet,
-    DecisionViewSet,
-    LivrableViewSet,
-    ResultatMetriqueViewSet,
-    ObservationOperationnelleViewSet,
     AnomalieViewSet,
-    HypotheseViewSet,
-    MemoireStrategiqueViewSet,
-    DocumentEntrepriseViewSet,
     AssistantQueryView,
+    DecisionViewSet,
+    DocumentEntrepriseViewSet,
+    HypotheseViewSet,
+    LivrableViewSet,
+    MemoireStrategiqueViewSet,
+    ObservationOperationnelleViewSet,
+    OpportuniteFinancementIngestionView,
     OpportuniteFinancementViewSet,
-    OpportuniteFinancementIngestionView
+    ProgressionObjectifsView,
+    RecommandationViewSet,
+    ResultatMetriqueViewSet,
 )
 from . import views
-
 
 router = DefaultRouter()
 router.register(r'recommandations', RecommandationViewSet, basename='recommandation')
@@ -32,9 +33,9 @@ router.register(r'documents-entreprise', DocumentEntrepriseViewSet, basename='do
 router.register(r'opportunites-financement', OpportuniteFinancementViewSet, basename='opportunitefinancement')
 
 urlpatterns = [
-    # Inclut l'ensemble des routes CRUD et actions générées par le routeur
     path('integration/energy/', views.integrer_extraction_energy, name='integrer_energy'),
     path('assistant/interroger/', AssistantQueryView.as_view(), name='assistant_interroger'),
+    path('progression-objectifs/', ProgressionObjectifsView.as_view(), name='progression_objectifs'),
     path('opportunites-financement/ingestion/', OpportuniteFinancementIngestionView.as_view(), name='funding_ingestion'),
     path('', include(router.urls)),
 ]

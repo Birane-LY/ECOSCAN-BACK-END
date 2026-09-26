@@ -33,6 +33,8 @@ ReportsTool.jsx jusqu'à la création du Livrable.
 import io
 import logging
 import os
+from datetime import timedelta
+from xml.sax.saxutils import escape
 
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -63,6 +65,7 @@ TITRES_TEMPLATE = {
     "COMPTABLE": "Bilan énergétique — Rapport comptable",
     "BANQUE": "Dossier de financement — Synthèse énergétique",
     "INVESTISSEUR": "Business case — Opportunité d'investissement énergétique",
+    "MEMOIRE": "Mémoire stratégique — Synthèse EcoScan",
 }
 
 # Ce que chaque destinataire regarde en priorité — un comptable veut des
@@ -73,6 +76,7 @@ SECTIONS_PAR_TYPE = {
     "COMPTABLE": ("metriques", "anomalies"),
     "BANQUE": ("metriques", "recommandations", "anomalies"),
     "INVESTISSEUR": ("recommandations", "metriques"),
+    "MEMOIRE": ("memoire",),
 }
 
 
@@ -102,7 +106,7 @@ def _entete(livrable, organisation, fiche_projet, styles):
     else:
         logger.warning("ECOSCAN_REPORT_LOGO_PATH introuvable (%s) — en-tête généré sans logo.", chemin_logo)
 
-    titre_bloc = [Paragraph(TITRES_TEMPLATE.get(livrable.type, livrable.nom), styles["EcoScanTitre"])]
+    titre_bloc = [Paragraph(escape(TITRES_TEMPLATE.get(livrable.type, livrable.nom)), styles["EcoScanTitre"])]
     titre_bloc.append(Paragraph("EcoScan — Pilotage énergétique", styles["EcoScanSousTitre"]))
 
     entete_table = Table(
@@ -122,7 +126,8 @@ def _entete(livrable, organisation, fiche_projet, styles):
     # ce qui doit être renseigné pour qu'un rapport imprimé reste traçable.
     infos = [
         ["Organisation", organisation.nom if organisation else "—"],
-        ["Fiche projet", fiche_projet.nom if fiche_projet else "—"],
+        ["Fiche projet", fiche_projet.nom if fiche_projet else "Aucun projet associé"],
+        ["Mémoire", livrable.memoire.titre if livrable.memoire else "Aucune mémoire associée"],
         ["Date du rapport", f"{timezone.now():%d/%m/%Y à %H:%M}"],
         ["Période couverte", f"{MAX_JOURS_HISTORIQUE} derniers jours"],
     ]
@@ -203,10 +208,34 @@ def _table_anomalies(anomalies, styles):
     return [table]
 
 
+def _contenu_memoire(memoire, styles):
+    if not memoire:
+        return [Paragraph("Aucune mémoire stratégique associée à ce rapport.", styles["Normal"])]
+
+    lignes = [
+        ("Signal initial", memoire.signal_initial),
+        ("Hypothèse", memoire.hypothese_texte),
+        ("Action menée", memoire.action_texte),
+        ("Statut", memoire.get_statut_display()),
+    ]
+    if memoire.impact_attendu_fcfa is not None:
+        lignes.append(("Impact attendu", f"{memoire.impact_attendu_fcfa} FCFA"))
+    if memoire.impact_mesure_fcfa is not None:
+        lignes.append(("Impact mesuré", f"{memoire.impact_mesure_fcfa} FCFA"))
+
+    elements = [Paragraph(escape(memoire.titre), styles["Heading3"])]
+    for libelle, valeur in lignes:
+        if valeur:
+            elements.append(Paragraph(f"<b>{escape(libelle)} :</b> {escape(str(valeur))}", styles["Normal"]))
+            elements.append(Spacer(1, 0.15 * cm))
+    return elements
+
+
 SECTION_BUILDERS = {
     "metriques": ("Indicateurs de performance récents", _table_metriques),
     "recommandations": ("Recommandations décidées", _table_recommandations),
     "anomalies": ("Anomalies détectées", _table_anomalies),
+    "memoire": ("Mémoire stratégique", _contenu_memoire),
 }
 
 
@@ -229,8 +258,8 @@ def generer_pdf_livrable(livrable: Livrable) -> ContentFile:
     de contenu inventé. Lève une exception si la construction échoue ; c'est
     à l'appelant (LivrableViewSet.generer) de décider comment y réagir."""
     fiche_projet = livrable.fiche_projet
-    organisation = fiche_projet.organisation if fiche_projet else None
-    horizon = timezone.now() - timezone.timedelta(days=MAX_JOURS_HISTORIQUE)
+    organisation = livrable.organisation
+    horizon = timezone.now() - timedelta(days=MAX_JOURS_HISTORIQUE)
 
     metriques = list(
         ResultatMetrique.objects.filter(organisation=organisation, periode_fin__gte=horizon)
@@ -245,7 +274,12 @@ def generer_pdf_livrable(livrable: Livrable) -> ContentFile:
         .order_by("-date_detection")
     ) if organisation else []
 
-    donnees = {"metriques": metriques, "recommandations": recommandations, "anomalies": anomalies}
+    donnees = {
+        "metriques": metriques,
+        "recommandations": recommandations,
+        "anomalies": anomalies,
+        "memoire": livrable.memoire,
+    }
     sections = SECTIONS_PAR_TYPE.get(livrable.type, ("metriques", "recommandations", "anomalies"))
 
     buffer = io.BytesIO()

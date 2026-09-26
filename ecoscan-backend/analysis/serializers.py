@@ -40,11 +40,12 @@ class RecommandationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Recommandation
         fields = (
-            "id", "objectif", "titre", "description", "impact_estime",
+            "id", "objectif", "anomalie", "titre", "description", "impact_estime",
             "economie_estimee", "unite", "priorite", "statut",
             "date_echeance", "date_decision",
         )
-        read_only_fields = ("id", "statut", "date_decision")
+ 
+        read_only_fields = ("id", "anomalie", "statut", "date_decision")
 
     def validate_objectif(self, value):
         _verifier_appartenance(self.context.get("request"), value.organisation, "objectif")
@@ -59,8 +60,12 @@ class ActionSerializer(serializers.ModelSerializer):
         fields = (
             "id", "recommandation", "titre", "description", "statut",
             "responsable", "date_echeance", "date_realisation",
+            "economie_realisee_fcfa", "taux_realisation_impact", "date_mesure_impact",
         )
-        read_only_fields = ("id", "statut", "date_realisation")
+        read_only_fields = (
+            "id", "statut", "date_realisation",
+            "economie_realisee_fcfa", "taux_realisation_impact", "date_mesure_impact",
+        )
 
     def validate_recommandation(self, value):
         _verifier_appartenance(self.context.get("request"), value.objectif.organisation, "recommandation")
@@ -97,46 +102,88 @@ class LivrableSerializer(serializers.ModelSerializer):
     class Meta:
         model = Livrable
         fields = (
-            "id", "fiche_projet", "nom", "type", "statut",
+            "id", "organisation", "fiche_projet", "memoire", "nom", "type", "statut",
             "url_fichier", "version", "date_generation",
         )
-        # CORRECTIF : url_fichier n'était pas en lecture seule — un client
-        # pouvait poser n'importe quelle URL directement, sans jamais passer
-        # par la génération réelle (voir analysis/services/report_service.py).
+        
         read_only_fields = ("id", "statut", "version", "date_generation", "url_fichier")
 
-    def validate_fiche_projet(self, value):
-        _verifier_appartenance(self.context.get("request"), value.organisation, "fiche_projet")
-        return value
+    def validate(self, attrs):
+        request = self.context.get("request")
+        organisation = attrs.get("organisation", getattr(self.instance, "organisation", None))
+        fiche_projet = attrs.get("fiche_projet", getattr(self.instance, "fiche_projet", None))
+        memoire = attrs.get("memoire", getattr(self.instance, "memoire", None))
+
+        if organisation is None and fiche_projet:
+            organisation = fiche_projet.organisation
+            attrs["organisation"] = organisation
+        if organisation is None:
+            raise serializers.ValidationError({"organisation": "Ce champ est obligatoire."})
+        _verifier_appartenance(request, organisation, "organisation")
+        if fiche_projet and fiche_projet.organisation_id != organisation.id:
+            raise serializers.ValidationError({"fiche_projet": "Le projet doit appartenir à l'organisation du rapport."})
+        if memoire and memoire.organisation_id != organisation.id:
+            raise serializers.ValidationError({"memoire": "La mémoire doit appartenir à l'organisation du rapport."})
+        return attrs
 
 
 class ResultatMetriqueSerializer(serializers.ModelSerializer):
-    """Sérialiseur pour l'Audit Trail immuable des résultats de métriques d'analyse."""
+    """Sérialiseur pour les résultats d'analyses et décodeur de facture Senelec."""
+    valeur_affichee = serializers.SerializerMethodField()
+    donnees_facture = serializers.SerializerMethodField()
 
     class Meta:
         model = ResultatMetrique
-        fields = (
-            "id", "organisation", "compteur", "code_metrique", "version_metrique",
-            "valeur", "unite", "periode_debut", "periode_fin", "baseline_type",
-            "baseline_valeur", "baseline_nombre_observations", "completude",
-            "statut_qualite", "confiance", "sources", "limites", "date_calcul",
-        )
-        read_only_fields = (
-            "id", "organisation", "date_calcul", "version_metrique",
-            "completude", "statut_qualite", "confiance",
-        )
+        fields = '__all__'
+
+    def get_valeur_affichee(self, obj):
+        if obj.valeur is None:
+            return None
+        return f"{obj.valeur.normalize():f}"
+
+    def get_donnees_facture(self, obj):
+        """Décode la facture Senelec liée pour l'afficher en clair à la PME."""
+        if not obj.fichier_source or not hasattr(obj.fichier_source, "import_donnees"):
+            return None
+
+        extraits = obj.fichier_source.import_donnees.donnees_extraites or {}
+        if not extraits:
+            return None
+
+        conso = extraits.get("consommation_kwh") or (float(obj.valeur) if obj.valeur else 0)
+        montant = extraits.get("montant_net_paye") or 0
+        jours = extraits.get("nombre_jours") or 60
+        t3 = extraits.get("consommation_tranche_3") or 0
+        tva = extraits.get("montant_tva") or 0
+
+        cout_jour = round(montant / jours) if jours else 0
+        conso_jour = round(conso / jours, 1) if jours else 0
+        part_t3 = round((t3 / conso * 100), 1) if conso else 0
+
+        return {
+            "numero_facture": extraits.get("numero_facture"),
+            "tarif": extraits.get("tarif") or "PMP",
+            "periode_debut": extraits.get("periode_debut"),
+            "periode_fin": extraits.get("periode_fin"),
+            "nombre_jours": jours,
+            "consommation_totale": conso,
+            "montant_net_paye": montant,
+            "cout_par_jour": cout_jour,
+            "conso_par_jour": conso_jour,
+            "consommation_tranche_3": t3,
+            "part_tranche_3_pct": part_t3,
+            "montant_tva": tva,
+            "alerte_tranche_3": part_t3 > 50,
+        }
 
     def validate(self, attrs):
-        """Quality Gate : Applique les validations de cohérence temporelle chronologique."""
         debut = attrs.get("periode_debut")
         fin = attrs.get("periode_fin")
-
         if debut and fin and debut >= fin:
             raise serializers.ValidationError(
-                {"periode_debut": "Cohérence temporelle invalide : la date de début doit être strictement antérieure à la date de fin."}
+                {"periode_debut": "La date de début doit être strictement antérieure à la date de fin."}
             )
         return attrs
-
 
 class ObservationOperationnelleSerializer(serializers.ModelSerializer):
     """Sérialiseur pour les observations terrain journalières d'EcoScan."""
@@ -153,11 +200,14 @@ class ObservationOperationnelleSerializer(serializers.ModelSerializer):
 
 
 class AnomalieSerializer(serializers.ModelSerializer):
+    recommandations = RecommandationSerializer(many=True, read_only=True)
+
     class Meta:
         model = Anomalie
         fields = (
             "id", "organisation", "resultat_metrique", "type", "severite",
             "valeur_observee", "valeur_attendue", "ecart_pourcentage", "statut", "date_detection",
+            "recommandations",
         )
         read_only_fields = fields
 

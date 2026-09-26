@@ -30,6 +30,17 @@ class Recommandation(models.Model):
         on_delete=models.CASCADE,
         related_name="recommandations",
     )
+    # Anomalie à l'origine de la recommandation (nullable : une recommandation peut
+    # aussi être créée sans diagnostic). Ferme la boucle anomalie -> hypothèse ->
+    # recommandation -> actions -> mémoire : sans ce lien, « impossible de savoir
+    # quelle action a suivi quelle anomalie » (limite notée dans memory_service).
+    anomalie = models.ForeignKey(
+        "analysis.Anomalie",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recommandations",
+    )
     titre = models.CharField(max_length=180)
     description = models.TextField()
     impact_estime = models.DecimalField(max_digits=18, decimal_places=6)
@@ -52,6 +63,10 @@ class Recommandation(models.Model):
         automatique depuis les métriques réelles n'existe encore, et ce n'est
         pas ajouté ici pour ne pas présenter une progression déduite comme une
         mesure certaine)."""
+        if self.statut == self.Statut.DECIDEE:
+            # Idempotent : sans cette garde, un second appel (double clic, rejeu
+            # réseau) ajoutait l'économie estimée une deuxième fois à l'Objectif.
+            return
         self.statut = self.Statut.DECIDEE
         self.date_decision = timezone.now()
         self.save(update_fields=("statut", "date_decision"))
@@ -140,7 +155,7 @@ class Decision(models.Model):
 
 
 class Livrable(models.Model):
-    """Document, rapport d'audit ou certification officielle généré pour un projet.
+    """Document ou rapport généré pour une organisation, avec projet/mémoire optionnels.
 
     Assure la traçabilité des livrables et la gestion de leurs versions successives.
     """
@@ -154,8 +169,22 @@ class Livrable(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     fiche_projet = models.ForeignKey(
         "organizations.FicheProjet",
+        on_delete=models.SET_NULL,
+        related_name="livrables",
+        null=True,
+        blank=True,
+    )
+    organisation = models.ForeignKey(
+        "organizations.Organisation",
         on_delete=models.CASCADE,
         related_name="livrables",
+    )
+    memoire = models.ForeignKey(
+        "MemoireStrategique",
+        on_delete=models.SET_NULL,
+        related_name="livrables",
+        null=True,
+        blank=True,
     )
     nom = models.CharField(max_length=180)
     type = models.CharField(max_length=80)

@@ -1,12 +1,9 @@
 """
 Détection d'anomalies — purement déterministe, aucune IA ici.
 
-Les seuils (10/20/40 %) viennent du document de justification partagé pour ce
-projet. Ce sont des points de départ, PAS des valeurs calibrées par
-organisation — le document lui-même le dit : "Ces seuils doivent ensuite être
-personnalisés selon l'organisation." Personnalisation non implémentée ici
-(nécessiterait un modèle de configuration par organisation, hors scope de cette
-passe) — à ajouter si le besoin se confirme en usage réel.
+Les seuils (10/20/40 %) viennent du document de justification du projet. Ce sont
+des points de départ, PAS des valeurs calibrées par organisation (personnalisation
+non implémentée : nécessiterait un modèle de configuration par organisation).
 """
 
 from decimal import Decimal
@@ -18,11 +15,16 @@ SEUIL_SURVEILLANCE = Decimal("10.0")
 SEUIL_ALERTE = Decimal("20.0")
 SEUIL_INVESTIGATION_PRIORITAIRE = Decimal("40.0")
 
+CODES_METRIQUES_COMPATIBLES = (
+    "variation_vs_baseline",
+    "variation_facture_vs_facture_precedente",
+    "variation_woyofal_vs_moyenne_recente",
+)
+
 
 def _classer_severite(ecart_absolu: Decimal) -> Optional[str]:
-    """Retourne None si l'écart est dans la variation normale (< 10 %) — dans ce
-    cas, AUCUNE anomalie ne doit être créée : une variation normale n'est pas un
-    signal, la créer quand même noierait les vraies anomalies dans le bruit."""
+    """None si l'écart est dans la variation normale (< 10 %) : aucune anomalie ne
+    doit alors être créée, sinon les vraies anomalies seraient noyées dans le bruit."""
     if ecart_absolu < SEUIL_SURVEILLANCE:
         return None
     if ecart_absolu < SEUIL_ALERTE:
@@ -32,15 +34,9 @@ def _classer_severite(ecart_absolu: Decimal) -> Optional[str]:
     return Anomalie.Severite.INVESTIGATION_PRIORITAIRE
 
 
-CODES_METRIQUES_COMPATIBLES = ("variation_vs_baseline", "variation_facture_vs_facture_precedente")
-
-
 def detecter_anomalie(resultat_variation: ResultatMetrique) -> Optional[Anomalie]:
-    """Analyse un ResultatMetrique de type variation (relevé fréquent OU facture
-    périodique) et crée/met à jour l'Anomalie correspondante si l'écart dépasse
-    le seuil de surveillance. Les deux codes de métrique partagent la même
-    logique de seuils et de sévérité — seule la façon dont la variation a été
-    calculée en amont diffère (voir metrics_service.py / _publier_resultat)."""
+    """Crée/met à jour l'Anomalie correspondant à un ResultatMetrique de variation
+    si l'écart dépasse le seuil de surveillance."""
     if resultat_variation.code_metrique not in CODES_METRIQUES_COMPATIBLES:
         raise ValueError(
             f"detecter_anomalie attend un ResultatMetrique parmi {CODES_METRIQUES_COMPATIBLES}, "
@@ -59,18 +55,26 @@ def detecter_anomalie(resultat_variation: ResultatMetrique) -> Optional[Anomalie
     if valeur_attendue is not None:
         valeur_observee = valeur_attendue * (Decimal("1") + ecart_pourcentage / Decimal("100"))
 
-    type_anomalie = "consumption_spike" if ecart_pourcentage > 0 else "consumption_drop"
+    champs = {
+        "type": "consumption_spike" if ecart_pourcentage > 0 else "consumption_drop",
+        "severite": severite,
+        "valeur_observee": valeur_observee,
+        "valeur_attendue": valeur_attendue,
+        "ecart_pourcentage": ecart_pourcentage,
+    }
 
-    anomalie, _cree = Anomalie.objects.update_or_create(
-        organisation=resultat_variation.organisation,
-        resultat_metrique=resultat_variation,
-        defaults={
-            "type": type_anomalie,
-            "severite": severite,
-            "valeur_observee": valeur_observee,
-            "valeur_attendue": valeur_attendue,
-            "ecart_pourcentage": ecart_pourcentage,
-            "statut": Anomalie.Statut.DETECTED,
-        },
-    )
+    anomalie = Anomalie.objects.filter(
+        organisation=resultat_variation.organisation, resultat_metrique=resultat_variation
+    ).first()
+    if anomalie is None:
+        return Anomalie.objects.create(
+            organisation=resultat_variation.organisation,
+            resultat_metrique=resultat_variation,
+            statut=Anomalie.Statut.DETECTED,
+            **champs,
+        )
+
+    for cle, valeur in champs.items():
+        setattr(anomalie, cle, valeur)
+    anomalie.save(update_fields=tuple(champs))
     return anomalie

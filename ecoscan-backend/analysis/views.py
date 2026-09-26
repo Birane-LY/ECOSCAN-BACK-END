@@ -1,19 +1,27 @@
 import logging
-from decimal import Decimal, InvalidOperation
+import re
+import secrets
+import uuid
 from datetime import datetime, timedelta
-from django.utils import timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.storage import default_storage
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status, viewsets
-from rest_framework.views import APIView   
-from django.conf import settings
 from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from audit.models import JournalAudit
+from audit.services import enregistrer_evenement
 from energy.models import ImportDonnees
 from organizations.models import Organisation
-from audit.models import  JournalAudit
+
 from .models import (
     Action,
     Anomalie,
@@ -23,10 +31,9 @@ from .models import (
     Livrable,
     MemoireStrategique,
     ObservationOperationnelle,
+    OpportuniteFinancement,
     Recommandation,
     ResultatMetrique,
-    OpportuniteFinancement,
-   
 )
 from .serializers import (
     ActionSerializer,
@@ -37,76 +44,98 @@ from .serializers import (
     LivrableSerializer,
     MemoireStrategiqueSerializer,
     ObservationOperationnelleSerializer,
+    OpportuniteFinancementSerializer,
     RecommandationSerializer,
     ResultatMetriqueSerializer,
-    OpportuniteFinancementSerializer
 )
-from analysis.api.ai_client import indexer_document
-from analysis.api.ai_client import interroger_assistant
-from analysis.services.registry import obtenir_definition
+from analysis.api.ai_client import indexer_document, interroger_assistant
+from analysis.services.factures import analyser_facture_par_id
+from analysis.services.progression_objectifs import calculer_progressions_organisation
+from analysis.services.recommandations import (
+    DonneesInvalidesError,
+    EtatIncompatibleError,
+    creer_recommandation_depuis_anomalie,
+    lier_action_a_memoire,
+    mesurer_impact_action,
+)
+from analysis.services.taches import lancer_en_arriere_plan
 from analysis.services.memory_service import creer_memoire_depuis_hypothese
-from analysis.services.anomaly import detecter_anomalie
-from analysis.services.context import obtenir_contexte
-from analysis.services.hypothesis import generer_hypothese
+from analysis.services.registry import obtenir_definition
 from analysis.services.report_service import generer_pdf_livrable
-from audit.services import enregistrer_evenement
 
 logger = logging.getLogger(__name__)
 
+ROLES_ADMIN = ("ADMIN_ORGANISATION", "SUPER_ADMIN")
+SIX_DECIMALS = Decimal('0.000001')
+VALEUR_MAX = Decimal('999999999999')  # Sécurité sur max_digits=18, decimal_places=6
+FOUR_DECIMALS = Decimal('0.0001')
 
-def _verifier_puissance_souscrite(import_instance, champs: dict) -> None:
-    """Compare la puissance souscrite lue sur une facture avec celle du compteur.
 
-    Cette fonction d'assistance permet de détecter les écarts de souscription sans
-    altérer automatiquement les données. Les observations sont jointes aux limites
-    du résultat métrique pour vérification humaine.
-
-    Args:
-        import_instance (ImportDonnees): L'instance d'import de données concernée.
-        champs (dict): Le dictionnaire d'extractions contenant les valeurs de puissance.
-
-    Returns:
-        Optional[str]: Un message explicatif si une puissance est présente, sinon None.
+def _nettoyer_et_convertir_decimal(valeur_brute):
     """
-    puissance_facture = champs.get("puissance_souscrite") or champs.get("puissance_transfo")
-    if puissance_facture is None:
+    Nettoie et extrait un nombre valide à partir d'une donnée brute OCR ou texte.
+    Exemples gérés : "2 460", "246 kWh", "246,5", 246.0
+    Ignore les numéros de SIRET/Compteur/Facture (> 10 chiffres d'affilée sans décimale).
+    """
+    if valeur_brute is None:
         return None
-    try:
-        puissance_facture = Decimal(str(puissance_facture))
-    except InvalidOperation:
+    
+    val_str = str(valeur_brute).strip().replace('\xa0', '').replace(' ', '').replace(',', '.')
+
+    # Ignorer les identifiants longs (ex: SIRET, N° Compteur >= 10 chiffres consécutifs)
+    if re.search(r'\d{10,}', val_str):
+        logger.warning(f"Champ OCR ignoré (ressemble à un ID/SIRET/N° Compteur) : {val_str}")
         return None
 
-    return (
-        f"Puissance souscrite lue sur la facture : {puissance_facture} kVA — "
-        f"à comparer manuellement avec la valeur enregistrée sur le compteur concerné."
-    )
+    match = re.search(r'[-+]?\d*\.?\d+', val_str)
+    if not match:
+        return None
+        
+    cleaned_str = match.group(0)
+    
+    try:
+        dec = Decimal(cleaned_str)
+        if abs(dec) > VALEUR_MAX:
+            logger.warning(f"Valeur numérique rejetée car > VALEUR_MAX ({VALEUR_MAX}): {dec}")
+            return None
+        return dec.quantize(SIX_DECIMALS, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError):
+        return None
 
 
 def _publier_resultat_depuis_import(import_instance):
-    """Convertit une extraction d'import 'energy' validée en un résultat métrique.
+    """Convertit une extraction d'import 'energy' validée en ResultatMetrique.
 
-    Assure l'idempotence des calculs grâce à la contrainte unique sur `fichier_source`.
-    Calcule la période temporelle, le statut de qualité en fonction du score de
-    confiance et agrège les limites métier de la définition d'analyse.
-
-    Args:
-        import_instance (ImportDonnees): L'instance d'import traitée (statut TERMINE).
+    Idempotent grâce à `fichier_source` (get_or_create). Après publication, la
+    chaîne facture -> variation -> anomalie -> hypothèse est (re)jouée EN
+    ARRIÈRE-PLAN.
 
     Returns:
-        tuple[ResultatMetrique, bool]: L'objet ResultatMetrique créé ou récupéré, et
-        un booléen indiquant si l'objet vient d'être créé.
+        tuple[ResultatMetrique, bool]: le résultat et un booléen « vient d'être créé ».
     """
     definition = obtenir_definition("consommation_facture_periodique")
     champs = import_instance.donnees_extraites or {}
-    consommation = champs.get("consommation_kwh")
+    
+    # 1. Tester par ordre de précision les différentes clés du dictionnaire OCR
+    candidats_consommation = [
+        champs.get("consommation_kwh"),
+        champs.get("consommation_totale"),
+        champs.get("consommation"),
+        champs.get("index_consommation"),
+    ]
 
-    date_facture_str = champs.get("date_facture")
+    valeur_decimal = None
+    for candidat in candidats_consommation:
+        if candidat is not None:
+            valeur_decimal = _nettoyer_et_convertir_decimal(candidat)
+            if valeur_decimal is not None:
+                break
+
     periode_fin = None
+    date_facture_str = champs.get("date_facture")
     if date_facture_str:
         try:
-            periode_fin = datetime.strptime(date_facture_str, "%d/%m/%Y").replace(
-                tzinfo=timezone.get_current_timezone()
-            )
+            periode_fin = timezone.make_aware(datetime.strptime(date_facture_str, "%d/%m/%Y"))
         except (ValueError, TypeError):
             periode_fin = None
     if periode_fin is None:
@@ -115,25 +144,31 @@ def _publier_resultat_depuis_import(import_instance):
 
     limites = list(definition.limites)
 
-    valeur_decimal = None
-    if consommation is not None:
-        try:
-            valeur_decimal = Decimal(str(consommation))
-        except InvalidOperation:
-            valeur_decimal = None
+    # 2. Calcul sécurisé de la confiance
+    try:
+        confiance = (
+            Decimal(str(import_instance.score_qualite)) / Decimal("100")
+            if import_instance.score_qualite is not None
+            else None
+        )
+        if confiance is not None:
+            if not confiance.is_finite():
+                confiance = None
+            else:
+                confiance = confiance.quantize(FOUR_DECIMALS, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError):
+        confiance = None
 
-    confiance = (
-        import_instance.score_qualite / Decimal("100")
-        if import_instance.score_qualite is not None
-        else None
-    )
-
-    if valeur_decimal is not None and confiance is not None and confiance >= Decimal("0.8"):
+    # 3. Attribution dynamique de la complétude et du statut de qualité
+    if valeur_decimal is not None and confiance is not None and confiance >= Decimal("0.75"):
         statut_qualite = ResultatMetrique.StatutQualite.FIABLE
+        completude_decimal = Decimal("1.0000")
     elif valeur_decimal is not None:
         statut_qualite = ResultatMetrique.StatutQualite.ESTIME
+        completude_decimal = Decimal("1.0000")
     else:
         statut_qualite = ResultatMetrique.StatutQualite.INSUFFISANT
+        completude_decimal = Decimal("0.0000")
 
     puissance_facture = champs.get("puissance_souscrite") or champs.get("puissance_transfo")
     if puissance_facture is not None:
@@ -153,7 +188,7 @@ def _publier_resultat_depuis_import(import_instance):
             "unite": definition.unite,
             "periode_debut": periode_debut,
             "periode_fin": periode_fin,
-            "completude": Decimal("1.0") if valeur_decimal is not None else Decimal("0.0"),
+            "completude": completude_decimal,
             "statut_qualite": statut_qualite,
             "confiance": confiance,
             "sources": [import_instance.nom_fichier],
@@ -161,108 +196,64 @@ def _publier_resultat_depuis_import(import_instance):
         },
     )
 
-    if cree and resultat.valeur is not None:
-        variation = _calculer_variation_facture(resultat)
-        if variation is not None:
-            anomalie = detecter_anomalie(variation)
-            if anomalie is not None:
-                contexte = obtenir_contexte(anomalie)
-                generer_hypothese(anomalie, contexte)
+    # Si l'enregistrement existait déjà sans valeur valide, on le met à jour
+    if not cree and (resultat.valeur is None or resultat.valeur == Decimal("0")) and valeur_decimal is not None:
+        resultat.valeur = valeur_decimal
+        resultat.completude = completude_decimal
+        resultat.statut_qualite = statut_qualite
+        resultat.confiance = confiance
+        resultat.save(update_fields=("valeur", "completude", "statut_qualite", "confiance"))
+
+    if resultat.valeur is not None:
+        lancer_en_arriere_plan(analyser_facture_par_id, resultat.id)
+        
     return resultat, cree
 
 
-def _calculer_variation_facture(resultat_actuel: ResultatMetrique):
-    """Compare la facture publiée à la précédente pour la même organisation."""
-    precedent = (
-        ResultatMetrique.objects.filter(
-            organisation=resultat_actuel.organisation,
-            code_metrique="consommation_facture_periodique",
-        )
-        .exclude(id=resultat_actuel.id)
-        .filter(periode_fin__lt=resultat_actuel.periode_fin)
-        .order_by("-periode_fin")
-        .first()
-    )
-    if precedent is None or precedent.valeur is None or precedent.valeur == 0:
-        return None
-
-    variation_pct = ((resultat_actuel.valeur - precedent.valeur) / precedent.valeur) * 100
-    definition = obtenir_definition("variation_facture_vs_facture_precedente")
-    variation_resultat, _ = ResultatMetrique.objects.update_or_create(
-        organisation=resultat_actuel.organisation,
-        compteur=resultat_actuel.compteur,
-        code_metrique=definition.code,
-        periode_debut=precedent.periode_fin,
-        periode_fin=resultat_actuel.periode_fin,
-        version_metrique=definition.version,
-        defaults={
-            "valeur": Decimal(str(round(variation_pct, 2))),
-            "unite": definition.unite,
-            "baseline_type": "facture_precedente",
-            "baseline_valeur": precedent.valeur,
-            "baseline_nombre_observations": 1,
-            "completude": Decimal("1.0"),
-            "statut_qualite": ResultatMetrique.StatutQualite.FIABLE,
-            "confiance": Decimal("1.0"),
-            "sources": list(definition.sources_requises),
-            "limites": list(definition.limites),
-        },
-    )
-    return variation_resultat
-
-
 class AnalyseScopedQuerySetMixin:
-    """Mixin pour le filtrage strict multi-tenant des données d'analyse.
-
-    Garantit le cloisonnement des objets selon les organisations de l'utilisateur.
-    Le rôle `SUPER_ADMIN` est explicitement restreint d'accès aux objets métier
-    afin de préserver la souveraineté et la confidentialité des données clients.
-    """
+    """Filtrage strict multi-tenant. Le rôle SUPER_ADMIN n'a volontairement aucun
+    accès aux objets métier des clients."""
 
     permission_classes = [IsAuthenticated]
     organisation_lookup = "recommandation__objectif__organisation"
 
     def get_queryset(self):
-        """Restreint le QuerySet aux seules organisations dont l'utilisateur est membre.
-
-        Returns:
-            QuerySet: Le jeu de données filtré pour le tenant courant ou vide si SUPER_ADMIN.
-        """
-        queryset = self.queryset
         user = self.request.user
-
         if getattr(user, "role", None) == "SUPER_ADMIN":
-            return queryset.none()
-
+            return self.queryset.none()
         organisations = Organisation.objects.filter(membres__utilisateur=user)
-        return queryset.filter(**{f"{self.organisation_lookup}__in": organisations})
+        return self.queryset.all().filter(**{f"{self.organisation_lookup}__in": organisations})
+
+    def _exiger_perimetre(self, organisation):
+        """Refuse la création d'un objet rattaché à une organisation dont
+        l'utilisateur n'est pas membre."""
+        if organisation is None or not Organisation.objects.filter(
+            id=organisation.id, membres__utilisateur=self.request.user
+        ).exists():
+            raise PermissionDenied("Ressource hors de votre périmètre.")
 
 
 class AnalyseScopedViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSet):
-    """Classe de base pour les ViewSets nécessitant un accès CRUD complet et scopé par tenant."""
+    """CRUD complet scopé par tenant."""
 
 
 class RecommandationViewSet(AnalyseScopedViewSet):
-    """ViewSet pour la gestion du cycle de vie des recommandations d'efficacité énergétique."""
+    """Cycle de vie des recommandations d'efficacité énergétique."""
 
     queryset = Recommandation.objects.select_related("objectif__organisation").order_by("-priorite", "date_echeance")
     serializer_class = RecommandationSerializer
     organisation_lookup = "objectif__organisation"
 
     def get_queryset(self):
-        """Permet d'ajouter un filtre optionnel par objectif via les query params."""
         queryset = super().get_queryset()
         objectif_id = self.request.query_params.get("objectif")
         if objectif_id:
             queryset = queryset.filter(objectif_id=objectif_id)
         return queryset
-    
+
     @action(detail=True, methods=["post"])
     def generer(self, request, pk=None):
-        """Déclenche la phase d'édition initiale de la recommandation.
-
-        Action traçée dans le journal d'audit sous la clé 'GENERER_RECOMMANDATION'.
-        """
+        """Phase d'édition initiale. Audit : 'GENERER_RECOMMANDATION'."""
         recommandation = self.get_object()
         recommandation.generer()
 
@@ -274,16 +265,14 @@ class RecommandationViewSet(AnalyseScopedViewSet):
             organisation=getattr(recommandation.objectif, "organisation", None),
             request=request,
         )
-
         return Response(self.get_serializer(recommandation).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="marquer-comme-decidee")
     def marquer_comme_decidee(self, request, pk=None):
-        """Valide l'adoption stratégique de la piste d'amélioration par l'organisation.
-
-        Action traçée dans le journal d'audit sous la clé 'MARQUER_DECIDEE_RECOMMANDATION'.
-        """
+        """Adoption de la piste par l'organisation. Audit : 'MARQUER_DECIDEE_RECOMMANDATION'."""
         recommandation = self.get_object()
+        if recommandation.statut == Recommandation.Statut.DECIDEE:
+            return Response(self.get_serializer(recommandation).data, status=status.HTTP_200_OK)
         recommandation.marquer_comme_decidee()
 
         enregistrer_evenement(
@@ -294,80 +283,108 @@ class RecommandationViewSet(AnalyseScopedViewSet):
             organisation=getattr(recommandation.objectif, "organisation", None),
             request=request,
         )
-
         return Response(self.get_serializer(recommandation).data, status=status.HTTP_200_OK)
 
 
 class ActionViewSet(AnalyseScopedViewSet):
-    """ViewSet pour le suivi opérationnel et l'exécution des actions techniques."""
+    """Suivi opérationnel des actions techniques."""
 
     queryset = Action.objects.select_related("recommandation__objectif__organisation", "responsable").order_by("date_echeance")
     serializer_class = ActionSerializer
     organisation_lookup = "recommandation__objectif__organisation"
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        recommandation_id = self.request.query_params.get("recommandation")
+        if recommandation_id:
+            try:
+                uuid.UUID(str(recommandation_id))
+            except ValueError:
+                return queryset.none()
+            queryset = queryset.filter(recommandation_id=recommandation_id)
+        return queryset
+
+    @staticmethod
+    def _organisation_de(action_obj):
+        if action_obj.recommandation and action_obj.recommandation.objectif:
+            return action_obj.recommandation.objectif.organisation
+        return None
+
+    def perform_create(self, serializer):
+        recommandation = serializer.validated_data.get("recommandation")
+        objectif = getattr(recommandation, "objectif", None)
+        self._exiger_perimetre(getattr(objectif, "organisation", None))
+        lier_action_a_memoire(serializer.save())
+
+    @action(detail=True, methods=["post"], url_path="mesurer-impact")
+    def mesurer_impact(self, request, pk=None):
+        """Enregistre l'impact RÉEL (FCFA), saisi par une personne, d'une action
+        terminée et le propage à la mémoire stratégique. Audit : 'MESURER_IMPACT_ACTION'."""
+        action_obj = self.get_object()
+        try:
+            mesurer_impact_action(action_obj, request.data.get("economie_realisee_fcfa"))
+        except DonneesInvalidesError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except EtatIncompatibleError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        enregistrer_evenement(
+            action="MESURER_IMPACT_ACTION",
+            ressource="Action",
+            identifiant_ressource=str(action_obj.id),
+            utilisateur=request.user,
+            organisation=self._organisation_de(action_obj),
+            details={"economie_realisee_fcfa": float(action_obj.economie_realisee_fcfa)},
+            request=request,
+        )
+        return Response(self.get_serializer(action_obj).data, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["post"])
     def suivre(self, request, pk=None):
-        """Passe l'action dans l'état opérationnel d'exécution.
-
-        Action traçée dans le journal d'audit sous la clé 'SUIVRE_ACTION'.
-        """
+        """Passe l'action en exécution. Audit : 'SUIVRE_ACTION'."""
         action_obj = self.get_object()
         action_obj.suivre()
-
-        organisation = None
-        if action_obj.recommandation and action_obj.recommandation.objectif:
-            organisation = action_obj.recommandation.objectif.organisation
 
         enregistrer_evenement(
             action="SUIVRE_ACTION",
             ressource="Action",
             identifiant_ressource=str(action_obj.id),
             utilisateur=request.user,
-            organisation=organisation,
+            organisation=self._organisation_de(action_obj),
             request=request,
         )
-
         return Response(self.get_serializer(action_obj).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
     def cloturer(self, request, pk=None):
-        """Enregistre l'achèvement complet de l'action terrain.
-
-        Action traçée dans le journal d'audit sous la clé 'CLOTURER_ACTION'.
-        """
+        """Enregistre l'achèvement de l'action. Audit : 'CLOTURER_ACTION'."""
         action_obj = self.get_object()
         action_obj.cloturer()
-
-        organisation = None
-        if action_obj.recommandation and action_obj.recommandation.objectif:
-            organisation = action_obj.recommandation.objectif.organisation
 
         enregistrer_evenement(
             action="CLOTURER_ACTION",
             ressource="Action",
             identifiant_ressource=str(action_obj.id),
             utilisateur=request.user,
-            organisation=organisation,
+            organisation=self._organisation_de(action_obj),
             request=request,
         )
-
         return Response(self.get_serializer(action_obj).data, status=status.HTTP_200_OK)
 
 
 class DecisionViewSet(AnalyseScopedViewSet):
-    """ViewSet pour la formalisation et l'historisation des arbitrages d'investissement."""
+    """Arbitrages d'investissement."""
 
     queryset = Decision.objects.select_related("recommandation__objectif__organisation", "decideur").order_by("-date_decision")
     serializer_class = DecisionSerializer
     organisation_lookup = "recommandation__objectif__organisation"
 
     def perform_create(self, serializer):
-        """Renseigne automatiquement l'utilisateur connecté comme décideur et consigne l'audit."""
+        recommandation = serializer.validated_data.get("recommandation")
+        objectif = getattr(recommandation, "objectif", None)
+        organisation = getattr(objectif, "organisation", None)
+        self._exiger_perimetre(organisation)
         decision = serializer.save(decideur=self.request.user, date_decision=timezone.now())
-
-        organisation = None
-        if decision.recommandation and decision.recommandation.objectif:
-            organisation = decision.recommandation.objectif.organisation
 
         enregistrer_evenement(
             action="CREER_DECISION",
@@ -375,40 +392,21 @@ class DecisionViewSet(AnalyseScopedViewSet):
             identifiant_ressource=str(decision.id),
             utilisateur=self.request.user,
             organisation=organisation,
-            # CORRECTIF : "type_decision" n'existe pas sur le modèle Decision
-            # (champs réels : resultat, commentaire, date_decision, decideur) —
-            # hasattr() renvoyait toujours False, ce détail n'était donc jamais
-            # tracé dans le journal d'audit.
             details={"resultat": decision.resultat},
             request=self.request,
         )
 
 
 class LivrableViewSet(AnalyseScopedViewSet):
-    """ViewSet pour la gestion des rapports d'audit, certifications et livrables techniques."""
+    """Rapports d'audit, certifications et livrables techniques."""
 
-    queryset = Livrable.objects.select_related("fiche_projet__organisation").order_by("-date_generation")
+    queryset = Livrable.objects.select_related("organisation", "fiche_projet", "memoire").order_by("-date_generation")
     serializer_class = LivrableSerializer
-    organisation_lookup = "fiche_projet__organisation"
+    organisation_lookup = "organisation"
 
     @action(detail=True, methods=["post"])
     def generer(self, request, pk=None):
-        """Génère réellement le PDF du livrable (voir analysis/services/report_service.py)
-        puis fige la publication formelle.
-
-        CORRECTIF : Livrable.generer() (models.py) ne fait que basculer le
-        statut et la date — c'est ATTENDU, cohérent avec le reste du module où
-        les méthodes du modèle sont de simples transitions d'état et toute
-        logique avec effet de bord vit dans services/ (voir hypothesis.py,
-        memory_service.py). Ce qui manquait, c'est cet appel lui-même : rien
-        n'invoquait jamais la génération du fichier — url_fichier restait donc
-        vide indéfiniment, même après un appel "réussi" à cette action.
-
-        Si la génération du PDF échoue, le livrable reste en BROUILLON (pas de
-        statut GENERE ni de date_generation) plutôt que de mentir sur son état.
-
-        Action traçée dans le journal d'audit sous la clé 'GENERER_LIVRABLE'.
-        """
+        """Génère le PDF puis fige la publication. Audit : 'GENERER_LIVRABLE'."""
         livrable = self.get_object()
 
         try:
@@ -423,10 +421,9 @@ class LivrableViewSet(AnalyseScopedViewSet):
         chemin_stocke = default_storage.save(f"livrables/{livrable.id}/{pdf_file.name}", pdf_file)
         livrable.url_fichier = default_storage.url(chemin_stocke)
         livrable.save(update_fields=("url_fichier",))
-        livrable.generer()  # statut=GENERE, date_generation=maintenant
+        livrable.generer()
 
-        organisation = livrable.fiche_projet.organisation if livrable.fiche_projet else None
-
+        organisation = livrable.organisation
         enregistrer_evenement(
             action="GENERER_LIVRABLE",
             ressource="Livrable",
@@ -435,20 +432,15 @@ class LivrableViewSet(AnalyseScopedViewSet):
             organisation=organisation,
             request=request,
         )
-
         return Response(self.get_serializer(livrable).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
     def valider(self, request, pk=None):
-        """Approuve la conformité réglementaire et technique du livrable.
-
-        Action traçée dans le journal d'audit sous la clé 'VALIDER_LIVRABLE'.
-        """
+        """Approuve la conformité du livrable. Audit : 'VALIDER_LIVRABLE'."""
         livrable = self.get_object()
         livrable.valider()
 
-        organisation = livrable.fiche_projet.organisation if livrable.fiche_projet else None
-
+        organisation = livrable.organisation
         enregistrer_evenement(
             action="VALIDER_LIVRABLE",
             ressource="Livrable",
@@ -457,29 +449,21 @@ class LivrableViewSet(AnalyseScopedViewSet):
             organisation=organisation,
             request=request,
         )
-
         return Response(self.get_serializer(livrable).data, status=status.HTTP_200_OK)
 
 
 class ResultatMetriqueViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
-    """ViewSet en lecture seule exposant les bilans énergétiques, baselines et indicateurs carbone."""
+    """Lecture seule : bilans énergétiques, baselines, indicateurs."""
 
     queryset = ResultatMetrique.objects.select_related("organisation", "compteur").order_by("-periode_fin")
     serializer_class = ResultatMetriqueSerializer
     organisation_lookup = "organisation"
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def integrer_extraction_energy(request):
-    """Intègre une facture extraite depuis le module 'energy' sous forme de résultat métrique.
-
-    Exige un identifiant d'import valide et au statut TERMINE. Vérifie les droits
-    d'accès de l'utilisateur sur l'organisation concernée.
-
-    Returns:
-        Response: Le ResultatMetrique créé/mis à jour (HTTP 201 ou 200), ou une erreur HTTP.
-    """
+    """Intègre une facture extraite par 'energy' sous forme de ResultatMetrique."""
     import_id = request.data.get("import_id")
     if not import_id:
         return Response({"error": "import_id est requis."}, status=status.HTTP_400_BAD_REQUEST)
@@ -501,16 +485,20 @@ def integrer_extraction_energy(request):
     if not appartient:
         return Response({"error": "Import hors de votre organisation."}, status=status.HTTP_403_FORBIDDEN)
 
-    if import_instance.statut != ImportDonnees.Statut.TERMINE:
+    if import_instance.statut not in (ImportDonnees.Statut.TERMINE, ImportDonnees.Statut.REVUE_REQUISE):
         return Response(
             {
                 "error": (
                     f"Import non publiable : statut actuel '{import_instance.statut}', "
-                    f"'{ImportDonnees.Statut.TERMINE}' requis."
+                    f"'{ImportDonnees.Statut.TERMINE}' ou '{ImportDonnees.Statut.REVUE_REQUISE}' requis."
                 )
             },
             status=status.HTTP_409_CONFLICT,
         )
+
+    if import_instance.statut == ImportDonnees.Statut.REVUE_REQUISE:
+        import_instance.statut = ImportDonnees.Statut.TERMINE
+        import_instance.save(update_fields=("statut",))
 
     resultat, created = _publier_resultat_depuis_import(import_instance)
 
@@ -533,18 +521,15 @@ def integrer_extraction_energy(request):
 
 
 class ObservationOperationnelleViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSet):
-    """ViewSet pour la saisie et la validation des constatations terrain."""
+    """Saisie et validation des constatations terrain."""
 
     queryset = ObservationOperationnelle.objects.select_related("organisation", "auteur").order_by("-date_observation")
     serializer_class = ObservationOperationnelleSerializer
     organisation_lookup = "organisation"
 
     def perform_create(self, serializer):
-        """Associe l'auteur connecté et vérifie l'appartenance à l'organisation."""
-        organisations = Organisation.objects.filter(membres__utilisateur=self.request.user)
         organisation = serializer.validated_data.get("organisation")
-        if organisation not in organisations:
-            raise PermissionDenied("Organisation hors de votre périmètre.")
+        self._exiger_perimetre(organisation)
         observation = serializer.save(auteur=self.request.user)
 
         enregistrer_evenement(
@@ -558,10 +543,7 @@ class ObservationOperationnelleViewSet(AnalyseScopedQuerySetMixin, viewsets.Mode
 
     @action(detail=True, methods=["post"])
     def valider(self, request, pk=None):
-        """Marque une observation terrain comme vérifiée et exacte.
-
-        Action traçée dans le journal d'audit sous la clé 'VALIDER_OBSERVATION'.
-        """
+        """Marque l'observation comme vérifiée. Audit : 'VALIDER_OBSERVATION'."""
         observation = self.get_object()
         observation.valide = True
         observation.save(update_fields=("valide",))
@@ -574,20 +556,51 @@ class ObservationOperationnelleViewSet(AnalyseScopedQuerySetMixin, viewsets.Mode
             organisation=observation.organisation,
             request=request,
         )
-
         return Response(self.get_serializer(observation).data, status=status.HTTP_200_OK)
 
 
 class AnomalieViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
-    """ViewSet en lecture seule pour la consultation des dérives et anomalies détectées."""
+    """Lecture seule des dérives et anomalies détectées."""
 
     queryset = Anomalie.objects.select_related("organisation", "resultat_metrique").order_by("-date_detection")
     serializer_class = AnomalieSerializer
     organisation_lookup = "organisation"
 
+    @action(detail=True, methods=["post"], url_path="creer-recommandation")
+    def creer_recommandation(self, request, pk=None):
+        """Geste humain : crée une recommandation à partir d'une anomalie. Audit : 'CREER_RECOMMANDATION'."""
+        anomalie = self.get_object()
+        try:
+            recommandation = creer_recommandation_depuis_anomalie(anomalie, request.data)
+        except DonneesInvalidesError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except EtatIncompatibleError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        enregistrer_evenement(
+            action="CREER_RECOMMANDATION",
+            ressource="Recommandation",
+            identifiant_ressource=str(recommandation.id),
+            utilisateur=request.user,
+            organisation=anomalie.organisation,
+            details={"anomalie_id": str(anomalie.id)},
+            request=request,
+        )
+        return Response(RecommandationSerializer(recommandation).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="generer-recommandation-ia")
+    def generer_recommandation_ia(self, request, pk=None):
+        """Génération automatique de recommandation par IA pour cette anomalie."""
+        anomalie = self.get_object()
+        from analysis.services.auto_recommandation import generer_recommandation_auto
+        reco = generer_recommandation_auto(anomalie)
+        if reco is None:
+            return Response({"error": "Impossible de générer une recommandation pour cette anomalie."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(RecommandationSerializer(reco).data, status=status.HTTP_201_CREATED)
+
 
 class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
-    """ViewSet pour la consultation et le traitement des explications générées par IA."""
+    """Consultation et traitement des explications générées par IA."""
 
     queryset = Hypothese.objects.select_related("anomalie__organisation").order_by("-date_creation")
     serializer_class = HypotheseSerializer
@@ -595,19 +608,17 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
 
     @action(detail=True, methods=["post"])
     def confirmer(self, request, pk=None):
-        """Confirme une hypothèse explicative et déclenche sa conversion en mémoire stratégique.
-
-        Requires:
-            confiance (float): Le niveau de confiance validé par l'expert (0.0 à 1.0).
-        """
+        """Confirme une hypothèse PROPOSEE et la convertit en mémoire stratégique."""
         hypothese = self.get_object()
+        if hypothese.statut != Hypothese.Statut.PROPOSEE:
+            return Response(
+                {"error": f"Seule une hypothèse PROPOSEE peut être confirmée (statut actuel : {hypothese.statut})."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         confiance_brute = request.data.get("confiance")
         if confiance_brute is None:
             return Response({"error": "confiance est requise (0.0 à 1.0) pour confirmer une hypothèse."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # CORRECTIF : confiance était affectée telle quelle, sans validation —
-        # une valeur non numérique ou hors [0, 1] provoquait une erreur base de
-        # données brute (DecimalField) au lieu d'une réponse 400 propre.
         try:
             confiance = Decimal(str(confiance_brute))
         except InvalidOperation:
@@ -619,10 +630,22 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
         hypothese.confiance = confiance
         hypothese.save(update_fields=("statut", "confiance"))
 
+        anomalie = hypothese.anomalie
+        if anomalie and anomalie.statut in (Anomalie.Statut.DETECTED, Anomalie.Statut.NEEDS_CONTEXT):
+            anomalie.statut = Anomalie.Statut.CONFIRMED
+            anomalie.save(update_fields=("statut",))
+
         creer_memoire_depuis_hypothese(hypothese)
 
-        organisation = hypothese.anomalie.organisation if hypothese.anomalie else None
+        # Génération automatique de la recommandation si non encore créée
+        if anomalie:
+            from analysis.services.auto_recommandation import generer_recommandation_auto
+            try:
+                generer_recommandation_auto(anomalie)
+            except Exception:
+                pass
 
+        organisation = hypothese.anomalie.organisation if hypothese.anomalie else None
         enregistrer_evenement(
             action="CONFIRMER_HYPOTHESE",
             ressource="Hypothese",
@@ -632,21 +655,21 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
             details={"confiance": float(confiance)},
             request=request,
         )
-
         return Response(self.get_serializer(hypothese).data, status=status.HTTP_200_OK)
-    
+
     @action(detail=True, methods=["post"])
     def rejeter(self, request, pk=None):
-        """Invalide une hypothèse générée par l'IA.
-
-        Action traçée dans le journal d'audit sous la clé 'REJETER_HYPOTHESE'.
-        """
+        """Invalide une hypothèse générée par l'IA. Audit : 'REJETER_HYPOTHESE'."""
         hypothese = self.get_object()
+        if hypothese.statut != Hypothese.Statut.PROPOSEE:
+            return Response(
+                {"error": f"Seule une hypothèse PROPOSEE peut être rejetée (statut actuel : {hypothese.statut})."},
+                status=status.HTTP_409_CONFLICT,
+            )
         hypothese.statut = Hypothese.Statut.REJETEE
         hypothese.save(update_fields=("statut",))
 
         organisation = hypothese.anomalie.organisation if hypothese.anomalie else None
-
         enregistrer_evenement(
             action="REJETER_HYPOTHESE",
             ressource="Hypothese",
@@ -655,12 +678,25 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
             organisation=organisation,
             request=request,
         )
-
         return Response(self.get_serializer(hypothese).data, status=status.HTTP_200_OK)
 
 
+class ProgressionObjectifsView(APIView):
+    """Progression DÉCLARÉE et MESURÉE de chaque objectif."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if getattr(request.user, "role", None) == "SUPER_ADMIN":
+            return Response({"error": "Rôle non autorisé."}, status=status.HTTP_403_FORBIDDEN)
+        resultats = []
+        for organisation in Organisation.objects.filter(membres__utilisateur=request.user):
+            resultats.extend(calculer_progressions_organisation(organisation))
+        return Response(resultats)
+
+
 class MemoireStrategiqueViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
-    """ViewSet en lecture seule exposant la base de connaissances stratégiques consolidée."""
+    """Lecture seule de la base de connaissances stratégiques."""
 
     queryset = MemoireStrategique.objects.select_related("organisation").order_by("-date_creation")
     serializer_class = MemoireStrategiqueSerializer
@@ -668,18 +704,15 @@ class MemoireStrategiqueViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyMod
 
 
 class DocumentEntrepriseViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSet):
-    """ViewSet pour la gestion documentaire technique de l'entreprise."""
+    """Gestion documentaire technique de l'entreprise."""
 
     queryset = DocumentEntreprise.objects.select_related("organisation", "depose_par").order_by("-date_depot")
     serializer_class = DocumentEntrepriseSerializer
     organisation_lookup = "organisation"
 
     def perform_create(self, serializer):
-        """Enregistre le document avec l'utilisateur déposant et journalise l'action."""
-        organisations = Organisation.objects.filter(membres__utilisateur=self.request.user)
         organisation = serializer.validated_data.get("organisation")
-        if organisation not in organisations:
-            raise PermissionDenied("Organisation hors de votre périmètre.")
+        self._exiger_perimetre(organisation)
         doc = serializer.save(depose_par=self.request.user)
 
         enregistrer_evenement(
@@ -693,10 +726,7 @@ class DocumentEntrepriseViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSe
 
     @action(detail=True, methods=["post"])
     def valider(self, request, pk=None):
-        """Approuve le document et déclenche son indexation vectorielle dans le moteur RAG.
-
-        Action traçée dans le journal d'audit avec l'état du flag 'indexe_rag'.
-        """
+        """Approuve le document et l'indexe dans le RAG. Audit : 'VALIDER_DOCUMENT'."""
         document = self.get_object()
         document.valider(request.user)
 
@@ -710,6 +740,8 @@ class DocumentEntrepriseViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSe
         if "_error" not in resultat:
             document.indexe_rag = True
             document.save(update_fields=("indexe_rag",))
+        else:
+            logger.warning("Document %s validé mais non indexé : %s", document.id, resultat["_error"])
 
         enregistrer_evenement(
             action="VALIDER_DOCUMENT",
@@ -720,39 +752,46 @@ class DocumentEntrepriseViewSet(AnalyseScopedQuerySetMixin, viewsets.ModelViewSe
             details={"indexe_rag": document.indexe_rag},
             request=request,
         )
-
         return Response(self.get_serializer(document).data, status=status.HTTP_200_OK)
 
 
+def _nettoyer_historique(brut) -> list:
+    """Historique fourni par le front : 6 derniers échanges, rôles et taille bornés."""
+    if not isinstance(brut, list):
+        return []
+    historique = []
+    for item in brut[-6:]:
+        if not isinstance(item, dict):
+            continue
+        role = "assistant" if item.get("role") == "assistant" else "user"
+        contenu = str(item.get("content") or "").strip()[:1500]
+        if contenu:
+            historique.append({"role": role, "content": contenu})
+    return historique
+
+
 class AssistantQueryView(APIView):
-    """API Endpoint pour les requêtes conversationnelles adressées à l'assistant IA."""
+    """Requêtes conversationnelles adressées à l'assistant IA."""
 
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        """Interroge l'assistant RAG avec la question utilisateur contextualisée par l'organisation.
-
-        Returns:
-            Response: La réponse générée et les sources documentaires, ou une erreur HTTP.
-        """
         question = (request.data.get("question") or "").strip()
         if not question:
             return Response({"error": "La question ne peut pas être vide."}, status=status.HTTP_400_BAD_REQUEST)
 
         if getattr(request.user, "role", None) == "SUPER_ADMIN":
-            return Response(
-                {"error": "L'assistant n'est pas disponible pour ce rôle."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+            return Response({"error": "L'assistant n'est pas disponible pour ce rôle."}, status=status.HTTP_403_FORBIDDEN)
 
         organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
         if organisation is None:
-            return Response(
-                {"error": "Aucune organisation associée à ce compte."},
-                status=status.HTTP_409_CONFLICT,
-            )
+            return Response({"error": "Aucune organisation associée à ce compte."}, status=status.HTTP_409_CONFLICT)
 
-        reponse = interroger_assistant(question, organisation.id)
+        reponse = interroger_assistant(
+            question,
+            organisation.id,
+            historique=_nettoyer_historique(request.data.get("historique")),
+        )
 
         enregistrer_evenement(
             action="INTERROGER_ASSISTANT",
@@ -765,7 +804,7 @@ class AssistantQueryView(APIView):
         )
 
         if "_error" in reponse:
-            return Response({"error": reponse["_error"]}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            return Response({"error": reponse["_error"]}, status=status.HTTP_53_SERVICE_UNAVAILABLE)
 
         return Response(
             {"answer": reponse.get("answer", "Je n'ai pas pu formuler de réponse."), "sources": reponse.get("sources", [])},
@@ -774,26 +813,25 @@ class AssistantQueryView(APIView):
 
 
 class OpportuniteFinancementViewSet(viewsets.ReadOnlyModelViewSet):
-    """ViewSet en lecture pour la consultation des opportunités et subventions d'investissements."""
+    """Consultation des opportunités et subventions."""
 
     serializer_class = OpportuniteFinancementSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        """Filtre les opportunités par statut ('ACTIF' par défaut, 'A_VERIFIER' pour les admins)."""
         statut_demande = self.request.query_params.get("statut")
         if statut_demande == "A_VERIFIER":
-            if getattr(self.request.user, "role", None) not in ("ADMIN_ORGANISATION", "SUPER_ADMIN"):
+            if getattr(self.request.user, "role", None) not in ROLES_ADMIN:
                 return OpportuniteFinancement.objects.none()
             return OpportuniteFinancement.objects.filter(statut="A_VERIFIER")
         return OpportuniteFinancement.objects.filter(statut="ACTIF")
 
     @action(detail=True, methods=["post"], url_path="valider")
     def valider(self, request, pk=None):
-        """Approuve une opportunité de financement pour publication au catalogue public."""
-        if getattr(request.user, "role", None) not in ("ADMIN_ORGANISATION", "SUPER_ADMIN"):
+        """Publie une opportunité en attente de relecture."""
+        if getattr(request.user, "role", None) not in ROLES_ADMIN:
             return Response({"error": "Rôle non autorisé pour cette action."}, status=status.HTTP_403_FORBIDDEN)
-        opportunite = self.get_object()
+        opportunite = get_object_or_404(OpportuniteFinancement, pk=pk)
         if opportunite.statut != "A_VERIFIER":
             return Response({"error": "Cette opportunité n'est pas en attente de relecture."}, status=status.HTTP_409_CONFLICT)
         opportunite.statut = "ACTIF"
@@ -806,15 +844,14 @@ class OpportuniteFinancementViewSet(viewsets.ReadOnlyModelViewSet):
             utilisateur=request.user,
             request=request,
         )
-
         return Response(self.get_serializer(opportunite).data)
 
     @action(detail=True, methods=["post"], url_path="rejeter")
     def rejeter(self, request, pk=None):
-        """Passe une opportunité de financement à l'état expiré/rejeté."""
-        if getattr(request.user, "role", None) not in ("ADMIN_ORGANISATION", "SUPER_ADMIN"):
+        """Passe une opportunité à l'état expiré/rejeté."""
+        if getattr(request.user, "role", None) not in ROLES_ADMIN:
             return Response({"error": "Rôle non autorisé pour cette action."}, status=status.HTTP_403_FORBIDDEN)
-        opportunite = self.get_object()
+        opportunite = get_object_or_404(OpportuniteFinancement, pk=pk)
         opportunite.statut = "EXPIRE"
         opportunite.save(update_fields=("statut",))
 
@@ -825,7 +862,6 @@ class OpportuniteFinancementViewSet(viewsets.ReadOnlyModelViewSet):
             utilisateur=request.user,
             request=request,
         )
-
         return Response(self.get_serializer(opportunite).data)
 
 
@@ -833,32 +869,31 @@ SEUIL_CONFIANCE_AUTO_PUBLICATION = 0.75
 
 
 class OpportuniteFinancementIngestionView(APIView):
-    """Endpoint Webhook recevant des flux d'opportunités financières automatisés (ex: n8n)."""
+    """Webhook recevant des flux d'opportunités financières automatisés."""
 
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     def post(self, request):
-        """Traite l'ingestion par lots et applique le seuil de confiance pour l'auto-publication.
-
-        Headers:
-            X-N8N-Ingestion-Token: Jeton de sécurité pour valider la provenance de la requête.
-
-        Returns:
-            Response: Un bilan du nombre d'éléments créés et mis à jour.
-        """
-        token = request.headers.get("X-N8N-Ingestion-Token")
-        if token != getattr(settings, "N8N_INGESTION_TOKEN", None):
+        attendu = getattr(settings, "N8N_INGESTION_TOKEN", "") or ""
+        recu = request.headers.get("X-N8N-Ingestion-Token", "")
+        if not attendu or not secrets.compare_digest(recu, attendu):
             return Response({"error": "Jeton invalide."}, status=status.HTTP_401_UNAUTHORIZED)
 
         items = request.data if isinstance(request.data, list) else [request.data]
-        crees, maj = 0, 0
+        crees, maj, ignores = 0, 0, 0
         for item in items:
-            confiance = item.get("confiance_extraction")
+            if not isinstance(item, dict) or not item.get("titre") or not item.get("organisme"):
+                ignores += 1
+                continue
+            try:
+                confiance = float(item["confiance_extraction"]) if item.get("confiance_extraction") is not None else None
+            except (TypeError, ValueError):
+                confiance = None
             statut_calcule = (
-                "ACTIF" if confiance is not None and float(confiance) >= SEUIL_CONFIANCE_AUTO_PUBLICATION
-                else "A_VERIFIER"
+                "ACTIF" if confiance is not None and confiance >= SEUIL_CONFIANCE_AUTO_PUBLICATION else "A_VERIFIER"
             )
-            obj, created = OpportuniteFinancement.objects.update_or_create(
+            _obj, created = OpportuniteFinancement.objects.update_or_create(
                 titre=item.get("titre"), organisme=item.get("organisme"),
                 defaults={
                     "description": item.get("description", ""),
@@ -878,8 +913,7 @@ class OpportuniteFinancementIngestionView(APIView):
         enregistrer_evenement(
             action="INGESTION_N8N_OPPORTUNITES",
             ressource="OpportuniteFinancement",
-            details={"crees": crees, "mis_a_jour": maj},
+            details={"crees": crees, "mis_a_jour": maj, "ignores": ignores},
             request=request,
         )
-
-        return Response({"crees": crees, "mis_a_jour": maj}, status=status.HTTP_200_OK)
+        return Response({"crees": crees, "mis_a_jour": maj, "ignores": ignores}, status=status.HTTP_200_OK)

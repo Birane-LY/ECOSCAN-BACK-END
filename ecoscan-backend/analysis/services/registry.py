@@ -177,6 +177,54 @@ REGISTRE_METRIQUES = {
     proprietaire="energy_analytics",
     version="1.0",
 ),
+    "consommation_journaliere_woyofal": DefinitionMetrique(
+        code="consommation_journaliere_woyofal",
+        nom="Consommation journalière (compteur prépayé Woyofal)",
+        objectif=(
+            "Mesurer la consommation quotidienne d'un compteur prépayé, dont on relève "
+            "le solde restant et non un index cumulé."
+        ),
+        question_metier="Combien ai-je consommé sur cette journée, recharges comprises ?",
+        decision_associee="Comparer la journée à la moyenne récente et détecter une dérive.",
+        formule_description=(
+            "Solde au relevé précédent + recharges entre les deux relevés - solde au relevé "
+            "suivant, réparti au prorata du temps sur chaque jour couvert."
+        ),
+        unite="kWh",
+        frequence="quotidienne",
+        sources_requises=("releves_solde_woyofal", "achats_woyofal"),
+        qualite_requise=QualiteRequise(completude_min=0.80, nombre_observations_min=2),
+        limites=(
+            "Repose sur des soldes saisis à la main : un oubli de recharge ou une erreur de "
+            "saisie rend l'intervalle incohérent (il est alors écarté, jamais corrigé).",
+            "Quand deux relevés sont séparés de plus de 36 h, la consommation est lissée sur "
+            "les jours intermédiaires (qualité « estimée »).",
+            "Jours découpés en UTC (identique à l'heure de Dakar).",
+        ),
+        proprietaire="energy_analytics",
+        version="1.0",
+    ),
+    "variation_woyofal_vs_moyenne_recente": DefinitionMetrique(
+        code="variation_woyofal_vs_moyenne_recente",
+        nom="Variation de consommation Woyofal par rapport aux jours précédents",
+        objectif="Détecter une dérive de consommation sur un compteur prépayé.",
+        question_metier="Ai-je consommé plus ou moins que d'habitude ces derniers jours ?",
+        decision_associee="Investiguer une dérive ou confirmer l'effet d'une action.",
+        formule_description="(consommation du jour - moyenne des 7 jours précédents) / moyenne × 100.",
+        unite="%",
+        frequence="quotidienne",
+        sources_requises=("consommation_journaliere_woyofal",),
+        qualite_requise=QualiteRequise(completude_min=0.80, nombre_observations_min=4),
+        baseline=DefinitionBaseline(type="moyenne_simple", parametres={"nombre_jours": 7}),
+        limites=(
+            "Baseline de 7 jours : sensible à un événement exceptionnel, et ne distingue pas "
+            "semaine et week-end.",
+            "Au moins 4 jours de référence suffisamment couverts sont nécessaires.",
+            "Ne tient pas compte du volume de production ou de la météo sans normalisation externe.",
+        ),
+        proprietaire="energy_analytics",
+        version="1.0",
+    ),
 }
 
 

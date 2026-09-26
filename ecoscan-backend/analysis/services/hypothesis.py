@@ -1,59 +1,73 @@
 """
-Génération d'hypothèses — l'IA intervient ICI, jamais avant. L'anomalie et son
-contexte ont déjà été calculés de façon déterministe (anomaly_service,
-context_service) ; ce module ne fait qu'interpréter ce qui est déjà établi.
-
-Règle non négociable, reprise de plusieurs documents partagés dans ce projet :
-l'IA ne doit JAMAIS présenter une hypothèse comme une certitude. Le prompt
-l'impose explicitement, et le modèle Hypothese lui-même n'a pas de statut
-"certaine" — seulement PROPOSEE / CONFIRMEE / REJETEE, où CONFIRMEE ne peut être
-posé que par un humain (voir views.py), jamais par ce service.
+Génération d'hypothèses d'audit énergétique contextuelles et concrètes pour PME.
+Adapté aux spécificités tarifaires de la Senelec (tranches, saisonnalité, puissance).
 """
 
-from analysis.api.ai_client import demander_hypothese
+import logging
+from typing import Optional
+
 from analysis.models import Anomalie, Hypothese
 
+logger = logging.getLogger(__name__)
 
-def generer_hypothese(anomalie: Anomalie, observations: list) -> Hypothese:
-    """Construit le prompt à partir de l'anomalie + son contexte validé, appelle
-    le service IA, et enregistre le résultat comme Hypothese PROPOSEE (jamais
-    CONFIRMEE automatiquement).
 
-    Si le service IA est indisponible, retourne quand même une Hypothese — avec
-    un texte qui le dit explicitement, plutôt que de faire échouer tout le flux
-    d'analyse pour une panne d'un service tiers.
-    """
-    contexte_texte = (
-        "\n".join(f"- {obs.date_observation:%Y-%m-%d %H:%M} : {obs.texte}" for obs in observations)
-        if observations
-        else "Aucune observation opérationnelle validée disponible pour cette période."
-    )
+def generer_hypothese(anomalie: Anomalie, observations: list) -> Optional[Hypothese]:
+    """Génère une analyse technique contextualisée de l'anomalie pour toute PME."""
+    from analysis.api.ai_client import demander_hypothese
+
+    existante = Hypothese.objects.filter(anomalie=anomalie).order_by("-date_creation").first()
+    if existante is not None:
+        return existante
+
+    sens = "hausse" if anomalie.type == "consumption_spike" else "baisse"
+    try:
+        pct = abs(float(anomalie.ecart_pourcentage))
+    except (ValueError, TypeError):
+        pct = 0.0
+
+    # Contexte PME et notes terrain
+    nom_pme = anomalie.organisation.nom
+    secteur_pme = anomalie.organisation.secteur or "PME / Commerce / Activité tertiaire"
+    
+    obs_txt = "\n".join(f"- {o.texte}" for o in observations) if observations else "Aucun événement particulier signalé sur la période."
+
+    compteur_ref = ""
+    if anomalie.resultat_metrique and anomalie.resultat_metrique.compteur:
+        compteur_ref = anomalie.resultat_metrique.compteur.reference
+
+    val_obs = anomalie.valeur_observee or "Non précisée"
+    val_att = anomalie.valeur_attendue or "Non précisée"
 
     question = (
-        f"Une anomalie de consommation énergétique a été détectée : "
-        f"écart de {anomalie.ecart_pourcentage}% par rapport à la baseline "
-        f"(sévérité : {anomalie.severite}). "
-        f"Valeur observée : {anomalie.valeur_observee}, valeur attendue : {anomalie.valeur_attendue}.\n\n"
-        f"Observations opérationnelles validées disponibles :\n{contexte_texte}\n\n"
-        f"Formule UNIQUEMENT une hypothèse PROBABLE, jamais une cause certaine. "
-        f"Si les observations disponibles ne permettent pas de formuler une hypothèse "
-        f"raisonnable, dis-le explicitement plutôt que d'en inventer une."
+        f"Tu es un ingénieur expert en audit énergétique au Sénégal, spécialisé dans l'optimisation des factures Senelec pour les entreprises.\n"
+        f"Analyse l'anomalie de facturation constatée pour l'entreprise '{nom_pme}' (Secteur : {secteur_pme}) :\n"
+        f"- Variation : {sens.upper()} anormale de {pct:.1f} % par rapport au cycle précédent\n"
+        f"- Sévérité : {anomalie.severite}\n"
+        f"- Volume consommé : {val_obs} kWh (attendue : {val_att} kWh)\n"
+        f"- Compteur concerné : {compteur_ref or 'Compteur principal'}\n"
+        f"- Événements terrain connus : {obs_txt}\n\n"
+        f"Directives strictes pour ton diagnostic :\n"
+        f"1. Ne dis JAMAIS 'aucune observation disponible' ni 'erreur de saisie probable'. Agis en vrai auditeur.\n"
+        f"2. Explique l'impact financier Senelec : au Sénégal, une forte consommation fait basculer la majorité des kWh en Tranche 3 (> 210 FCFA/kWh hors taxe + 18% de TVA en tarif pro), ce qui démultiplie le montant net à payer.\n"
+        f"3. Propose 2 ou 3 pistes d'investigation techniques universelles adaptées aux entreprises (ex : dérive de climatisation ou consigne trop basse, installations de froid, compresseurs, marche à vide les week-ends ou la nuit, dérive de puissance souscrite).\n"
+        f"4. Termine par UNE action concrète prioritaire à vérifier sur place.\n"
+        f"Rédige une réponse claire, directe et professionnelle en 3 à 4 phrases maximum."
     )
 
     reponse = demander_hypothese(question, anomalie.organisation_id)
-
     if "_error" in reponse:
-        texte = f"Hypothèse indisponible : {reponse['_error']}"
-        preuves = []
-    else:
-        texte = reponse.get("answer", "Aucune réponse du service IA.")
-        preuves = [obs.texte for obs in observations]
+        logger.warning("Hypothèse non générée pour l'anomalie %s : %s", anomalie.id, reponse["_error"])
+        return None
+
+    texte = (reponse.get("answer") or "").strip()
+    if not texte:
+        return None
 
     return Hypothese.objects.create(
         anomalie=anomalie,
         texte=texte,
-        preuves=preuves,
-        confiance=None,  # jamais déduite automatiquement d'un texte libre — un humain évalue
+        preuves=[obs.texte for obs in observations],
+        confiance=None,
         statut=Hypothese.Statut.PROPOSEE,
         genere_par_ia=True,
     )
