@@ -14,7 +14,7 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
+DEBUG = os.getenv('DJANGO_DEBUG', '0') in ('1', 'True', 'true')
 
 ALLOWED_HOSTS = [
     host.strip()
@@ -57,7 +57,21 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+EMAIL_BACKEND = os.getenv(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend",
+)
+EMAIL_HOST = os.getenv("EMAIL_HOST", "")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "True").lower() == "true"
+EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "False").lower() == "true"
+EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "15"))
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+DEFAULT_FROM_EMAIL = os.getenv(
+    "DEFAULT_FROM_EMAIL",
+    EMAIL_HOST_USER or "noreply@monapp.com",
+)
 ROOT_URLCONF = 'config.urls'
 
 TEMPLATES = [
@@ -76,7 +90,18 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
-
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            # Évite l'erreur 'database is locked' lors des tâches de fond
+            'timeout': 30,
+            # Active le mode WAL pour la concurrence
+            'init_command': 'PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;',
+        }
+    }
+}
 # Database configuration
 def postgres_est_disponible():
     try:
@@ -108,6 +133,9 @@ if DEBUG:
     configuration_sqlite = {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        "OPTIONS": {
+            "timeout": 60,
+        },
     }
 
     if choix_db_local == "sqlite":
@@ -167,7 +195,12 @@ REST_FRAMEWORK = {
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
 ]
+CORS_ALLOW_CREDENTIALS = True
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
 
 PASSWORD_RESET_TIMEOUT = 172800  # 48 heures
 
@@ -180,4 +213,21 @@ SIMPLE_JWT = {
 
 
 WOYOFAL_PRELEVEMENTS_PCT = os.getenv("WOYOFAL_PRELEVEMENTS_PCT", "0")
-ALLOWED_HOSTS = ['192.168.1.5', 'localhost', '  https://upper-deflected-sardine.ngrok-free.dev','127.0.0.1', '*']
+
+PAYDUNYA_MASTER_KEY = os.getenv("PAYDUNYA_MASTER_KEY", "")
+PAYDUNYA_PRIVATE_KEY = os.getenv("PAYDUNYA_PRIVATE_KEY", "")
+PAYDUNYA_PUBLIC_KEY = os.getenv("PAYDUNYA_PUBLIC_KEY", "")
+PAYDUNYA_TOKEN = os.getenv("PAYDUNYA_TOKEN", "")
+PAYDUNYA_MODE = os.getenv("PAYDUNYA_MODE", "test")
+
+DJANGO_INTERNAL_TOKEN = os.getenv("DJANGO_INTERNAL_TOKEN", "ALGT5wMY-ZOibOjI017Et8Pf9Y6NyR4TWqBVnxUgg2gn")
+AI_SERVICE_INTERNAL_TOKEN = os.getenv("AI_SERVICE_INTERNAL_TOKEN", "ECOSCANAI123")
+N8N_INGESTION_TOKEN = os.getenv("N8N_INGESTION_TOKEN", "")
+N8N_SHARED_SECRET = os.getenv("N8N_SHARED_SECRET", "")
+N8N_RELANCE_WEBHOOK_URL = os.getenv("N8N_RELANCE_WEBHOOK_URL", "")
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
+
+SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "False").lower() == "true"
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "False").lower() == "true"
+CSRF_COOKIE_SECURE = os.getenv("CSRF_COOKIE_SECURE", "False").lower() == "true"
+SECURE_HSTS_SECONDS = int(os.getenv("SECURE_HSTS_SECONDS", "0"))
