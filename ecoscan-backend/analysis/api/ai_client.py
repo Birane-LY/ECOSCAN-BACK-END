@@ -25,18 +25,18 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 AI_SERVICE_URL = getattr(settings, "AI_SERVICE_URL", "http://localhost:8001").rstrip("/")
-AI_SERVICE_INTERNAL_TOKEN = getattr(settings, "AI_SERVICE_INTERNAL_TOKEN", "change-me-internal-token")
+AI_SERVICE_INTERNAL_TOKEN = getattr(settings, "AI_SERVICE_INTERNAL_TOKEN", "")
 # La chaîne de secours FastAPI peut enchaîner plusieurs modèles (30 s chacun) :
 # un délai de 15 s coupait la requête avant la réponse. 60 s par défaut.
 AI_SERVICE_TIMEOUT = getattr(settings, "AI_SERVICE_TIMEOUT", 60.0)
 
+
 _HEADERS = {"X-Internal-Service-Token": AI_SERVICE_INTERNAL_TOKEN}
 
-if AI_SERVICE_INTERNAL_TOKEN == "change-me-internal-token":
+if not AI_SERVICE_INTERNAL_TOKEN:
     logger.warning(
-        "AI_SERVICE_INTERNAL_TOKEN n'est pas configuré (valeur par défaut) : le service "
-        "IA répondra 401/500 tant que cette valeur ne sera pas identique à INTERNAL_TOKEN "
-        "côté FastAPI."
+        "AI_SERVICE_INTERNAL_TOKEN n'est pas configuré : les appels au service IA "
+        "sont désactivés jusqu'à sa configuration côté Django et FastAPI."
     )
 
 
@@ -64,6 +64,11 @@ def _post_json(url: str, payload: dict) -> dict:
 
 
 def _appeler(url: str, payload: dict, contexte: str) -> dict:
+    if not AI_SERVICE_INTERNAL_TOKEN:
+        message = "AI_SERVICE_INTERNAL_TOKEN n'est pas configuré."
+        logger.warning("%s : %s", contexte, message)
+        return {"_error": message}
+
     try:
         return _post_json(url, payload)
     except (OSError, ValueError) as exc:  # URLError/HTTPError/timeout/JSON invalide

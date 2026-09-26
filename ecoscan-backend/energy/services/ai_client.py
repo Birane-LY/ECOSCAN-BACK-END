@@ -15,7 +15,7 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 AI_SERVICE_URL = getattr(settings, "AI_SERVICE_URL", "http://localhost:8001")
-AI_SERVICE_INTERNAL_TOKEN = getattr(settings, "AI_SERVICE_INTERNAL_TOKEN", "change-me-internal-token")
+AI_SERVICE_INTERNAL_TOKEN = getattr(settings, "AI_SERVICE_INTERNAL_TOKEN", "")
 AI_SERVICE_TIMEOUT = getattr(settings, "AI_SERVICE_TIMEOUT", 30.0)
 
 
@@ -50,6 +50,10 @@ def analyser_image(fichier_bytes: bytes, filename: str) -> dict:
     """Envoie une photo (compteur ou facture) au service vision. Ne lève
     jamais d'exception — une panne du service IA doit dégrader gracieusement
     vers la saisie manuelle, jamais bloquer l'utilisateur sur le terrain."""
+    if not AI_SERVICE_INTERNAL_TOKEN:
+        logger.warning("AI_SERVICE_INTERNAL_TOKEN n'est pas configuré : analyse d'image indisponible.")
+        return {"_error": "Le service d'analyse d'image n'est pas configuré."}
+
     content_type = mimetypes.guess_type(filename)[0] or "image/jpeg"
     try:
         return _post_multipart(f"{AI_SERVICE_URL}/api/v1/image/analyze", "file", filename, fichier_bytes, content_type)

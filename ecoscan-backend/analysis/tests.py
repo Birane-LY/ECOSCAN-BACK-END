@@ -10,6 +10,30 @@ from .models import Livrable, MemoireStrategique, OpportuniteFinancement
 from .services.report_service import _contenu_memoire, generer_pdf_livrable
 
 
+class InternalAIClientTokenTests(TestCase):
+	def test_rag_client_does_not_call_service_without_token(self):
+		from .api import ai_client
+
+		with patch.object(ai_client, "AI_SERVICE_INTERNAL_TOKEN", ""), patch.object(
+			ai_client, "_post_json"
+		) as post_json:
+			result = ai_client._appeler("http://service.test", {}, "Test")
+
+		self.assertIn("_error", result)
+		post_json.assert_not_called()
+
+	def test_image_client_does_not_call_service_without_token(self):
+		from energy.services import ai_client
+
+		with patch.object(ai_client, "AI_SERVICE_INTERNAL_TOKEN", ""), patch.object(
+			ai_client, "_post_multipart"
+		) as post_multipart:
+			result = ai_client.analyser_image(b"image", "test.jpg")
+
+		self.assertIn("_error", result)
+		post_multipart.assert_not_called()
+
+
 @override_settings(N8N_INGESTION_TOKEN="test-ingestion-token")
 class OpportuniteFinancementIngestionTests(TestCase):
 	def setUp(self):
