@@ -2,7 +2,6 @@ import re
 from django.contrib.auth.tokens import default_token_generator
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.core.mail import send_mail
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from email_validator import validate_email, EmailNotValidError
@@ -11,23 +10,32 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework.validators import UniqueValidator
 import logging
 from organizations.models import Organisation, UtilisateurOrganisation
+from billing.models import Plan
 from .models import Utilisateur, PreferencesUtilisateur
 from django.db import transaction
+from .services import envoyer_email_activation
 
 logger = logging.getLogger(__name__)
 
 class OnboardingAdminOrganisationSerializer(serializers.Serializer):
     """Sérialiseur pour la phase d'onboarding autonome d'un Admin d'organisation.
     
-    Reçoit le nom de l'administrateur et l'e-mail unique sélectionné côté Front-End.
+    Crée une demande organisationnelle en attente et son administrateur inactif.
     """
     nom_admin = serializers.CharField(
         max_length=150,
         error_messages={"blank": "Veuillez renseigner le nom du responsable."}
     )
+    nom_organisation = serializers.CharField(
+        max_length=180,
+        error_messages={"blank": "Veuillez renseigner le nom de votre organisation."}
+    )
     email_connexion = serializers.EmailField(
         error_messages={"blank": "L'adresse e-mail de connexion est obligatoire."}
     )
+    secteur = serializers.CharField(max_length=120)
+    localisation = serializers.CharField(max_length=255)
+    details_demande = serializers.JSONField(required=False, default=dict)
 
     def validate_email_connexion(self, value):
         """Vérifie le domaine, normalise l'e-mail et contrôle l'unicité avec des messages UX clairs."""
@@ -46,17 +54,54 @@ class OnboardingAdminOrganisationSerializer(serializers.Serializer):
 
         return email_valide
 
+    def validate_nom_organisation(self, value):
+        value = value.strip()
+        if Organisation.objects.filter(nom__iexact=value).exists():
+            raise serializers.ValidationError(
+                "Une demande ou une organisation portant déjà ce nom existe."
+            )
+        return value
+
+    def validate_details_demande(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Les informations complémentaires doivent être un objet.")
+        allowed_fields = {"profil", "nombre_sites", "sources", "maturite", "objectifs"}
+        details = {key: value[key] for key in allowed_fields if key in value}
+        plan_id = value.get("plan_id")
+        if plan_id:
+            try:
+                plan = Plan.objects.get(pk=plan_id, actif=True)
+            except (Plan.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+                raise serializers.ValidationError("La formule sélectionnée n’est plus disponible.")
+            details["plan_id"] = str(plan.pk)
+            details["plan_nom"] = plan.nom
+        return details
+
     def create(self, validated_data):
-        """Crée le compte de l'Admin d'organisation à l'état inactif."""
-        utilisateur = Utilisateur.objects.create(
-            email=validated_data["email_connexion"],
-            nom=validated_data["nom_admin"],
-            role=Utilisateur.Role.ADMIN_ORGANISATION,
-            actif=False,
-            is_staff=False
-        )
-        utilisateur.set_unusable_password()
-        utilisateur.save()
+        """Crée atomiquement le compte inactif, l'organisation en attente et leur lien."""
+        with transaction.atomic():
+            utilisateur = Utilisateur.objects.create(
+                email=validated_data["email_connexion"],
+                nom=validated_data["nom_admin"],
+                role=Utilisateur.Role.ADMIN_ORGANISATION,
+                actif=False,
+                is_staff=False,
+            )
+            utilisateur.set_unusable_password()
+            utilisateur.save(update_fields=("password", "mot_de_passe_hash"))
+
+            organisation = Organisation.objects.create(
+                nom=validated_data["nom_organisation"],
+                secteur=validated_data["secteur"],
+                localisation=validated_data["localisation"],
+                statut=Organisation.Statut.EN_ATTENTE,
+                details_demande=validated_data.get("details_demande", {}),
+            )
+            UtilisateurOrganisation.objects.create(
+                organisation=organisation,
+                utilisateur=utilisateur,
+            )
+
         return utilisateur
 
 
@@ -206,22 +251,16 @@ class InvitationCreateSerializer(serializers.ModelSerializer):
                     utilisateur=utilisateur,
                 )
 
-        uid = urlsafe_base64_encode(force_bytes(utilisateur.pk))
-        token = default_token_generator.make_token(utilisateur)
-        lien_activation = f"https://monapp.com/activation/?uid={uid}&token={token}"
-
+        self.context["activation_email_sent"] = False
         try:
-            send_mail(
-                subject="Invitation à rejoindre la plateforme",
-                message=f"Bonjour {utilisateur.nom},\n\nVous avez été invité sur la plateforme.\n"
-                        f"Veuillez finaliser la configuration de votre compte en définissant votre mot de passe "
-                        f"via ce lien unique : {lien_activation}\n\nL'équipe.",
-                from_email="noreply@monapp.com",
-                recipient_list=[utilisateur.email],
-                fail_silently=False,
+            envoyer_email_activation(
+                utilisateur,
+                sujet="Invitation à rejoindre la plateforme",
+                introduction="Vous avez été invité à rejoindre la plateforme EcoScan.",
             )
-        except Exception as exc:
-            logger.warning("Échec de l'envoi de l'email d'invitation à %s : %s", utilisateur.email, exc)
+            self.context["activation_email_sent"] = True
+        except Exception:
+            logger.exception("L'invitation de %s est créée, mais l'e-mail n'a pas été envoyé.", utilisateur.email)
             # Le compte et le rattachement à l'organisation restent valides même
             # si l'email échoue — l'admin peut relancer l'envoi manuellement
             # (via un futur endpoint "renvoyer l'invitation" si le besoin se confirme).
@@ -237,6 +276,10 @@ class FinaliserInscriptionSerializer(serializers.Serializer):
     uid = serializers.CharField(error_messages={"blank": "Identifiant utilisateur manquant."})
     token = serializers.CharField(error_messages={"blank": "Jeton de sécurité manquant."})
     mot_de_passe = serializers.CharField(write_only=True, error_messages={"blank": "Le mot de passe est obligatoire."})
+    mot_de_passe_confirmation = serializers.CharField(
+        write_only=True,
+        error_messages={"blank": "La confirmation du mot de passe est obligatoire."},
+    )
 
     def validate_mot_de_passe(self, value):
         """Filtre le mot de passe selon l'UX et convertit les erreurs Django brutes en messages fluides."""
@@ -266,6 +309,11 @@ class FinaliserInscriptionSerializer(serializers.Serializer):
 
     def validate(self, data):
         """Valide la validité temporelle et technique du lien d'invitation."""
+        if data["mot_de_passe"] != data["mot_de_passe_confirmation"]:
+            raise serializers.ValidationError({
+                "mot_de_passe_confirmation": "Les mots de passe ne correspondent pas."
+            })
+
         try:
             uid_decode = force_str(urlsafe_base64_decode(data["uid"]))
             utilisateur = Utilisateur.objects.get(pk=uid_decode)
@@ -341,14 +389,3 @@ class ChangerMotDePasseSerializer(serializers.Serializer):
         utilisateur.set_password(self.validated_data["nouveau_mot_de_passe"])
         utilisateur.save()
         return utilisateur
-
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-
-class EcoscanTokenSerializer(TokenObtainPairSerializer):
-    @classmethod
-    def get_token(cls, user):
-        token = super().get_token(user)
-        token["role"] = user.role
-        token["nom"] = user.nom
-        token["email"] = user.email
-        return token

@@ -71,8 +71,10 @@ class EstAdminOuDevOuSoiMeme(permissions.BasePermission):
         
         # Pour lister tous les comptes (GET /api/users/) ou inviter (POST), il faut être Admin 
         if view.action in ["list", "create"]:
-            return request.user.role == Utilisateur.Role.ADMIN_ORGANISATION
-            
+            return request.user.role in [
+                Utilisateur.Role.ADMIN_ORGANISATION,
+                Utilisateur.Role.SUPER_ADMIN,
+            ]
         # Pour les actions unitaires (GET détaillé, PUT, PATCH, DELETE sur un ID), on autorise tout le monde.
         # Le filtrage fin se fera dans `has_object_permission` et `get_queryset`.
         return True
@@ -100,6 +102,15 @@ class UtilisateurViewSet(viewsets.ModelViewSet):
     """
     queryset = Utilisateur.objects.all().order_by("email")
     permission_classes = [EstAdminOuDevOuSoiMeme]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        data = serializer.data
+        data["activation_email_sent"] = serializer.context.get("activation_email_sent", False)
+        return Response(data, status=status.HTTP_201_CREATED, headers=headers)
 
     @action(detail=False, methods=['get'], url_path='me')
     def me(self, request):
