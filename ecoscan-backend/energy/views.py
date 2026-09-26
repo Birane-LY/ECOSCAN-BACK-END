@@ -1,12 +1,16 @@
 import hashlib
 import json
 import logging
-from decimal import Decimal
+import uuid
+from decimal import Decimal, InvalidOperation
+
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets, generics
-from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser
@@ -85,8 +89,11 @@ class FichierSourceViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         if organisation is None:
             raise PermissionDenied("Aucune organisation associée à ce compte.")
 
-        contenu = fichier.read()
-        fichier.seek(0)
+        hash_fichier = calculer_hash_fichier(fichier)
+        # UniqueConstraint (hash, organisation) : redéposer la même facture provoquait
+        # une IntegrityError -> erreur 500 illisible pour l'utilisateur.
+        if FichierSource.objects.filter(organisation=organisation, hash=hash_fichier).exists():
+            raise DRFValidationError({"fichier": ["Ce fichier a déjà été importé (même contenu). Retrouvez-le dans « Fichiers importés »."]})
 
         fichier_instance = serializer.save(
             organisation=organisation,
@@ -94,15 +101,17 @@ class FichierSourceViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
             nom=fichier.name,
             mime_type=getattr(fichier, "content_type", "") or "",
             taille_octets=fichier.size,
-            hash=calculer_hash_fichier(fichier),
+            hash=hash_fichier,
         )
 
         enregistrer_evenement(
+            action="DEPOT_FICHIER_SOURCE",
+            ressource="FichierSource",
+            identifiant_ressource=str(fichier_instance.id),
             utilisateur=self.request.user,
             organisation=organisation,
-            action="DEPOT_FICHIER_SOURCE",
             details={
-                "fichier_id": fichier_instance.id,
+                "fichier_id": str(fichier_instance.id),
                 "nom": fichier_instance.nom,
                 "taille_octets": fichier_instance.taille_octets,
                 "hash": fichier_instance.hash,
@@ -142,13 +151,15 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         )
 
         enregistrer_evenement(
+            action="CREATION_IMPORT",
+            ressource="ImportDonnees",
+            identifiant_ressource=str(import_instance.id),
             utilisateur=self.request.user,
             organisation=fichier_source.organisation,
-            action="CREATION_IMPORT",
             details={
-                "import_id": import_instance.id,
-                "fichier_source_id": fichier_source.id,
-                "compteur_id": compteur.id if compteur else None,
+                "import_id": str(import_instance.id),
+                "fichier_source_id": str(fichier_source.id),
+                "compteur_id": str(compteur.id) if compteur else None,
             },
             request=self.request
         )
@@ -159,10 +170,12 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         import_instance.lancer_import()
 
         enregistrer_evenement(
+            action="LANCEMENT_PIPELINE_OCR",
+            ressource="ImportDonnees",
+            identifiant_ressource=str(import_instance.id),
             utilisateur=request.user,
             organisation=import_instance.organisation,
-            action="LANCEMENT_PIPELINE_OCR",
-            details={"import_id": import_instance.id},
+            details={"import_id": str(import_instance.id)},
             request=request
         )
 
@@ -194,10 +207,12 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
             ))
 
             enregistrer_evenement(
+                action="REJET_DOCUMENT_HORS_PERIMETRE",
+                ressource="ImportDonnees",
+                identifiant_ressource=str(import_instance.id),
                 utilisateur=request.user,
                 organisation=import_instance.organisation,
-                action="REJET_DOCUMENT_HORS_PERIMETRE",
-                details={"import_id": import_instance.id, "raison": import_instance.ocr_erreur},
+                details={"import_id": str(import_instance.id), "raison": import_instance.ocr_erreur},
                 request=request
             )
             return Response(self.get_serializer(import_instance).data, status=status.HTTP_200_OK)
@@ -208,13 +223,13 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         import_instance.donnees_extraites = champs
         import_instance.rapport_analyse = {"classification": classification, "validation": validation}
         import_instance.nombre_lignes = 1
-        import_instance.nombre_erreurs = len(validation["erreurs"])
-        import_instance.score_qualite = self._calculer_score_qualite(score_lisibilite, score_pertinence, validation)
+        score_qualite = self._calculer_score_qualite(score_lisibilite, score_pertinence, validation)
+        import_instance.score_qualite = score_qualite
 
         if not validation["valide"]:
             import_instance.statut = ImportDonnees.Statut.INCOHERENT
             import_instance.ocr_erreur = "; ".join(e["message"] for e in validation["erreurs"])
-        elif classification["decision"] == "human_review" or validation["requires_review"]:
+        elif (classification.get("decision") == "human_review" or validation.get("requires_review")) and score_qualite < Decimal("80"):
             import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
         else:
             import_instance.statut = ImportDonnees.Statut.TERMINE
@@ -227,21 +242,52 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         ))
 
         if import_instance.statut == ImportDonnees.Statut.TERMINE:
-            from analysis.views import _publier_resultat_depuis_import
-            _publier_resultat_depuis_import(import_instance)
+            # La publication (métriques, anomalie, hypothèse IA) ne doit jamais
+            # faire échouer un import déjà enregistré : on journalise et on continue.
+            try:
+                from analysis.views import _publier_resultat_depuis_import
+                _publier_resultat_depuis_import(import_instance)
+            except Exception:
+                logger.exception("Publication du résultat métrique impossible pour l'import %s.", import_instance.id)
 
         enregistrer_evenement(
+            action="TRAITEMENT_IMPORT_TERMINE",
+            ressource="ImportDonnees",
+            identifiant_ressource=str(import_instance.id),
             utilisateur=request.user,
             organisation=import_instance.organisation,
-            action="TRAITEMENT_IMPORT_TERMINE",
             details={
-                "import_id": import_instance.id,
+                "import_id": str(import_instance.id),
                 "statut_final": import_instance.statut,
                 "score_qualite": float(import_instance.score_qualite),
             },
             request=request
         )
 
+        return Response(self.get_serializer(import_instance).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="valider-et-publier")
+    def valider_et_publier(self, request, pk=None):
+        """Action manuelle : valide un import (même s'il était en REVUE_REQUISE) et publie le résultat métrique."""
+        import_instance = self.get_object()
+        import_instance.statut = ImportDonnees.Statut.TERMINE
+        import_instance.save(update_fields=("statut",))
+
+        try:
+            from analysis.views import _publier_resultat_depuis_import
+            _publier_resultat_depuis_import(import_instance)
+        except Exception:
+            logger.exception("Publication du résultat métrique impossible pour l'import %s.", import_instance.id)
+
+        enregistrer_evenement(
+            action="VALIDATION_ET_PUBLICATION_IMPORT",
+            ressource="ImportDonnees",
+            identifiant_ressource=str(import_instance.id),
+            utilisateur=request.user,
+            organisation=import_instance.organisation,
+            details={"import_id": str(import_instance.id)},
+            request=request
+        )
         return Response(self.get_serializer(import_instance).data, status=status.HTTP_200_OK)
 
     def _echouer(self, import_instance, message, request=None):
@@ -252,10 +298,12 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         import_instance.save(update_fields=("statut", "ocr_statut", "ocr_erreur", "date_traitement"))
 
         enregistrer_evenement(
+            action="ECHEC_TRAITEMENT_IMPORT",
+            ressource="ImportDonnees",
+            identifiant_ressource=str(import_instance.id),
             utilisateur=request.user if request else import_instance.lance_par,
             organisation=import_instance.organisation,
-            action="ECHEC_TRAITEMENT_IMPORT",
-            details={"import_id": import_instance.id, "erreur": message},
+            details={"import_id": str(import_instance.id), "erreur": message},
             request=request
         )
 
@@ -289,10 +337,12 @@ class SourceDonneeViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet
         instance = serializer.save(organisation=organisation)
 
         enregistrer_evenement(
+            action="CREATION_SOURCE_DONNEE",
+            ressource="SourceDonnee",
+            identifiant_ressource=str(instance.id),
             utilisateur=self.request.user,
             organisation=organisation,
-            action="CREATION_SOURCE_DONNEE",
-            details={"source_id": instance.id, "nom": instance.nom},
+            details={"source_id": str(instance.id), "nom": instance.nom},
             request=self.request
         )
 
@@ -313,6 +363,21 @@ class DonneeEnergetiqueViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelVi
     ).order_by("-periode_debut")
     serializer_class = DonneeEnergetiqueSerializer
     organisation_lookup = "compteur__site__organisation"
+
+    def perform_create(self, serializer):
+        """Refuse un relevé sur un compteur d'une autre organisation (rien ne le
+        contrôlait) et le marque VALIDEE : les métriques (registry : statut_validation
+        requis = VALIDEE) ignorent tout relevé EN_ATTENTE, et aucun écran ni endpoint
+        ne permet de le valider — la mesure de consommation restait donc vide.
+        Mettre ECOSCAN_VALIDATION_AUTO_RELEVES = False pour rétablir une validation manuelle."""
+        compteur = serializer.validated_data.get("compteur")
+        organisation = getattr(getattr(compteur, "site", None), "organisation", None)
+        if organisation is None or not self._organisations_de_lutilisateur().filter(id=organisation.id).exists():
+            raise PermissionDenied("Compteur hors de votre organisation.")
+        if getattr(settings, "ECOSCAN_VALIDATION_AUTO_RELEVES", True):
+            serializer.save(statut_validation=DonneeEnergetique.StatutValidation.VALIDEE)
+        else:
+            serializer.save()
 
 
 class HistoriquePerformanceViewSet(OrganisationScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
@@ -351,10 +416,12 @@ class ObjectifViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
         instance = serializer.save(organisation=organisation)
 
         enregistrer_evenement(
+            action="CREATION_OBJECTIF",
+            ressource="Objectif",
+            identifiant_ressource=str(instance.id),
             utilisateur=self.request.user,
             organisation=organisation,
-            action="CREATION_OBJECTIF",
-            details={"objectif_id": instance.id, "titre": getattr(instance, "titre", "")},
+            details={"objectif_id": str(instance.id), "titre": getattr(instance, "titre", "")},
             request=self.request
         )
 
@@ -378,8 +445,11 @@ class IndicateurObjectifViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelV
 def _compteur_de(request, compteur_id):
     if not compteur_id:
         return None
-    return Compteur.objects.filter(
-        id=compteur_id, site__organisation__membres__utilisateur=request.user).first()
+    try:
+        return Compteur.objects.filter(
+            id=compteur_id, site__organisation__membres__utilisateur=request.user).first()
+    except (ValueError, TypeError, DjangoValidationError):
+        return None
 
 
 class PredictionAchatView(APIView):
@@ -390,7 +460,13 @@ class PredictionAchatView(APIView):
         montant = request.data.get("montant_fcfa")
         if compteur is None or montant is None:
             return Response({"error": "compteur valide et montant_fcfa requis."}, status=400)
-        return Response(predire_kwh(compteur, Decimal(str(montant))))
+        try:
+            montant_decimal = Decimal(str(montant))
+        except InvalidOperation:
+            return Response({"error": "montant_fcfa doit être un nombre."}, status=status.HTTP_400_BAD_REQUEST)
+        if montant_decimal <= 0:
+            return Response({"error": "montant_fcfa doit être supérieur à 0."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(predire_kwh(compteur, montant_decimal))
 
 
 class EtatTrancheView(APIView):
@@ -403,6 +479,41 @@ class EtatTrancheView(APIView):
         return Response(etat_tranche(compteur))
 
 
+def _client_id_valide(request):
+    """client_id du mobile (UUID) : 400 clair au lieu d'une erreur 500 au filtrage."""
+    brut = request.data.get("client_id")
+    if not brut:
+        return None
+    try:
+        return uuid.UUID(str(brut))
+    except ValueError:
+        raise DRFValidationError({"client_id": ["UUID invalide."]})
+
+
+def _compteur_autorise(request):
+    """Compteur du corps de requête, ou 403 s'il n'appartient pas à l'utilisateur."""
+    compteur = _compteur_de(request, request.data.get("compteur"))
+    if compteur is None:
+        raise PermissionDenied("Compteur introuvable ou hors de votre organisation.")
+    return compteur
+
+
+def _declencher_analyse(compteur):
+    """Après un nouveau relevé de solde : analyse (hier puis aujourd'hui) en
+    arrière-plan — la réponse HTTP n'attend ni le calcul ni l'IA.
+
+    Remplace l'ancienne « synchronisation Data Center » qui copiait kWh achetés
+    ou soldes dans DonneeEnergetique.valeur : ce champ est un INDEX de compteur,
+    ces chiffres n'en sont pas (le Data Center lit désormais ReleveSolde et
+    AchatWoyofal directement)."""
+    try:
+        from analysis.services.orchestrator import analyser_compteur_apres_saisie
+        from analysis.services.taches import lancer_en_arriere_plan
+        lancer_en_arriere_plan(analyser_compteur_apres_saisie, compteur.id)
+    except Exception:
+        logger.exception("Analyse non planifiée pour le compteur %s.", getattr(compteur, "id", None))
+
+
 class AchatWoyofalListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = AchatWoyofalSerializer
@@ -412,34 +523,27 @@ class AchatWoyofalListCreateView(generics.ListCreateAPIView):
             compteur__site__organisation__membres__utilisateur=self.request.user)
 
     def create(self, request, *args, **kwargs):
-        existant = self.get_queryset().filter(client_id=request.data.get("client_id")).first()
-        if existant:
-            return Response(self.get_serializer(existant).data, status=200)
+        compteur = _compteur_autorise(request)
+
+        client_id = _client_id_valide(request)
+        if client_id:  # idempotence : ne compare que si un client_id est fourni
+            existant = self.get_queryset().filter(client_id=client_id).first()
+            if existant:
+                return Response(self.get_serializer(existant).data, status=status.HTTP_200_OK)
 
         response = super().create(request, *args, **kwargs)
 
         if response.status_code == status.HTTP_201_CREATED:
-            compteur = _compteur_de(request, request.data.get("compteur"))
-            
-            # --- Synchronisation avec DonneeEnergetique pour alimenter le DataCenter ---
-            if compteur:
-                valeur_kwh = response.data.get("kwh_obtenus") or 0
-                if valeur_kwh:
-                    DonneeEnergetique.objects.create(
-                        compteur=compteur,
-                        valeur=Decimal(str(valeur_kwh)),
-                        periode_debut=timezone.now(),
-                        periode_fin=timezone.now(),
-                    )
-
             enregistrer_evenement(
-                utilisateur=request.user,
-                organisation=compteur.site.organisation if compteur else None,
                 action="CREATION_ACHAT_WOYOFAL",
+                ressource="AchatWoyofal",
+                identifiant_ressource=str(response.data.get("id", "")),
+                utilisateur=request.user,
+                organisation=compteur.site.organisation,
                 details={
-                    "client_id": request.data.get("client_id"),
+                    "client_id": str(client_id) if client_id else None,
                     "montant": request.data.get("montant_fcfa"),
-                    "compteur_id": compteur.id if compteur else None,
+                    "compteur_id": str(compteur.id),
                 },
                 request=request
             )
@@ -456,34 +560,26 @@ class ReleveSoldeListCreateView(generics.ListCreateAPIView):
             compteur__site__organisation__membres__utilisateur=self.request.user)
 
     def create(self, request, *args, **kwargs):
-        existant = self.get_queryset().filter(client_id=request.data.get("client_id")).first()
-        if existant:
-            return Response(self.get_serializer(existant).data, status=200)
+        compteur = _compteur_autorise(request)
+
+        client_id = _client_id_valide(request)
+        if client_id:
+            existant = self.get_queryset().filter(client_id=client_id).first()
+            if existant:
+                return Response(self.get_serializer(existant).data, status=status.HTTP_200_OK)
 
         response = super().create(request, *args, **kwargs)
 
         if response.status_code == status.HTTP_201_CREATED:
-            compteur = _compteur_de(request, request.data.get("compteur"))
-            
-            # --- Synchronisation avec DonneeEnergetique pour alimenter le DataCenter ---
-            if compteur:
-                valeur_index = response.data.get("valeur") or response.data.get("index_kwh")
-                if valeur_index is not None:
-                    DonneeEnergetique.objects.create(
-                        compteur=compteur,
-                        valeur=Decimal(str(valeur_index)),
-                        periode_debut=timezone.now(),
-                        periode_fin=timezone.now(),
-                    )
+            _declencher_analyse(compteur)
 
             enregistrer_evenement(
-                utilisateur=request.user,
-                organisation=compteur.site.organisation if compteur else None,
                 action="CREATION_RELEVE_SOLDE",
-                details={
-                    "client_id": request.data.get("client_id"),
-                    "compteur_id": compteur.id if compteur else None,
-                },
+                ressource="ReleveSolde",
+                identifiant_ressource=str(response.data.get("id", "")),
+                utilisateur=request.user,
+                organisation=compteur.site.organisation,
+                details={"client_id": str(client_id) if client_id else None, "compteur_id": str(compteur.id)},
                 request=request
             )
 
@@ -526,9 +622,10 @@ class CaptureImageView(APIView):
 
         organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
         enregistrer_evenement(
+            action="CAPTURE_IMAGE_ANALYSEE",
+            ressource="CaptureImage",
             utilisateur=request.user,
             organisation=organisation,
-            action="CAPTURE_IMAGE_ANALYSEE",
             details={"nom_fichier": fichier.name, "champs_detectes": list(champs_utiles.keys())},
             request=request
         )
@@ -550,12 +647,16 @@ class CreerImportDepuisCaptureView(APIView):
             return Response({"error": "Aucune organisation associée."}, status=status.HTTP_409_CONFLICT)
 
         fichier = request.FILES.get("image")
-        champs_confirmes = json.loads(request.data.get("champs_confirmes", "{}"))
-        if not fichier or not champs_confirmes:
+        try:
+            champs_confirmes = json.loads(request.data.get("champs_confirmes", "{}"))
+        except (TypeError, ValueError):
+            return Response({"error": "champs_confirmes doit être un JSON valide."}, status=status.HTTP_400_BAD_REQUEST)
+        if not fichier or not isinstance(champs_confirmes, dict) or not champs_confirmes:
             return Response({"error": "Image et champs confirmés requis."}, status=status.HTTP_400_BAD_REQUEST)
 
-        contenu = fichier.read()
-        fichier.seek(0)
+        hash_fichier = calculer_hash_fichier(fichier)
+        if FichierSource.objects.filter(organisation=organisation, hash=hash_fichier).exists():
+            return Response({"error": "Cette photo a déjà été importée."}, status=status.HTTP_409_CONFLICT)
 
         with transaction.atomic():
             fichier_source = FichierSource.objects.create(
@@ -563,7 +664,7 @@ class CreerImportDepuisCaptureView(APIView):
                 nom=fichier.name, fichier=fichier,
                 mime_type=getattr(fichier, "content_type", "") or "",
                 taille_octets=fichier.size,
-                hash=calculer_hash_fichier(fichier),
+                hash=hash_fichier,
             )
             import_instance = ImportDonnees.objects.create(
                 fichier_source=fichier_source, organisation=organisation, lance_par=request.user,
@@ -574,18 +675,23 @@ class CreerImportDepuisCaptureView(APIView):
                 date_traitement=timezone.now(),
                 nombre_lignes=1,
             )
+
+        # Hors transaction : la publication peut appeler le service IA (lent) et
+        # ne doit ni bloquer la base ni annuler l'import déjà enregistré.
+        try:
             from analysis.views import _publier_resultat_depuis_import
             _publier_resultat_depuis_import(import_instance)
+        except Exception:
+            logger.exception("Publication du résultat métrique impossible pour l'import %s.", import_instance.id)
 
-            enregistrer_evenement(
-                utilisateur=request.user,
-                organisation=organisation,
-                action="CREATION_IMPORT_DEPUIS_CAPTURE",
-                details={
-                    "import_id": import_instance.id,
-                    "fichier_source_id": fichier_source.id,
-                },
-                request=request
-            )
+        enregistrer_evenement(
+            action="CREATION_IMPORT_DEPUIS_CAPTURE",
+            ressource="ImportDonnees",
+            identifiant_ressource=str(import_instance.id),
+            utilisateur=request.user,
+            organisation=organisation,
+            details={"import_id": str(import_instance.id), "fichier_source_id": str(fichier_source.id)},
+            request=request
+        )
 
         return Response(ImportDonneesSerializer(import_instance).data, status=status.HTTP_201_CREATED)

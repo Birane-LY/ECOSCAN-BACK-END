@@ -48,6 +48,8 @@ def etat_tranche(compteur) -> dict:
                 "prochain_prix": next((float(q.prix_fcfa_par_kwh) for q in bareme if q.ordre > p.ordre), None),
             }
 
+    return {"erreur": "Cumul supérieur à toutes les tranches configurées.", "cumul_kwh": float(cumul)}
+
 
 def predire_kwh(compteur, montant_fcfa: Decimal) -> dict:
     bareme = bareme_actuel()
