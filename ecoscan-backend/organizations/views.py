@@ -1,8 +1,11 @@
+from django.conf import settings
+from django.http import JsonResponse
 from django.db import transaction
 from rest_framework import viewsets, permissions, status
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+import logging
 from .models import (
     Organisation,
     UtilisateurOrganisation,
@@ -12,6 +15,11 @@ from .models import (
     Compteur,
     ConfigurationSecurite,
 )
+from energy.models import DonneeEnergetique, Objectif
+from analysis.models import Anomalie, Recommandation, MemoireStrategique
+from accounts.models import Utilisateur
+from accounts.services import envoyer_email_activation
+
 from .serializers import (
     OrganisationSerializer,
     UtilisateurOrganisationSerializer,
@@ -21,6 +29,16 @@ from .serializers import (
     CompteurSerializer,
     ConfigurationSecuriteSerializer,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class EmailActivationDeliveryError(APIException):
+    status_code = status.HTTP_502_BAD_GATEWAY
+    default_detail = (
+        "L’e-mail d’activation n’a pas pu être envoyé. "
+        "La demande reste en attente ; réessayez après vérification du service e-mail."
+    )
 
 
 class EstMembreDeLOrganisation(permissions.BasePermission):
@@ -150,8 +168,16 @@ class OrganisationViewSet(viewsets.ModelViewSet):
         # SÉCURITÉ : Un script (n8n ou autre) qui a besoin de cette route doit 
         # s'authentifier avec un compte de service ayant réellement le rôle SUPER_ADMIN.
         if acteur.role == "SUPER_ADMIN":
+            champs_autorises = {"statut", "defaut_paiement"}
+            champs_interdits = set(request.data.keys()) - champs_autorises
+            if champs_interdits:
+                raise PermissionDenied(
+                    "Le Super Admin ne peut pas modifier les informations d'une organisation."
+                )
+
             nouveau_statut = request.data.get("statut")
             nouveau_defaut = request.data.get("defaut_paiement")
+            email_activation_envoye = False
 
             # 1. Traitement du flag de paiement envoyé par n8n ou le Super Admin
             if nouveau_defaut is not None:
@@ -159,6 +185,24 @@ class OrganisationViewSet(viewsets.ModelViewSet):
 
             # 2. Traitement du changement de statut (Suspension / Réactivation)
             if nouveau_statut and instance.statut != nouveau_statut:
+                if nouveau_statut not in Organisation.Statut.values:
+                    raise ValidationError({"statut": "Statut d’organisation invalide."})
+
+                demande_en_attente = instance.statut == Organisation.Statut.EN_ATTENTE
+                if demande_en_attente and nouveau_statut != Organisation.Statut.ACTIVE:
+                    raise PermissionDenied("Une demande en attente ne peut être qu’approuvée ou laissée en attente.")
+                if demande_en_attente and nouveau_statut == Organisation.Statut.ACTIVE:
+                    from billing.models import Plan
+                    plan_id_demande = instance.details_demande.get("plan_id")
+                    plan_configure = (
+                        Plan.objects.filter(pk=plan_id_demande, actif=True).exists()
+                        if plan_id_demande
+                        else Plan.objects.filter(code="standard", actif=True).exists()
+                    )
+                    if not plan_configure:
+                        raise ValidationError({
+                            "plan": "La formule demandée n’est plus active ou le plan d’essai standard n’est pas configuré."
+                        })
                 
                 # Tentative de Suspension : Impossible si le client est à jour
                 if nouveau_statut == Organisation.Statut.SUSPENDUE:
@@ -175,10 +219,38 @@ class OrganisationViewSet(viewsets.ModelViewSet):
                         )
 
                 instance.statut = nouveau_statut
-            
-            instance.save()
+
+                if demande_en_attente and nouveau_statut == Organisation.Statut.ACTIVE:
+                    admins = Utilisateur.objects.filter(
+                        organisations_membres__organisation=instance,
+                        role=Utilisateur.Role.ADMIN_ORGANISATION,
+                        actif=False,
+                    ).distinct()
+                    for admin in admins:
+                        try:
+                            envoyer_email_activation(
+                                admin,
+                                sujet="Votre demande EcoScan est approuvée",
+                                introduction=(
+                                    "Votre demande d’accès à EcoScan a été approuvée. "
+                                    "Votre compte administrateur est prêt à être activé."
+                                ),
+                            )
+                            email_activation_envoye = True
+                        except Exception as exc:
+                            raise EmailActivationDeliveryError() from exc
+
+                # Do not hold SQLite's write lock while waiting for the SMTP server.
+                with transaction.atomic():
+                    instance.save()
+
+            else:
+                instance.save()
+
             serializer = self.get_serializer(instance)
-            return Response(serializer.data)
+            data = serializer.data
+            data["activation_email_sent"] = email_activation_envoye
+            return Response(data)
 
         # Un ADMIN_ORGANISATION membre de sa propre structure peut modifier ses
         # informations descriptives (nom, secteur, localisation), jamais son statut.
@@ -295,3 +367,129 @@ class OnboardingSimpleView(APIView):
                 unite="kWh", statut_synchronisation="MANUEL",
             )
         return Response({"organisation": str(org.id), "site": str(site.id), "compteur": str(compteur.id)}, status=201)
+
+
+
+
+class InternalAIContextView(APIView):
+    """Endpoint interne appelé exclusivement par le service FastAPI Assistant AI.
+    
+    Transmet le contexte métier complet et les données de consommation récentes
+    (notamment les créneaux horaires) en échange du token de service sécurisé.
+    """
+    authentication_classes = []  # Pas de JWT utilisateur
+    permission_classes = []      # Sécurisé par token interne
+
+    def get(self, request, organisation_id):
+        token_attendu = getattr(settings, "DJANGO_INTERNAL_TOKEN", "")
+        token_recu = request.headers.get("X-Internal-Service-Token")
+
+        if not token_recu or token_recu != token_attendu:
+            return JsonResponse({"detail": "Token d'authentification interne invalide."}, status=401)
+
+        try:
+            org = Organisation.objects.get(id=organisation_id)
+        except (Organisation.DoesNotExist, ValueError):
+            return JsonResponse({"detail": "Organisation introuvable."}, status=404)
+
+        # Récupération des relevés de consommation récents avec leurs créneaux
+        releves_creneaux = list(
+            DonneeEnergetique.objects.filter(compteur__site__organisation=org)
+            .order_by("-date_releve", "-periode_debut")[:30]
+            .values("date_releve", "creneau", "valeur", "unite", "compteur__reference")
+        )
+
+        # Récupération des anomalies récentes
+        anomalies = list(
+            Anomalie.objects.filter(organisation=org)
+            .order_by("-date_detection")[:5]
+            .values("type", "severite", "ecart_pourcentage", "statut")
+        )
+
+        # Récupération des objectifs
+        objectifs = list(
+            Objectif.objects.filter(organisation=org)
+            .order_by("-date_debut")[:5]
+            .values("nom", "type", "valeur_cible", "unite", "progression_actuelle", "statut")
+        )
+
+        # Récupération des recommandations récentes
+        recommandations = list(
+            Recommandation.objects.filter(objectif__organisation=org)
+            .order_by("-id")[:5]
+            .values("titre", "description", "impact_estime", "economie_estimee", "unite", "priorite", "statut")
+        )
+
+        # Récupération des mémoires stratégiques
+        memoires = list(
+            MemoireStrategique.objects.filter(organisation=org)
+            .order_by("-date_creation")[:5]
+            .values("titre", "signal_initial", "hypothese_texte", "action_texte", "impact_attendu_fcfa", "impact_mesure_fcfa", "statut")
+        )
+
+        contexte_metier = {
+            "organisation": {
+                "id": str(org.id),
+                "nom": org.nom,
+                "secteur": org.secteur,
+                "localisation": org.localisation,
+            },
+            "compteurs": [
+                {
+                    "id": str(c.id),
+                    "reference": c.reference,
+                    "site": c.site.nom,
+                    "puissance_souscrite_kva": str(c.puissance_souscrite_kva) if c.puissance_souscrite_kva else None,
+                }
+                for site in org.sites.all()
+                for c in site.compteurs.all()
+            ],
+            "donnees_creneaux_recents": [
+                {
+                    "date": str(r["date_releve"]),
+                    "creneau": r["creneau"] or "Standard",
+                    "consommation": float(r["valeur"]),
+                    "unite": r["unite"],
+                    "compteur": r["compteur__reference"],
+                }
+                for r in releves_creneaux
+            ],
+            "anomalies_recentes": anomalies,
+            "objectifs": [
+                {
+                    "titre": o["nom"],
+                    "type": o["type"],
+                    "valeur_cible": float(o["valeur_cible"]) if o["valeur_cible"] else None,
+                    "unite": o["unite"],
+                    "progression": float(o["progression_actuelle"]) if o["progression_actuelle"] else 0,
+                    "statut": o["statut"],
+                }
+                for o in objectifs
+            ],
+            "recommandations": [
+                {
+                    "titre": r["titre"],
+                    "description": r["description"],
+                    "impact_estime": float(r["impact_estime"]) if r["impact_estime"] else None,
+                    "economie_estimee": float(r["economie_estimee"]) if r["economie_estimee"] else None,
+                    "unite": r["unite"],
+                    "priorite": r["priorite"],
+                    "statut": r["statut"],
+                }
+                for r in recommandations
+            ],
+            "memoires_strategiques": [
+                {
+                    "titre": m["titre"],
+                    "signal_initial": m["signal_initial"],
+                    "hypothese_texte": m["hypothese_texte"],
+                    "action_texte": m["action_texte"],
+                    "impact_attendu_fcfa": float(m["impact_attendu_fcfa"]) if m["impact_attendu_fcfa"] else None,
+                    "impact_mesure_fcfa": float(m["impact_mesure_fcfa"]) if m["impact_mesure_fcfa"] else None,
+                    "statut": m["statut"],
+                }
+                for m in memoires
+            ],
+        }
+
+        return JsonResponse(contexte_metier, status=200)

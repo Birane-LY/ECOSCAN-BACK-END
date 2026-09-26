@@ -95,12 +95,26 @@ class OrganisationModuleTests(APITestCase):
         data = {"nom": "Nom Piraté par le Dev", "secteur": "Hacking"}
         response = self.client.put(detail_url, data, format="json", **headers)
         
-        # L'API accepte la requête (200 OK) mais ignore silencieusement les champs non autorisés
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.org_a.refresh_from_db()
-        # On vérifie mathématiquement que les textes privés du client n'ont PAS bougé en base
         self.assertEqual(self.org_a.nom, "Organisation A")
         self.assertEqual(self.org_a.secteur, "Énergie")
+
+    def test_super_admin_ne_peut_pas_creer_une_organisation(self):
+        headers = self.obtenir_headers_jwt(self.super_admin)
+        response = self.client.post(
+            self.structures_list_url,
+            {
+                "nom": "Organisation interdite",
+                "secteur": "Énergie",
+                "localisation": "Dakar",
+            },
+            format="json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Organisation.objects.filter(nom="Organisation interdite").exists())
 
     def test_blocage_suspension_sans_defaut_de_paiement(self):
         """L'API doit refuse la suspension d'un client dont les paiements sont à jour."""

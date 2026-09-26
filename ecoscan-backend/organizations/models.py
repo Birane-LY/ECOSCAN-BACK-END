@@ -22,6 +22,7 @@ class Organisation(models.Model):
                                choices=[("SIMPLIFIE", "Simplifié"), ("COMPLET", "Complet")])
     statut = models.CharField(max_length=20, choices=Statut.choices, default=Statut.EN_ATTENTE)
     defaut_paiement = models.BooleanField(default=False)
+    details_demande = models.JSONField(default=dict, blank=True)
 
     def __str__(self):
         return self.nom

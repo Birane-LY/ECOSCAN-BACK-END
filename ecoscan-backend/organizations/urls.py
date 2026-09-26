@@ -9,6 +9,7 @@ from .views import (
     CompteurViewSet,
     ConfigurationSecuriteView,
     OnboardingSimpleView,
+    InternalAIContextView,  
 )
 
 router = SimpleRouter()
@@ -22,5 +23,6 @@ router.register(r'compteurs', CompteurViewSet, basename='compteur')
 urlpatterns = [
     path('configuration-securite/', ConfigurationSecuriteView.as_view(), name='configuration_securite'),
     path('onboarding-simple/', OnboardingSimpleView.as_view(), name='onboarding_simple'),
+    path('internal/organisations/<str:organisation_id>/ai-context/', InternalAIContextView.as_view(), name='internal_ai_context'),
     path('', include(router.urls)),
 ]

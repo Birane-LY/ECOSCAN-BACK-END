@@ -30,9 +30,9 @@ class OrganisationSerializer(serializers.ModelSerializer):
         model = Organisation
         fields = (
             "id", "nom", "secteur", "localisation", "date_creation", "statut",
-            "defaut_paiement", "nombre_membres", "emails_admin",
+            "defaut_paiement", "nombre_membres", "emails_admin", "details_demande",
         )
-        read_only_fields = ("id", "date_creation", "nombre_membres", "emails_admin")
+        read_only_fields = ("id", "date_creation", "nombre_membres", "emails_admin", "details_demande")
 
     def get_nombre_membres(self, obj):
         return obj.membres.count()
