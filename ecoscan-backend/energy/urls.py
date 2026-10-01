@@ -16,8 +16,12 @@ from .views import (
     EtatTrancheView,
     AchatWoyofalListCreateView,
     ReleveSoldeListCreateView,
+    PointSuiviEnergetiqueViewSet,
+    ReleveRituelEnergetiqueViewSet,
+    RechargeRituelWoyofalViewSet,
     AutonomieView,
     CaptureImageView,
+    TranscrireAudioView,
     CreerImportDepuisCaptureView
     
 )
@@ -86,8 +90,27 @@ router.register(
     basename="indicateur-objectif",
 )
 
+router.register(
+    r"points-suivi-energetique",
+    PointSuiviEnergetiqueViewSet,
+    basename="point-suivi-energetique",
+)
+
+router.register(
+    r"releves-rituel",
+    ReleveRituelEnergetiqueViewSet,
+    basename="releve-rituel",
+)
+
+router.register(
+    r"recharges-rituel-woyofal",
+    RechargeRituelWoyofalViewSet,
+    basename="recharge-rituel-woyofal",
+)
+
 urlpatterns = [
     path('capture-image/', CaptureImageView.as_view(), name='capture_image'),
+    path('transcrire-audio/', TranscrireAudioView.as_view(), name='transcrire_audio'),
     path('capture-facture/', CreerImportDepuisCaptureView.as_view(), name='capture_facture'),
     path('prediction-achat/', PredictionAchatView.as_view()),
     path('etat-tranche/', EtatTrancheView.as_view()),

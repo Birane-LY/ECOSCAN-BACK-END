@@ -19,6 +19,7 @@ from datetime import timedelta
 from organizations.models import Compteur, Organisation
 from analysis.services.factures import recalculer_variations_factures
 from analysis.services.orchestrator import analyser_compteur, regenerer_hypotheses_manquantes
+from analysis.services.woyofal_rituel import analyser_woyofal_rituel
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,16 @@ class Command(BaseCommand):
                         self.stderr.write(f"  {compteur} {jour:%Y-%m-%d} : erreur {type(exc).__name__}")
                         continue
                     self.stdout.write(f"  {compteur} {jour:%Y-%m-%d} : {res['statut']}")
+
+            for decalage in range(options["jours"]):
+                jour = timezone.localdate(maintenant) - timedelta(days=decalage)
+                try:
+                    res = analyser_woyofal_rituel(str(organisation.id), jour.isoformat())
+                except Exception as exc:
+                    logger.exception("Analyse Woyofal rituelle impossible pour %s.", organisation)
+                    self.stderr.write(f"  Woyofal rituel {jour:%Y-%m-%d} : erreur {type(exc).__name__}")
+                    continue
+                self.stdout.write(f"  Woyofal rituel {jour:%Y-%m-%d} : {res['statut']} — {res.get('detail', '')}")
 
             # Rattrape les hypothèses des anomalies détectées pendant une panne du service IA
             self.stdout.write(f"[{organisation}] hypothèses générées en rattrapage : {regenerer_hypotheses_manquantes(organisation)}")

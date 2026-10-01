@@ -24,16 +24,21 @@ class AbonnementSerializer(serializers.ModelSerializer):
     `fields` (utiles en lecture pour le support/debug) et restent read-only.
     """
 
+    plan_nom = serializers.CharField(source="plan.nom", read_only=True)
+    organisation_nom = serializers.CharField(source="organisation.nom", read_only=True)
+
     class Meta:
         model = Abonnement
         fields = (
-            "id", "organisation", "plan", "statut", "periodicite", "debut", "fin_periode",
+            "id", "organisation", "plan", "statut", "periodicite", "debut", "fin_periode", "fin_grace",
             "annule_le", "fin_acces_si_annule", "fournisseur",
             "external_customer_id", "external_subscription_id", "date_creation",
+            "plan_nom", "organisation_nom",
         )
         read_only_fields = (
-            "id", "statut", "debut", "fin_periode", "annule_le", "fin_acces_si_annule",
+            "id", "statut", "debut", "fin_periode", "fin_grace", "annule_le", "fin_acces_si_annule",
             "external_customer_id", "external_subscription_id", "date_creation",
+            "plan_nom", "organisation_nom",
         )
 
 

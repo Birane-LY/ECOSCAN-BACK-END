@@ -14,6 +14,9 @@ from .models import (
     SyntheseFinanciere,
     AchatWoyofal,
     ReleveSolde,
+    PointSuiviEnergetique,
+    ReleveRituelEnergetique,
+    RechargeRituelWoyofal,
 )
 
 
@@ -457,3 +460,93 @@ class ReleveSoldeSerializer(serializers.ModelSerializer):
             )
 
         return compteur
+
+
+class PointSuiviEnergetiqueSerializer(serializers.ModelSerializer):
+    site_nom = serializers.CharField(source="site.nom", read_only=True, default="")
+    compteur_reference = serializers.CharField(source="compteur.reference", read_only=True, default="")
+
+    class Meta:
+        model = PointSuiviEnergetique
+        fields = (
+            "id", "organisation", "site", "site_nom", "compteur",
+            "compteur_reference", "nom", "mode_mesure", "date_creation",
+        )
+        read_only_fields = ("id", "date_creation")
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        organisation = attrs.get("organisation", getattr(self.instance, "organisation", None))
+        site = attrs.get("site", getattr(self.instance, "site", None))
+        compteur = attrs.get("compteur", getattr(self.instance, "compteur", None))
+        if request is None or organisation is None:
+            raise serializers.ValidationError({"organisation": "Une organisation est obligatoire."})
+        if not organisation.membres.filter(utilisateur=request.user).exists():
+            raise serializers.ValidationError({"organisation": "Cette organisation ne vous est pas rattachée."})
+        if site and site.organisation_id != organisation.id:
+            raise serializers.ValidationError({"site": "Ce site n’appartient pas à l’organisation sélectionnée."})
+        if compteur and (site is None or compteur.site_id != site.id):
+            raise serializers.ValidationError({"compteur": "Un compteur nécessite le site auquel il est rattaché."})
+        return attrs
+
+
+class ReleveRituelEnergetiqueSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReleveRituelEnergetique
+        fields = (
+            "id", "client_id", "point_suivi", "date_releve",
+            "creneau", "valeur_kwh", "note", "observe_le",
+        )
+        read_only_fields = ("id",)
+
+    def validate_point_suivi(self, point_suivi):
+        request = self.context.get("request")
+        if request is None or not point_suivi.organisation.membres.filter(utilisateur=request.user).exists():
+            raise serializers.ValidationError("Point de suivi hors de votre organisation.")
+        return point_suivi
+
+    def validate(self, attrs):
+        if self.instance:
+            raise serializers.ValidationError("Un relevé enregistré ne peut pas être modifié.")
+
+        date_releve = attrs.get("date_releve")
+        creneau = attrs.get("creneau")
+        aujourdhui = timezone.localdate()
+        if date_releve != aujourdhui:
+            raise serializers.ValidationError({
+                "date_releve": "Les relevés ne peuvent être saisis que pour la journée en cours."
+            })
+
+        maintenant = timezone.localtime()
+        minutes_actuelles = maintenant.hour * 60 + maintenant.minute
+        creneaux = list(ReleveRituelEnergetique.Creneau.values)
+        index = creneaux.index(creneau)
+        heure_debut = int(creneau[:2]) * 60 + int(creneau[3:])
+        heure_fin = (
+            int(creneaux[index + 1][:2]) * 60 + int(creneaux[index + 1][3:])
+            if index + 1 < len(creneaux)
+            else 24 * 60
+        )
+        if minutes_actuelles < heure_debut or minutes_actuelles >= heure_fin:
+            raise serializers.ValidationError({
+                "creneau": "L’heure de saisie de ce créneau est dépassée ou n’est pas encore arrivée."
+            })
+        return attrs
+
+
+class RechargeRituelWoyofalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RechargeRituelWoyofal
+        fields = (
+            "id", "client_id", "point_suivi", "montant_fcfa",
+            "kwh_credites", "effectuee_le", "note",
+        )
+        read_only_fields = ("id",)
+
+    def validate_point_suivi(self, point_suivi):
+        request = self.context.get("request")
+        if request is None or not point_suivi.organisation.membres.filter(utilisateur=request.user).exists():
+            raise serializers.ValidationError("Point de suivi hors de votre organisation.")
+        if point_suivi.mode_mesure != PointSuiviEnergetique.ModeMesure.SOLDE_WOYOFAL:
+            raise serializers.ValidationError("Les recharges ne concernent que les points Woyofal.")
+        return point_suivi

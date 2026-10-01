@@ -24,7 +24,6 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-AI_SERVICE_URL = getattr(settings, "AI_SERVICE_URL", "http://localhost:8001").rstrip("/")
 AI_SERVICE_INTERNAL_TOKEN = getattr(settings, "AI_SERVICE_INTERNAL_TOKEN", "")
 # La chaîne de secours FastAPI peut enchaîner plusieurs modèles (30 s chacun) :
 # un délai de 15 s coupait la requête avant la réponse. 60 s par défaut.
@@ -63,6 +62,11 @@ def _post_json(url: str, payload: dict) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _service_url(path: str) -> str:
+    base_url = getattr(settings, "AI_SERVICE_URL", "http://localhost:8001").rstrip("/")
+    return f"{base_url}{path}"
+
+
 def _appeler(url: str, payload: dict, contexte: str) -> dict:
     if not AI_SERVICE_INTERNAL_TOKEN:
         message = "AI_SERVICE_INTERNAL_TOKEN n'est pas configuré."
@@ -91,7 +95,7 @@ def indexer_document(
         "texte": texte,
         "metadata": metadata or {},
     }
-    return _appeler(f"{AI_SERVICE_URL}/internal/documents", payload, f"Indexation du document {document_id}")
+    return _appeler(_service_url("/internal/documents"), payload, f"Indexation du document {document_id}")
 
 
 def demander_hypothese(question: str, organisation_id) -> dict:
@@ -105,7 +109,7 @@ def demander_hypothese(question: str, organisation_id) -> dict:
         "limit": 5,
         "include_live_data": False,
     }
-    return _appeler(f"{AI_SERVICE_URL}/internal/query", payload, "Demande d'hypothèse")
+    return _appeler(_service_url("/internal/query"), payload, "Demande d'hypothèse")
 
 
 def interroger_assistant(
@@ -121,4 +125,4 @@ def interroger_assistant(
         "include_live_data": include_live_data,
         "history": historique or [],
     }
-    return _appeler(f"{AI_SERVICE_URL}/internal/query", payload, "Question assistant")
+    return _appeler(_service_url("/internal/query"), payload, "Question assistant")

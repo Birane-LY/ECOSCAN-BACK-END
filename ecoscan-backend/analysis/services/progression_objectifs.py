@@ -178,6 +178,74 @@ def _via_woyofal(objectif, debut, fin, compteurs):
     }, None
 
 
+def _via_woyofal_rituel(objectif, debut, fin):
+    """Mesure l'objectif sur les mêmes fenêtres Woyofal 08–20 que l'analyse rituelle."""
+    from energy.models import PointSuiviEnergetique
+    from analysis.services.woyofal_rituel import consommation_rituelle_jour
+
+    points = PointSuiviEnergetique.objects.filter(
+        organisation=objectif.organisation,
+        mode_mesure=PointSuiviEnergetique.ModeMesure.SOLDE_WOYOFAL,
+    )
+    if not points.exists():
+        return None, None
+
+    debut_jour = timezone.localdate(debut)
+    jours_reference = []
+    for decalage in range(1, JOURS_REFERENCE_WOYOFAL + 1):
+        resultat = consommation_rituelle_jour(objectif.organisation, debut_jour - timedelta(days=decalage))
+        if resultat["valeur"] is not None:
+            jours_reference.append(float(resultat["valeur"]))
+
+    if len(jours_reference) < MIN_JOURS_REFERENCE:
+        return None, (
+            f"Relevés rituels Woyofal insuffisants : l'objectif exige au moins "
+            f"{MIN_JOURS_REFERENCE} journées complètes parmi les {JOURS_REFERENCE_WOYOFAL} jours "
+            f"précédant son début ; {len(jours_reference)} sont disponibles."
+        )
+
+    maintenant = timezone.now()
+    fin_effective = min(fin, maintenant)
+    jours_ecoules = max(0, (fin_effective.date() - debut_jour).days + 1)
+    jours_mesures = []
+    for decalage in range(jours_ecoules):
+        resultat = consommation_rituelle_jour(objectif.organisation, debut_jour + timedelta(days=decalage))
+        if resultat["valeur"] is not None:
+            jours_mesures.append(float(resultat["valeur"]))
+
+    if len(jours_mesures) < MIN_JOURS_PERIODE:
+        return None, (
+            f"Relevés rituels Woyofal insuffisants : il faut au moins {MIN_JOURS_PERIODE} journées "
+            f"complètes depuis le début de l'objectif ; {len(jours_mesures)} sont disponibles."
+        )
+
+    unite = (objectif.unite or "").strip().lower().replace(" ", "")
+    if unite not in ("kwh", "%"):
+        return None, (
+            f"Les relevés rituels mesurent des kWh entre 08 h et 20 h. "
+            f"L'unité « {objectif.unite} » n'est pas calculée à partir de ces mesures sans tarif Woyofal configuré."
+        )
+
+    reference_journaliere = _moyenne(jours_reference)
+    reel_journalier = _moyenne(jours_mesures)
+    reduction = (reference_journaliere - reel_journalier) * len(jours_mesures)
+    valeur, raison = _convertir(reduction, reference_journaliere * len(jours_mesures), objectif.unite)
+    if valeur is None:
+        return None, raison
+    return {
+        "mesuree": round(valeur, 2),
+        "source": "woyofal_rituel_08_20",
+        "reference": round(reference_journaliere, 2),
+        "reel": round(reel_journalier, 2),
+        "fiabilite": "moyenne",
+        "detail": (
+            f"Moyenne mesurée entre 08 h et 20 h : {round(reference_journaliere, 1)} kWh/jour "
+            f"avant, {round(reel_journalier, 1)} kWh/jour pendant l'objectif, "
+            f"sur {len(jours_mesures)} journées complètes."
+        ),
+    }, None
+
+
 def calculer_progression_mesuree(objectif) -> dict:
     base = {
         "objectif_id": str(objectif.id),
@@ -218,6 +286,11 @@ def calculer_progression_mesuree(objectif) -> dict:
         mesure, raison = _via_woyofal(objectif, debut, fin, compteurs)
         if mesure:
             return {**base, **mesure, "detail": (mesure.get("detail") or "") + approximation}
+        raisons.append(raison)
+    mesure, raison = _via_woyofal_rituel(objectif, debut, fin)
+    if mesure:
+        return {**base, **mesure, "detail": (mesure.get("detail") or "") + approximation}
+    if raison:
         raisons.append(raison)
     mesure, raison = _via_factures(objectif, debut, fin)
     if mesure:

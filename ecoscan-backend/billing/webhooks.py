@@ -23,7 +23,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import Facture, Paiement, WebhookEvent
+from .models import Abonnement, Facture, Paiement, WebhookEvent
 from .providers import PaymentProviderError, obtenir_provider
 from .services import DunningService, SubscriptionService
 
@@ -91,27 +91,27 @@ def webhook_paiement(request, fournisseur: str):
     return Response({"status": "processed"}, status=status.HTTP_200_OK)
 
 
-def _traiter_paiement_reussi(evenement: dict) -> None:
+def _traiter_paiement_reussi(evenement: dict) -> bool:
     facture_id = evenement.get("facture_id")
     if not facture_id:
         logger.error("Événement de paiement réussi sans facture_id exploitable : %s", evenement)
-        return
+        return False
 
     try:
         facture = Facture.objects.select_for_update().get(id=facture_id)
     except Facture.DoesNotExist:
         logger.error("Facture %s introuvable pour un paiement confirmé.", facture_id)
-        return
+        return False
 
     # Le montant confirmé DOIT correspondre à ce qui est réellement dû —
     # sans ce contrôle, un montant falsifié en amont (même via un canal
     # normalement fiable) pourrait solder une facture pour moins que son dû.
     ecart = abs(evenement["montant"] - facture.montant_total)
-    if ecart > TOLERANCE_MONTANT:
+    if ecart > TOLERANCE_MONTANT or evenement.get("devise") != facture.devise:
         logger.error(
-            "Montant confirmé (%s) ne correspond pas au montant dû (%s) pour la facture %s — "
+            "Montant/devise confirmé (%s %s) ne correspond pas au montant dû (%s %s) pour la facture %s — "
             "paiement enregistré mais facture NON soldée, à vérifier manuellement.",
-            evenement["montant"], facture.montant_total, facture.id,
+            evenement["montant"], evenement.get("devise"), facture.montant_total, facture.devise, facture.id,
         )
         Paiement.objects.update_or_create(
             external_payment_id=evenement["external_payment_id"],
@@ -123,7 +123,7 @@ def _traiter_paiement_reussi(evenement: dict) -> None:
                 "metadata": {"alerte": "montant_incoherent_avec_facture"},
             },
         )
-        return
+        return False
 
     Paiement.objects.update_or_create(
         external_payment_id=evenement["external_payment_id"],
@@ -138,12 +138,17 @@ def _traiter_paiement_reussi(evenement: dict) -> None:
         },
     )
 
-    facture.statut = Facture.Statut.PAID
-    facture.save(update_fields=("statut",))
-
     abonnement = facture.abonnement
-    SubscriptionService().activer(abonnement, fin_periode=facture.periode_fin)
+    if facture.statut != Facture.Statut.PAID:
+        facture.statut = Facture.Statut.PAID
+        facture.save(update_fields=("statut",))
+    if (
+        abonnement.statut != Abonnement.Statut.ACTIVE
+        or abonnement.fin_periode != facture.periode_fin
+    ):
+        SubscriptionService().activer(abonnement, fin_periode=facture.periode_fin)
     DunningService().annuler_relances_en_attente(facture)
+    return True
 
 
 def _traiter_paiement_echoue(evenement: dict) -> None:

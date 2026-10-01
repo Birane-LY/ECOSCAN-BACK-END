@@ -5,8 +5,14 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework.decorators import action
+from django.db import transaction
+import logging
 
 from .models import Utilisateur, PreferencesUtilisateur
+from audit.models import JournalAudit
+from audit.services import enregistrer_evenement
+from organizations.models import Organisation, UtilisateurOrganisation
+from .services import envoyer_email_activation
 from .serializers import (
     OnboardingAdminOrganisationSerializer,
     UtilisateurSerializer,
@@ -17,13 +23,11 @@ from .serializers import (
     ChangerMotDePasseSerializer,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class OnboardingAdminOrganisationView(APIView):
-    """Endpoint public permettant la demande d'inscription autonome d'un Admin d'organisation.
-    
-    Le compte créé reste inactif (actif=False) jusqu'à sa validation manuelle 
-    par l'équipe de développement (Super Admin).
-    """
+    """Crée un compte en attente et envoie le lien de démarrage d'essai."""
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'invitation_validation'
@@ -31,9 +35,37 @@ class OnboardingAdminOrganisationView(APIView):
     def post(self, request):
         serializer = OnboardingAdminOrganisationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        utilisateur = serializer.save()
+        organisation = Organisation.objects.get(membres__utilisateur=utilisateur)
+
+        try:
+            envoyer_email_activation(
+                utilisateur,
+                sujet="Activez votre essai gratuit EcoScan",
+                introduction=(
+                    "Votre espace EcoScan est prêt. Activez votre adresse e-mail "
+                    "pour démarrer votre essai gratuit de 14 jours."
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Impossible d'envoyer le lien d'activation à %s ; annulation de l'inscription.",
+                utilisateur.email,
+            )
+            with transaction.atomic():
+                organisation.delete()
+                utilisateur.delete()
+            return Response(
+                {"detail": "L’e-mail d’activation n’a pas pu être envoyé. Veuillez réessayer."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
         return Response(
-            {"message": "Votre demande d'onboarding a été enregistrée. Elle est en attente de validation."},
+            {
+                "message": "Votre compte est créé. Activez votre adresse e-mail pour démarrer l’essai gratuit.",
+                "plan": organisation.details_demande.get("plan_nom"),
+                "duree_essai_jours": 14,
+            },
             status=status.HTTP_201_CREATED
         )
 
@@ -51,10 +83,14 @@ class FinaliserInscriptionView(APIView):
         serializer = FinaliserInscriptionSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response(
-            {"message": "Votre compte a été configuré et activé avec succès !"},
-            status=status.HTTP_200_OK
-        )
+        data = {
+            "message": "Votre compte a été configuré et activé avec succès !",
+            "essai_demarre": bool(serializer.context.get("essai_demarre")),
+        }
+        if serializer.context.get("essai_demarre"):
+            data["message"] = "Votre compte est activé et votre essai gratuit de 14 jours a démarré."
+            data["duree_essai_jours"] = 14
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class EstAdminOuDevOuSoiMeme(permissions.BasePermission):
@@ -88,7 +124,18 @@ class EstAdminOuDevOuSoiMeme(permissions.BasePermission):
               
         # Les Admins d'organisation peuvent gérer les objets de leur périmètre
         if acteur.role == Utilisateur.Role.ADMIN_ORGANISATION:
-            return obj.role in [Utilisateur.Role.UTILISATEUR_ORGANISATION, Utilisateur.Role.CONSULTANT]
+            organisations = Organisation.objects.filter(membres__utilisateur=acteur)
+            return (
+                acteur.actif
+                and obj.role in [Utilisateur.Role.UTILISATEUR_ORGANISATION, Utilisateur.Role.CONSULTANT]
+                and UtilisateurOrganisation.objects.filter(
+                    organisation__in=organisations,
+                    utilisateur=obj,
+                ).exists()
+            )
+
+        if acteur.role == Utilisateur.Role.SUPER_ADMIN:
+            return obj.role == Utilisateur.Role.SUPER_ADMIN
             
         return False
 
@@ -134,26 +181,105 @@ class UtilisateurViewSet(viewsets.ModelViewSet):
 
         # L'Admin d'organisation voit et gère uniquement les utilisateurs et consultants
         if acteur.role == Utilisateur.Role.ADMIN_ORGANISATION:
+            organisations = Organisation.objects.filter(membres__utilisateur=acteur)
             return self.queryset.filter(
-                role__in=[Utilisateur.Role.UTILISATEUR_ORGANISATION, Utilisateur.Role.CONSULTANT]
+                role__in=[Utilisateur.Role.UTILISATEUR_ORGANISATION, Utilisateur.Role.CONSULTANT],
+                organisations_membres__organisation__in=organisations,
             )
 
         # Un utilisateur standard (or consultant) ne voit QUE son propre profil en base
         return self.queryset.filter(id=acteur.id)
 
+    @action(detail=True, methods=["patch"], url_path="acces")
+    def acces(self, request, pk=None):
+        """Active ou suspend l'accès d'un compte géré par l'administrateur."""
+        utilisateur = self.get_object()
+        if utilisateur.id == request.user.id:
+            raise PermissionDenied("Vous ne pouvez pas modifier votre propre accès.")
+        if request.user.role not in (Utilisateur.Role.ADMIN_ORGANISATION, Utilisateur.Role.SUPER_ADMIN):
+            raise PermissionDenied("Seul un administrateur peut gérer les accès.")
+        if "actif" not in request.data or not isinstance(request.data["actif"], bool):
+            return Response(
+                {"actif": ["Ce champ booléen est obligatoire."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        nouvel_etat = request.data["actif"]
+        if request.user.role == Utilisateur.Role.ADMIN_ORGANISATION and not request.user.actif:
+            raise PermissionDenied("Votre compte doit être actif pour gérer les accès.")
+        if request.user.role == Utilisateur.Role.SUPER_ADMIN:
+            if utilisateur.role != Utilisateur.Role.SUPER_ADMIN:
+                raise PermissionDenied("Vous ne pouvez gérer que les accès de l'équipe EcoScan.")
+            if utilisateur.actif and not nouvel_etat and not Utilisateur.objects.filter(
+                role=Utilisateur.Role.SUPER_ADMIN,
+                actif=True,
+            ).exclude(pk=utilisateur.pk).exists():
+                raise PermissionDenied("Le dernier Super Administrateur actif ne peut pas être désactivé.")
+
+        etat_precedent = utilisateur.actif
+        if etat_precedent != nouvel_etat:
+            utilisateur.actif = nouvel_etat
+            utilisateur.save(update_fields=("actif",))
+            organisation = Organisation.objects.filter(
+                membres__utilisateur=utilisateur
+            ).first() if request.user.role == Utilisateur.Role.ADMIN_ORGANISATION else None
+            enregistrer_evenement(
+                action="ACTIVER_ACCES" if nouvel_etat else "DESACTIVER_ACCES",
+                ressource="Utilisateur",
+                identifiant_ressource=utilisateur.pk,
+                utilisateur=request.user,
+                organisation=organisation,
+                details={
+                    "utilisateur_nom": utilisateur.nom,
+                    "utilisateur_email": utilisateur.email,
+                    "etat_precedent": etat_precedent,
+                    "etat": nouvel_etat,
+                },
+                request=request,
+            )
+        return Response(self.get_serializer(utilisateur).data)
+
     def perform_destroy(self, instance):
         """Sécurise la suppression d'un compte pour empêcher les débordements de rôles."""
         acteur = self.request.user
-        
+        if instance.pk == acteur.pk:
+            raise PermissionDenied("Vous ne pouvez pas supprimer votre propre compte.")
+
         # Sécurité pour empêcher la suppression hors périmètre
         if acteur.role == Utilisateur.Role.SUPER_ADMIN and instance.role != Utilisateur.Role.SUPER_ADMIN:
             raise PermissionDenied("Vous ne pouvez supprimer que les membres de votre équipe de développement.")
+
+        if acteur.role == Utilisateur.Role.SUPER_ADMIN and instance.actif and not Utilisateur.objects.filter(
+            role=Utilisateur.Role.SUPER_ADMIN,
+            actif=True,
+        ).exclude(pk=instance.pk).exists():
+            raise PermissionDenied("Le dernier Super Administrateur actif ne peut pas être supprimé.")
             
         if acteur.role == Utilisateur.Role.ADMIN_ORGANISATION:
+            organisations = Organisation.objects.filter(membres__utilisateur=acteur)
             roles_geres = [Utilisateur.Role.UTILISATEUR_ORGANISATION, Utilisateur.Role.CONSULTANT]
-            if instance.role not in roles_geres:
+            if not acteur.actif or instance.role not in roles_geres or not UtilisateurOrganisation.objects.filter(
+                organisation__in=organisations,
+                utilisateur=instance,
+            ).exists():
                 raise PermissionDenied("Vous ne pouvez supprimer que des Utilisateurs ou des Consultants.")
-                
+
+        organisation = Organisation.objects.filter(
+            membres__utilisateur=instance
+        ).first() if acteur.role == Utilisateur.Role.ADMIN_ORGANISATION else None
+        enregistrer_evenement(
+            action="SUPPRIMER_UTILISATEUR",
+            ressource="Utilisateur",
+            identifiant_ressource=instance.pk,
+            utilisateur=acteur,
+            organisation=organisation,
+            details={
+                "utilisateur_nom": instance.nom,
+                "utilisateur_email": instance.email,
+                "utilisateur_role": instance.role,
+            },
+            request=self.request,
+        )
         instance.delete()
 
 

@@ -8,7 +8,8 @@ from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
-from rest_framework import permissions, status, viewsets, generics
+from django.utils.dateparse import parse_date
+from rest_framework import mixins, permissions, status, viewsets, generics
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
 from rest_framework.response import Response
@@ -30,6 +31,9 @@ from .models import (
     SyntheseFinanciere,
     AchatWoyofal,
     ReleveSolde,
+    PointSuiviEnergetique,
+    ReleveRituelEnergetique,
+    RechargeRituelWoyofal,
 )
 from .serializers import (
     DonneeEnergetiqueSerializer,
@@ -43,15 +47,20 @@ from .serializers import (
     SourceDonneeSerializer,
     SyntheseFinanciereSerializer,
     AchatWoyofalSerializer,
-    ReleveSoldeSerializer
+    ReleveSoldeSerializer,
+    PointSuiviEnergetiqueSerializer,
+    ReleveRituelEnergetiqueSerializer,
+    RechargeRituelWoyofalSerializer,
 )
 from .services.hashing import calculer_hash_fichier
 from .services.services import OCRService
-from .services.ai_client import analyser_image
+from .services.ai_client import analyser_image, transcrire_audio
 from .services.ocr import OCRServiceError
 from .services.prediction_tranches import etat_tranche, predire_kwh
 from .services.autonomie import estimer_autonomie
 from audit.services import enregistrer_evenement 
+from billing.permissions import EstAbonnementActif
+from billing.services import BillingAccessService
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +68,7 @@ logger = logging.getLogger(__name__)
 class OrganisationScopedQuerySetMixin:
     """Filtrage multi-tenant commun à tous les ViewSets de l'app energy."""
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
     organisation_lookup = "organisation"
 
     def get_queryset(self):
@@ -69,11 +78,11 @@ class OrganisationScopedQuerySetMixin:
         if getattr(user, "role", None) == "SUPER_ADMIN":
             return queryset.none()
 
-        organisations = Organisation.objects.filter(membres__utilisateur=user)
+        organisations = BillingAccessService().organisations_avec_acces(user)
         return queryset.filter(**{f"{self.organisation_lookup}__in": organisations})
 
     def _organisations_de_lutilisateur(self):
-        return Organisation.objects.filter(membres__utilisateur=self.request.user)
+        return BillingAccessService().organisations_avec_acces(self.request.user)
 
 
 class FichierSourceViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
@@ -352,7 +361,7 @@ class FacteurEmissionViewSet(viewsets.ReadOnlyModelViewSet):
 
     queryset = FacteurEmission.objects.all().order_by("nom")
     serializer_class = FacteurEmissionSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
 
 
 class DonneeEnergetiqueViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
@@ -442,18 +451,125 @@ class IndicateurObjectifViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelV
     organisation_lookup = "objectif__organisation"
 
 
+class PointSuiviEnergetiqueViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSet):
+    queryset = PointSuiviEnergetique.objects.select_related(
+        "organisation", "site", "compteur"
+    ).order_by("site__nom", "nom")
+    serializer_class = PointSuiviEnergetiqueSerializer
+    organisation_lookup = "organisation"
+
+
+class ReleveRituelEnergetiqueViewSet(
+    OrganisationScopedQuerySetMixin,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    viewsets.GenericViewSet,
+):
+    queryset = ReleveRituelEnergetique.objects.select_related(
+        "point_suivi__organisation"
+    ).order_by("-date_releve", "creneau")
+    serializer_class = ReleveRituelEnergetiqueSerializer
+    organisation_lookup = "point_suivi__organisation"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        point_id = self.request.query_params.get("point_suivi")
+        date_releve = self.request.query_params.get("date_releve")
+
+        if point_id:
+            try:
+                uuid.UUID(point_id)
+            except (ValueError, TypeError):
+                raise DRFValidationError({"point_suivi": ["Identifiant invalide."]})
+            queryset = queryset.filter(point_suivi_id=point_id)
+
+        if date_releve:
+            date_value = parse_date(date_releve)
+            if date_value is None:
+                raise DRFValidationError({"date_releve": ["Format attendu : AAAA-MM-JJ."]})
+            queryset = queryset.filter(date_releve=date_value)
+
+        return queryset
+
+    def perform_create(self, serializer):
+        reading = serializer.save()
+        point = reading.point_suivi
+        if (
+            point.mode_mesure == PointSuiviEnergetique.ModeMesure.SOLDE_WOYOFAL
+            and reading.creneau == ReleveRituelEnergetique.Creneau.VINGT_HEURES
+        ):
+            from analysis.services.taches import lancer_en_arriere_plan
+            from analysis.services.woyofal_rituel import analyser_woyofal_rituel
+
+            lancer_en_arriere_plan(
+                analyser_woyofal_rituel,
+                str(point.organisation_id),
+                reading.date_releve.isoformat(),
+            )
+
+
+class RechargeRituelWoyofalViewSet(
+    OrganisationScopedQuerySetMixin,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    viewsets.GenericViewSet,
+):
+    queryset = RechargeRituelWoyofal.objects.select_related(
+        "point_suivi__organisation"
+    ).order_by("-effectuee_le")
+    serializer_class = RechargeRituelWoyofalSerializer
+    organisation_lookup = "point_suivi__organisation"
+
+    def perform_create(self, serializer):
+        recharge = serializer.save()
+        from analysis.services.taches import lancer_en_arriere_plan
+        from analysis.services.woyofal_rituel import analyser_woyofal_rituel
+
+        jour = timezone.localtime(recharge.effectuee_le).date()
+        lancer_en_arriere_plan(
+            analyser_woyofal_rituel,
+            str(recharge.point_suivi.organisation_id),
+            jour.isoformat(),
+        )
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        point_id = self.request.query_params.get("point_suivi")
+        date_from = self.request.query_params.get("date_from")
+        date_to = self.request.query_params.get("date_to")
+        if point_id:
+            try:
+                uuid.UUID(point_id)
+            except (ValueError, TypeError):
+                raise DRFValidationError({"point_suivi": ["Identifiant invalide."]})
+            queryset = queryset.filter(point_suivi_id=point_id)
+        if date_from:
+            parsed_date = parse_date(date_from)
+            if parsed_date is None:
+                raise DRFValidationError({"date_from": ["Format attendu : AAAA-MM-JJ."]})
+            queryset = queryset.filter(effectuee_le__date__gte=parsed_date)
+        if date_to:
+            parsed_date = parse_date(date_to)
+            if parsed_date is None:
+                raise DRFValidationError({"date_to": ["Format attendu : AAAA-MM-JJ."]})
+            queryset = queryset.filter(effectuee_le__date__lte=parsed_date)
+        return queryset
+
+
 def _compteur_de(request, compteur_id):
     if not compteur_id:
         return None
     try:
         return Compteur.objects.filter(
-            id=compteur_id, site__organisation__membres__utilisateur=request.user).first()
+            id=compteur_id,
+            site__organisation__in=BillingAccessService().organisations_avec_acces(request.user),
+        ).first()
     except (ValueError, TypeError, DjangoValidationError):
         return None
 
 
 class PredictionAchatView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
 
     def post(self, request):
         compteur = _compteur_de(request, request.data.get("compteur"))
@@ -470,7 +586,7 @@ class PredictionAchatView(APIView):
 
 
 class EtatTrancheView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
 
     def get(self, request):
         compteur = _compteur_de(request, request.query_params.get("compteur"))
@@ -515,12 +631,12 @@ def _declencher_analyse(compteur):
 
 
 class AchatWoyofalListCreateView(generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
     serializer_class = AchatWoyofalSerializer
 
     def get_queryset(self):
         return AchatWoyofal.objects.filter(
-            compteur__site__organisation__membres__utilisateur=self.request.user)
+            compteur__site__organisation__in=BillingAccessService().organisations_avec_acces(self.request.user))
 
     def create(self, request, *args, **kwargs):
         compteur = _compteur_autorise(request)
@@ -552,12 +668,12 @@ class AchatWoyofalListCreateView(generics.ListCreateAPIView):
 
 
 class ReleveSoldeListCreateView(generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
     serializer_class = ReleveSoldeSerializer
 
     def get_queryset(self):
         return ReleveSolde.objects.filter(
-            compteur__site__organisation__membres__utilisateur=self.request.user)
+            compteur__site__organisation__in=BillingAccessService().organisations_avec_acces(self.request.user))
 
     def create(self, request, *args, **kwargs):
         compteur = _compteur_autorise(request)
@@ -587,7 +703,7 @@ class ReleveSoldeListCreateView(generics.ListCreateAPIView):
 
 
 class AutonomieView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
 
     def get(self, request):
         compteur = _compteur_de(request, request.query_params.get("compteur"))
@@ -603,7 +719,7 @@ CHAMPS_UTILES_CAPTURE = (
 
 
 class CaptureImageView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
     parser_classes = [MultiPartParser]
 
     def post(self, request):
@@ -620,7 +736,7 @@ class CaptureImageView(APIView):
         champs_bruts = resultat.get("champs", {})
         champs_utiles = {cle: champs_bruts.get(cle) for cle in CHAMPS_UTILES_CAPTURE if champs_bruts.get(cle) is not None}
 
-        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        organisation = BillingAccessService().organisations_avec_acces(request.user).first()
         enregistrer_evenement(
             action="CAPTURE_IMAGE_ANALYSEE",
             ressource="CaptureImage",
@@ -637,12 +753,53 @@ class CaptureImageView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+class TranscrireAudioView(APIView):
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
+    parser_classes = [MultiPartParser]
+    extensions_autorisees = {".m4a", ".mp3", ".ogg", ".wav", ".webm"}
+    taille_max_octets = 25 * 1024 * 1024
+
+    def post(self, request):
+        fichier = request.FILES.get("file")
+        if not fichier:
+            return Response({"error": "Aucun enregistrement audio reçu."}, status=status.HTTP_400_BAD_REQUEST)
+        extension = f".{fichier.name.rsplit('.', 1)[-1].lower()}" if "." in fichier.name else ""
+        if extension not in self.extensions_autorisees:
+            return Response(
+                {"error": "Format audio non pris en charge. Utilisez WebM, OGG, WAV, MP3 ou M4A."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if fichier.size > self.taille_max_octets:
+            return Response({"error": "L’enregistrement dépasse la taille maximale de 25 Mo."}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+
+        nom_fichier = f"bilan-vocal{extension}"
+        resultat = transcrire_audio(fichier.read(), nom_fichier, request.data.get("language", "fr"))
+        if "_error" in resultat:
+            return Response({"error": resultat["_error"]}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        if not resultat.get("transcription", "").strip():
+            return Response(
+                {"error": "Aucune parole n’a été reconnue. Réessayez ou saisissez le bilan par écrit."},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        organisation = BillingAccessService().organisations_avec_acces(request.user).first()
+        enregistrer_evenement(
+            action="TRANSCRIPTION_BILAN_VOCAL",
+            ressource="BilanEnergie",
+            utilisateur=request.user,
+            organisation=organisation,
+            details={"langue": resultat.get("language_detected"), "moteur": resultat.get("engine_used")},
+            request=request,
+        )
+        return Response(resultat, status=status.HTTP_200_OK)
+
+
 class CreerImportDepuisCaptureView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
     parser_classes = [MultiPartParser]
 
     def post(self, request):
-        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        organisation = BillingAccessService().organisations_avec_acces(request.user).first()
         if organisation is None:
             return Response({"error": "Aucune organisation associée."}, status=status.HTTP_409_CONFLICT)
 

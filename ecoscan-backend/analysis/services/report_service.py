@@ -13,8 +13,8 @@ portable sur n'importe quel hébergement sans configuration supplémentaire).
     pip install reportlab
 
 CHARTE GRAPHIQUE : logo et 3 couleurs de marque (voir ECOSCAN_NAVY / TEAL /
-ORANGE ci-dessous), extraites directement du logo fourni. Le logo est livré à
-côté de ce fichier (services/assets/logo_ecoscan.png) ; surchargeable sans
+ORANGE ci-dessous), extraites directement du logo fourni. Le logo est livré
+dans assets/logo_ecoscan.png ; surchargeable sans
 toucher au code via settings.ECOSCAN_REPORT_LOGO_PATH si un autre logo doit
 être utilisé plus tard (marque blanche, refonte...).
 
@@ -44,9 +44,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, HRFlowable,
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, HRFlowable
 
 from analysis.models import Anomalie, Livrable, Recommandation, ResultatMetrique
 
@@ -59,7 +57,7 @@ ECOSCAN_TEAL = colors.HexColor("#0E8596")     # filets, accents secondaires
 ECOSCAN_ORANGE = colors.HexColor("#F5901F")   # mise en avant ponctuelle (chiffres clés, alertes)
 ECOSCAN_GRIS_CLAIR = colors.HexColor("#F3F5F8")  # fond alterné des tableaux (neutre, pas une 4e couleur de marque)
 
-CHEMIN_LOGO_DEFAUT = os.path.join(os.path.dirname(__file__), "assets", "logo_ecoscan.png")
+CHEMIN_LOGO_DEFAUT = os.path.join(settings.BASE_DIR, "assets", "logo_ecoscan.png")
 
 TITRES_TEMPLATE = {
     "COMPTABLE": "Bilan énergétique — Rapport comptable",
@@ -82,67 +80,128 @@ SECTIONS_PAR_TYPE = {
 
 def _styles():
     base = getSampleStyleSheet()
-    base.add(ParagraphStyle(name="EcoScanTitre", parent=base["Title"], fontSize=19, textColor=ECOSCAN_NAVY, spaceAfter=4, alignment=0))
-    base.add(ParagraphStyle(name="EcoScanSousTitre", parent=base["Normal"], fontSize=10, textColor=colors.HexColor("#5B6B82"), spaceAfter=2))
-    base.add(ParagraphStyle(name="EcoScanSection", parent=base["Heading2"], fontSize=13, textColor=ECOSCAN_NAVY, spaceBefore=18, spaceAfter=8))
-    base.add(ParagraphStyle(name="EcoScanPied", parent=base["Normal"], fontSize=8, textColor=colors.HexColor("#94A3B8")))
+    base["Normal"].fontName = "Helvetica"
+    base["Normal"].fontSize = 10
+    base["Normal"].leading = 15
+    base["Normal"].textColor = colors.HexColor("#334155")
+    base["Normal"].spaceAfter = 3
+    base.add(ParagraphStyle(
+        name="EcoScanTitre", parent=base["Title"], fontName="Helvetica-Bold",
+        fontSize=21, leading=25, textColor=ECOSCAN_NAVY, spaceAfter=5, alignment=0,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanKicker", parent=base["Normal"], fontName="Helvetica-Bold",
+        fontSize=8, leading=10, textColor=ECOSCAN_TEAL, spaceAfter=5,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanSousTitre", parent=base["Normal"], fontSize=9.5,
+        leading=13, textColor=colors.HexColor("#64748B"), spaceAfter=0,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanSection", parent=base["Heading2"], fontName="Helvetica-Bold",
+        fontSize=12, leading=15, textColor=ECOSCAN_NAVY, spaceBefore=18, spaceAfter=8,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanMemoireTitre", parent=base["Heading1"], fontName="Helvetica-Bold",
+        fontSize=17, leading=21, textColor=ECOSCAN_NAVY, spaceBefore=1, spaceAfter=12,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanCardLabel", parent=base["Normal"], fontName="Helvetica-Bold",
+        fontSize=8, leading=11, textColor=ECOSCAN_TEAL, spaceAfter=0,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanCardBody", parent=base["Normal"], fontSize=9.5,
+        leading=14, textColor=colors.HexColor("#334155"), spaceAfter=0,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanImpactLabel", parent=base["Normal"], fontName="Helvetica-Bold",
+        fontSize=8, leading=10, textColor=colors.HexColor("#64748B"), spaceAfter=4,
+    ))
+    base.add(ParagraphStyle(
+        name="EcoScanImpactValue", parent=base["Normal"], fontName="Helvetica-Bold",
+        fontSize=14, leading=17, textColor=ECOSCAN_NAVY, spaceAfter=0,
+    ))
     return base
 
 
+def _chemin_logo():
+    """Utilise le logo de marque par défaut si aucun chemin valide n'est configuré."""
+    chemin_configure = getattr(settings, "ECOSCAN_REPORT_LOGO_PATH", "")
+    if chemin_configure and os.path.isfile(chemin_configure):
+        return chemin_configure
+    return CHEMIN_LOGO_DEFAUT if os.path.isfile(CHEMIN_LOGO_DEFAUT) else chemin_configure
+
+
 def _entete(livrable, organisation, fiche_projet, styles):
-    """Bandeau d'ouverture : logo, titre, et bloc d'identification du rapport
-    (organisation, projet, date de génération, période couverte) — c'est ce
-    bloc qui doit permettre d'identifier le document sans ambiguïté même
-    imprimé seul, hors de tout contexte applicatif."""
+    """Bandeau de marque et cartouche de contexte du document."""
     elements = []
 
-    chemin_logo = getattr(settings, "ECOSCAN_REPORT_LOGO_PATH", CHEMIN_LOGO_DEFAUT)
+    chemin_logo = _chemin_logo()
     logo_flowable = None
-    if chemin_logo and os.path.exists(chemin_logo):
+    if chemin_logo and os.path.isfile(chemin_logo):
         try:
-            logo_flowable = Image(chemin_logo, width=2.4 * cm, height=2.4 * cm)
-        except Exception:
+            logo_flowable = Image(chemin_logo, width=1.8 * cm, height=1.8 * cm)
+        except (OSError, ValueError):
             logger.warning("Logo introuvable ou illisible (%s) — en-tête généré sans logo.", chemin_logo)
     else:
         logger.warning("ECOSCAN_REPORT_LOGO_PATH introuvable (%s) — en-tête généré sans logo.", chemin_logo)
 
-    titre_bloc = [Paragraph(escape(TITRES_TEMPLATE.get(livrable.type, livrable.nom)), styles["EcoScanTitre"])]
-    titre_bloc.append(Paragraph("EcoScan — Pilotage énergétique", styles["EcoScanSousTitre"]))
+    titre_bloc = [
+        Paragraph("ECOSCAN  /  PILOTAGE ÉNERGÉTIQUE", styles["EcoScanKicker"]),
+        Paragraph(escape(TITRES_TEMPLATE.get(livrable.type, livrable.nom)), styles["EcoScanTitre"]),
+        Paragraph("Analyse claire, décisions éclairées.", styles["EcoScanSousTitre"]),
+    ]
 
     entete_table = Table(
         [[logo_flowable or "", titre_bloc]],
-        colWidths=[3 * cm, None],
+        colWidths=[2.4 * cm, 14.6 * cm],
     )
     entete_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (0, 0), 0),
-        ("LEFTPADDING", (1, 0), (1, 0), 10),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F7FB")),
+        ("BACKGROUND", (0, 0), (0, 0), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#E2EAF2")),
+        ("LINEBEFORE", (1, 0), (1, 0), 2, ECOSCAN_TEAL),
+        ("LEFTPADDING", (0, 0), (0, 0), 9),
+        ("RIGHTPADDING", (0, 0), (0, 0), 9),
+        ("LEFTPADDING", (1, 0), (1, 0), 14),
+        ("RIGHTPADDING", (1, 0), (1, 0), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 12),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
     ]))
     elements.append(entete_table)
-    elements.append(Spacer(1, 0.3 * cm))
-    elements.append(HRFlowable(width="100%", thickness=1.4, color=ECOSCAN_TEAL, spaceAfter=10))
+    elements.extend([Spacer(1, 0.32 * cm), HRFlowable(
+        width="100%", thickness=1.2, color=ECOSCAN_TEAL, spaceAfter=0.28 * cm,
+    )])
 
-    # Bloc d'identification — organisation, projet, date, période : exactement
-    # ce qui doit être renseigné pour qu'un rapport imprimé reste traçable.
+    periode = (
+        "Non applicable — mémoire stratégique"
+        if livrable.type == "MEMOIRE"
+        else f"{MAX_JOURS_HISTORIQUE} derniers jours"
+    )
     infos = [
-        ["Organisation", organisation.nom if organisation else "—"],
-        ["Fiche projet", fiche_projet.nom if fiche_projet else "Aucun projet associé"],
-        ["Mémoire", livrable.memoire.titre if livrable.memoire else "Aucune mémoire associée"],
-        ["Date du rapport", f"{timezone.now():%d/%m/%Y à %H:%M}"],
-        ["Période couverte", f"{MAX_JOURS_HISTORIQUE} derniers jours"],
+        [Paragraph("ORGANISATION", styles["EcoScanCardLabel"]),
+         Paragraph("ÉMIS LE", styles["EcoScanCardLabel"])],
+        [Paragraph(escape(organisation.nom if organisation else "—"), styles["EcoScanCardBody"]),
+         Paragraph(f"{timezone.localtime():%d/%m/%Y à %H:%M}", styles["EcoScanCardBody"])],
+        [Paragraph("FICHE PROJET", styles["EcoScanCardLabel"]),
+         Paragraph("PÉRIODE DES DONNÉES", styles["EcoScanCardLabel"])],
+        [Paragraph(escape(fiche_projet.nom if fiche_projet else "Aucun projet associé"), styles["EcoScanCardBody"]),
+         Paragraph(escape(periode), styles["EcoScanCardBody"])],
     ]
-    table_infos = Table(infos, colWidths=[4 * cm, 10.6 * cm])
+    table_infos = Table(infos, colWidths=[8.5 * cm, 8.5 * cm])
     table_infos.setStyle(TableStyle([
-        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-        ("TEXTCOLOR", (0, 0), (0, -1), ECOSCAN_NAVY),
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("TEXTCOLOR", (1, 0), (1, -1), colors.HexColor("#1F2937")),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("LINEBELOW", (0, 0), (-1, -2), 0.4, colors.HexColor("#E2E8F0")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2EAF2")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#E2EAF2")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     elements.append(table_infos)
-    elements.append(Spacer(1, 0.4 * cm))
+    elements.append(Spacer(1, 0.2 * cm))
     return elements
 
 
@@ -212,22 +271,63 @@ def _contenu_memoire(memoire, styles):
     if not memoire:
         return [Paragraph("Aucune mémoire stratégique associée à ce rapport.", styles["Normal"])]
 
-    lignes = [
+    elements = [Paragraph(escape(memoire.titre), styles["EcoScanMemoireTitre"])]
+    impacts = []
+    if memoire.impact_attendu_fcfa is not None:
+        impacts.append(("IMPACT ATTENDU", f"{memoire.impact_attendu_fcfa} FCFA"))
+    if memoire.impact_mesure_fcfa is not None:
+        impacts.append(("IMPACT MESURÉ", f"{memoire.impact_mesure_fcfa} FCFA"))
+    if impacts:
+        impact_cards = []
+        for libelle, valeur in impacts:
+            impact_cards.append(Table(
+                [[Paragraph(escape(libelle), styles["EcoScanImpactLabel"])],
+                 [Paragraph(escape(valeur), styles["EcoScanImpactValue"])]],
+                colWidths=[8.2 * cm],
+            ))
+        impact_table = Table(
+            [impact_cards],
+            colWidths=[8.5 * cm] * len(impact_cards),
+        )
+        impact_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F7FB")),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#E2EAF2")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2EAF2")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ]))
+        elements.extend([impact_table, Spacer(1, 0.35 * cm)])
+
+    blocs = [
         ("Signal initial", memoire.signal_initial),
         ("Hypothèse", memoire.hypothese_texte),
         ("Action menée", memoire.action_texte),
         ("Statut", memoire.get_statut_display()),
     ]
-    if memoire.impact_attendu_fcfa is not None:
-        lignes.append(("Impact attendu", f"{memoire.impact_attendu_fcfa} FCFA"))
-    if memoire.impact_mesure_fcfa is not None:
-        lignes.append(("Impact mesuré", f"{memoire.impact_mesure_fcfa} FCFA"))
-
-    elements = [Paragraph(escape(memoire.titre), styles["Heading3"])]
-    for libelle, valeur in lignes:
-        if valeur:
-            elements.append(Paragraph(f"<b>{escape(libelle)} :</b> {escape(str(valeur))}", styles["Normal"]))
-            elements.append(Spacer(1, 0.15 * cm))
+    for libelle, valeur in blocs:
+        if not valeur:
+            continue
+        bloc = Table(
+            [[Paragraph(escape(libelle.upper()), styles["EcoScanCardLabel"])],
+             [Paragraph(escape(str(valeur)), styles["EcoScanCardBody"])]],
+            colWidths=[17 * cm],
+        )
+        bloc.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2EAF2")),
+            ("LINEBEFORE", (0, 0), (0, -1), 2, ECOSCAN_TEAL),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 11),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 11),
+            ("TOPPADDING", (0, 0), (-1, 0), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+            ("TOPPADDING", (0, 1), (-1, 1), 2),
+            ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
+        ]))
+        elements.extend([bloc, Spacer(1, 0.16 * cm)])
     return elements
 
 
@@ -247,7 +347,7 @@ def _pied_de_page(canvas, doc):
     canvas.line(2 * cm, 1.5 * cm, A4[0] - 2 * cm, 1.5 * cm)
     canvas.setFont("Helvetica", 8)
     canvas.setFillColor(colors.HexColor("#94A3B8"))
-    canvas.drawString(2 * cm, 1.1 * cm, f"Généré par EcoScan le {timezone.now():%d/%m/%Y}")
+    canvas.drawString(2 * cm, 1.1 * cm, f"Généré par EcoScan le {timezone.localtime():%d/%m/%Y}")
     canvas.drawRightString(A4[0] - 2 * cm, 1.1 * cm, f"Page {doc.page}")
     canvas.restoreState()
 

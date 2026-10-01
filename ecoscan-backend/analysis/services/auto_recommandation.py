@@ -24,11 +24,53 @@ logger = logging.getLogger(__name__)
 TARIF_KWH_FCFA = Decimal("140")
 
 
-def _obtenir_ou_creer_objectif(organisation):
+def _est_woyofal_rituel(anomalie):
+    resultat = anomalie.resultat_metrique
+    return bool(
+        resultat
+        and resultat.code_metrique == "variation_woyofal_rituelle_vs_moyenne_recente"
+    )
+
+
+def _obtenir_ou_creer_objectif(organisation, woyofal_rituel=False, anomalie=None):
     """Retourne l'objectif FCFA s'il existe, sinon le premier objectif ACTIF.
     Si aucun objectif n'est actif, crée automatiquement un objectif par défaut
     en FCFA pour que l'IA puisse toujours lier sa recommandation sans blocage."""
     from energy.models import Objectif
+
+    if woyofal_rituel:
+        objectif = Objectif.objects.filter(
+            organisation=organisation,
+            statut=Objectif.Statut.ACTIF,
+            unite__iexact="kWh",
+        ).order_by("date_debut").first()
+        if objectif:
+            return objectif
+        reference = anomalie.valeur_attendue if anomalie else None
+        if reference is None or reference <= 0:
+            logger.warning(
+                "Objectif Woyofal non créé pour l'anomalie %s : référence kWh absente ou nulle.",
+                getattr(anomalie, "id", None),
+            )
+            return None
+        debut = timezone.now()
+        return Objectif.objects.create(
+            organisation=organisation,
+            nom="Réduire la consommation Woyofal",
+            description=(
+                "Objectif par défaut de réduction de 10 % de la référence Woyofal, "
+                "mesurée entre 08 h et 20 h."
+            ),
+            type="reduction_energie",
+            valeur_cible=max(
+                Decimal("0.001"),
+                (Decimal(reference) * Decimal("0.10")).quantize(Decimal("0.001")),
+            ),
+            unite="kWh",
+            date_debut=debut,
+            date_fin=debut + timedelta(days=365),
+            statut=Objectif.Statut.ACTIF,
+        )
 
     objectif = (
         Objectif.objects.filter(organisation=organisation, statut=Objectif.Statut.ACTIF, unite__in=["FCFA", "XOF"])
@@ -82,6 +124,31 @@ def _economie_depuis_anomalie(anomalie: Anomalie) -> Decimal:
     return Decimal("25000.00")
 
 
+def _recommandation_woyofal(anomalie):
+    """Construit une piste en kWh observés sans inventer de tarif Woyofal."""
+    if anomalie.type != "consumption_spike":
+        return (
+            f"Vérifier la baisse Woyofal de {abs(float(anomalie.ecart_pourcentage))}% "
+            "et confirmer que les relevés, recharges et équipements sont cohérents.",
+            "Comparer les soldes saisis et les recharges du jour, puis vérifier les équipements "
+            "qui auraient pu être arrêtés. Cette anomalie porte uniquement sur la fenêtre mesurée 08 h–20 h.",
+            Decimal("0"),
+        )
+
+    ecart_kwh = max(
+        Decimal("0"),
+        Decimal(anomalie.valeur_observee or 0) - Decimal(anomalie.valeur_attendue or 0),
+    )
+    variation = float(anomalie.ecart_pourcentage)
+    return (
+        f"Examiner la hausse Woyofal de {variation:.1f}% entre 08 h et 20 h",
+        "Comparer les relevés et recharges de chaque créneau, puis vérifier les équipements actifs "
+        "pendant la période. Le potentiel indicatif correspond à l'écart observé par rapport à la "
+        "référence 08 h–20 h ; il ne garantit pas une économie.",
+        ecart_kwh.quantize(Decimal("0.001")),
+    )
+
+
 def generer_recommandation_auto(anomalie: Anomalie) -> Recommandation | None:
     """Génère et persiste une recommandation automatique pour une anomalie.
 
@@ -98,7 +165,8 @@ def generer_recommandation_auto(anomalie: Anomalie) -> Recommandation | None:
             anomalie.save(update_fields=("statut",))
         return existante
 
-    objectif = _obtenir_ou_creer_objectif(anomalie.organisation)
+    woyofal_rituel = _est_woyofal_rituel(anomalie)
+    objectif = _obtenir_ou_creer_objectif(anomalie.organisation, woyofal_rituel, anomalie)
     if objectif is None:
         logger.warning(
             "Aucun objectif disponible pour l'organisation %s — recommandation auto impossible.",
@@ -124,13 +192,15 @@ def generer_recommandation_auto(anomalie: Anomalie) -> Recommandation | None:
         "- economie_estimee_fcfa : montant estimé en FCFA (nombre entier positif)"
     )
 
-    reponse = demander_hypothese(question, anomalie.organisation_id)
+    if woyofal_rituel:
+        titre, description, economie = _recommandation_woyofal(anomalie)
+    else:
+        reponse = demander_hypothese(question, anomalie.organisation_id)
+        titre = None
+        description = None
+        economie = _economie_depuis_anomalie(anomalie)
 
-    titre = None
-    description = None
-    economie = _economie_depuis_anomalie(anomalie)
-
-    if "_error" not in reponse:
+    if not woyofal_rituel and "_error" not in reponse:
         texte_brut = (reponse.get("answer") or "").strip()
         try:
             debut = texte_brut.index("{")
@@ -166,7 +236,7 @@ def generer_recommandation_auto(anomalie: Anomalie) -> Recommandation | None:
             description=description,
             impact_estime=economie,
             economie_estimee=economie,
-            unite="FCFA",
+            unite="kWh" if woyofal_rituel else "FCFA",
             priorite=(
                 Recommandation.Priorite.CRITIQUE
                 if anomalie.severite == Anomalie.Severite.INVESTIGATION_PRIORITAIRE

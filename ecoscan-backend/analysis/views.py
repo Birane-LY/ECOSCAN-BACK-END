@@ -4,10 +4,13 @@ import secrets
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import PurePosixPath
+from urllib.parse import unquote, urlparse
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.storage import default_storage
+from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -19,6 +22,8 @@ from rest_framework.views import APIView
 
 from audit.models import JournalAudit
 from audit.services import enregistrer_evenement
+from billing.permissions import EstAbonnementActif
+from billing.services import BillingAccessService
 from energy.models import ImportDonnees
 from organizations.models import Organisation
 
@@ -50,6 +55,8 @@ from .serializers import (
 )
 from analysis.api.ai_client import indexer_document, interroger_assistant
 from analysis.services.factures import analyser_facture_par_id
+from analysis.services.context import obtenir_contexte
+from analysis.services.hypothesis import generer_hypothese
 from analysis.services.progression_objectifs import calculer_progressions_organisation
 from analysis.services.recommandations import (
     DonneesInvalidesError,
@@ -177,6 +184,8 @@ def _publier_resultat_depuis_import(import_instance):
             f"à comparer manuellement avec la valeur enregistrée sur le compteur."
         )
 
+        logger = logging.getLogger(__name__)
+
     resultat, cree = ResultatMetrique.objects.get_or_create(
         fichier_source=import_instance.fichier_source,
         defaults={
@@ -214,22 +223,22 @@ class AnalyseScopedQuerySetMixin:
     """Filtrage strict multi-tenant. Le rôle SUPER_ADMIN n'a volontairement aucun
     accès aux objets métier des clients."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EstAbonnementActif]
     organisation_lookup = "recommandation__objectif__organisation"
 
     def get_queryset(self):
         user = self.request.user
         if getattr(user, "role", None) == "SUPER_ADMIN":
             return self.queryset.none()
-        organisations = Organisation.objects.filter(membres__utilisateur=user)
+        organisations = BillingAccessService().organisations_avec_acces(user)
         return self.queryset.all().filter(**{f"{self.organisation_lookup}__in": organisations})
 
     def _exiger_perimetre(self, organisation):
         """Refuse la création d'un objet rattaché à une organisation dont
         l'utilisateur n'est pas membre."""
-        if organisation is None or not Organisation.objects.filter(
-            id=organisation.id, membres__utilisateur=self.request.user
-        ).exists():
+        if organisation is None or not BillingAccessService().organisations_avec_acces(
+            self.request.user
+        ).filter(id=organisation.id).exists():
             raise PermissionDenied("Ressource hors de votre périmètre.")
 
 
@@ -434,6 +443,37 @@ class LivrableViewSet(AnalyseScopedViewSet):
         )
         return Response(self.get_serializer(livrable).data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get"])
+    def telecharger(self, request, pk=None):
+        """Télécharge le PDF après contrôle du périmètre de l'organisation."""
+        livrable = self.get_object()
+        if not livrable.url_fichier:
+            raise Http404("Aucun fichier n’est associé à ce livrable.")
+
+        segments = tuple(
+            segment
+            for segment in PurePosixPath(unquote(urlparse(livrable.url_fichier).path)).parts
+            if segment not in {"/", ""}
+        )
+        prefixe_attendu = ("livrables", str(livrable.id))
+        positions = [
+            index
+            for index in range(len(segments) - 1)
+            if segments[index:index + 2] == prefixe_attendu
+        ]
+        if len(positions) != 1 or positions[0] + 3 != len(segments):
+            raise Http404("Le chemin du fichier du livrable est invalide.")
+        chemin_stocke = "/".join(segments[positions[0]:])
+        nom_fichier = segments[-1]
+        if not default_storage.exists(chemin_stocke):
+            raise Http404("Le fichier du livrable est introuvable.")
+
+        try:
+            fichier = default_storage.open(chemin_stocke, "rb")
+        except FileNotFoundError as exc:
+            raise Http404("Le fichier du livrable est introuvable.") from exc
+        return FileResponse(fichier, as_attachment=True, filename=nom_fichier, content_type="application/pdf")
+
     @action(detail=True, methods=["post"])
     def valider(self, request, pk=None):
         """Approuve la conformité du livrable. Audit : 'VALIDER_LIVRABLE'."""
@@ -461,7 +501,7 @@ class ResultatMetriqueViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModel
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, EstAbonnementActif])
 def integrer_extraction_energy(request):
     """Intègre une facture extraite par 'energy' sous forme de ResultatMetrique."""
     import_id = request.data.get("import_id")
@@ -479,8 +519,8 @@ def integrer_extraction_energy(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    appartient = Organisation.objects.filter(
-        id=import_instance.organisation_id, membres__utilisateur=request.user
+    appartient = BillingAccessService().organisations_avec_acces(request.user).filter(
+        id=import_instance.organisation_id
     ).exists()
     if not appartient:
         return Response({"error": "Import hors de votre organisation."}, status=status.HTTP_403_FORBIDDEN)
@@ -566,6 +606,43 @@ class AnomalieViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet)
     serializer_class = AnomalieSerializer
     organisation_lookup = "organisation"
 
+    @action(detail=True, methods=["post"], url_path="generer-hypothese-ia")
+    def generer_hypothese_ia(self, request, pk=None):
+        """Relance un diagnostic manquant après une indisponibilité du service IA."""
+        anomalie = self.get_object()
+        hypothese = anomalie.hypotheses.order_by("-date_creation").first()
+        cree = hypothese is None
+        if hypothese is None:
+            hypothese = generer_hypothese(anomalie, obtenir_contexte(anomalie))
+
+        if hypothese is None:
+            enregistrer_evenement(
+                action="ECHEC_GENERATION_HYPOTHESE",
+                ressource="Anomalie",
+                identifiant_ressource=str(anomalie.id),
+                utilisateur=request.user,
+                organisation=anomalie.organisation,
+                resultat=JournalAudit.Resultat.ECHEC,
+                request=request,
+            )
+            return Response(
+                {"error": "Le service IA n’a pas pu générer le diagnostic. Réessayez dans quelques instants."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        enregistrer_evenement(
+            action="GENERER_HYPOTHESE_IA",
+            ressource="Hypothese",
+            identifiant_ressource=str(hypothese.id),
+            utilisateur=request.user,
+            organisation=anomalie.organisation,
+            request=request,
+        )
+        return Response(
+            HypotheseSerializer(hypothese).data,
+            status=status.HTTP_201_CREATED if cree else status.HTTP_200_OK,
+        )
+
     @action(detail=True, methods=["post"], url_path="creer-recommandation")
     def creer_recommandation(self, request, pk=None):
         """Geste humain : crée une recommandation à partir d'une anomalie. Audit : 'CREER_RECOMMANDATION'."""
@@ -638,12 +715,30 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
         creer_memoire_depuis_hypothese(hypothese)
 
         # Génération automatique de la recommandation si non encore créée
+        avertissement = None
         if anomalie:
             from analysis.services.auto_recommandation import generer_recommandation_auto
             try:
-                generer_recommandation_auto(anomalie)
+                recommandation = generer_recommandation_auto(anomalie)
+                if recommandation is None:
+                    avertissement = (
+                        "L'hypothèse a été confirmée et mémorisée, mais la recommandation "
+                        "n'a pas pu être créée. Réessayez depuis l'anomalie."
+                    )
+                    logger.warning(
+                        "Hypothèse %s confirmée, mais aucune recommandation créée pour l'anomalie %s.",
+                        hypothese.id,
+                        anomalie.id,
+                    )
             except Exception:
-                pass
+                logger.exception(
+                    "Hypothèse %s confirmée, mais une erreur empêche la création de la recommandation.",
+                    hypothese.id,
+                )
+                avertissement = (
+                    "L'hypothèse a été confirmée et mémorisée, mais une erreur empêche "
+                    "la création de la recommandation. Réessayez depuis l'anomalie."
+                )
 
         organisation = hypothese.anomalie.organisation if hypothese.anomalie else None
         enregistrer_evenement(
@@ -655,7 +750,10 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
             details={"confiance": float(confiance)},
             request=request,
         )
-        return Response(self.get_serializer(hypothese).data, status=status.HTTP_200_OK)
+        reponse = self.get_serializer(hypothese).data
+        if avertissement:
+            reponse["avertissement"] = avertissement
+        return Response(reponse, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
     def rejeter(self, request, pk=None):
@@ -684,13 +782,13 @@ class HypotheseViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet
 class ProgressionObjectifsView(APIView):
     """Progression DÉCLARÉE et MESURÉE de chaque objectif."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EstAbonnementActif]
 
     def get(self, request):
         if getattr(request.user, "role", None) == "SUPER_ADMIN":
             return Response({"error": "Rôle non autorisé."}, status=status.HTTP_403_FORBIDDEN)
         resultats = []
-        for organisation in Organisation.objects.filter(membres__utilisateur=request.user):
+        for organisation in BillingAccessService().organisations_avec_acces(request.user):
             resultats.extend(calculer_progressions_organisation(organisation))
         return Response(resultats)
 
@@ -773,7 +871,7 @@ def _nettoyer_historique(brut) -> list:
 class AssistantQueryView(APIView):
     """Requêtes conversationnelles adressées à l'assistant IA."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EstAbonnementActif]
 
     def post(self, request):
         question = (request.data.get("question") or "").strip()
@@ -783,7 +881,7 @@ class AssistantQueryView(APIView):
         if getattr(request.user, "role", None) == "SUPER_ADMIN":
             return Response({"error": "L'assistant n'est pas disponible pour ce rôle."}, status=status.HTTP_403_FORBIDDEN)
 
-        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        organisation = BillingAccessService().organisations_avec_acces(request.user).first()
         if organisation is None:
             return Response({"error": "Aucune organisation associée à ce compte."}, status=status.HTTP_409_CONFLICT)
 
@@ -804,7 +902,7 @@ class AssistantQueryView(APIView):
         )
 
         if "_error" in reponse:
-            return Response({"error": reponse["_error"]}, status=status.HTTP_53_SERVICE_UNAVAILABLE)
+            return Response({"error": reponse["_error"]}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         return Response(
             {"answer": reponse.get("answer", "Je n'ai pas pu formuler de réponse."), "sources": reponse.get("sources", [])},
@@ -816,7 +914,7 @@ class OpportuniteFinancementViewSet(viewsets.ReadOnlyModelViewSet):
     """Consultation des opportunités et subventions."""
 
     serializer_class = OpportuniteFinancementSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EstAbonnementActif]
 
     def get_queryset(self):
         statut_demande = self.request.query_params.get("statut")

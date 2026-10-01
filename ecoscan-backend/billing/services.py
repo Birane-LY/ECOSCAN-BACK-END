@@ -9,6 +9,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from .models import Abonnement, Facture, HistoriqueAbonnement, Paiement, Plan, Relance
@@ -35,30 +36,43 @@ class BillingAccessService:
     fonctionnalité. Centralisé ici pour que la règle d'accès ne soit jamais
     dupliquée (et potentiellement désynchronisée) dans chaque vue métier."""
 
-    # Statuts qui conservent l'accès — PAST_DUE et GRACE_PERIOD y sont
-    # délibérément inclus : "il ne faut pas suspendre immédiatement après le
-    # premier échec" (voir document partagé, section 6).
-    #
-    # IMPORTANT : ce statut seul ne suffit PAS à garantir un accès légitime —
-    # voir le commentaire sur `abonnement_courant()` ci-dessous. Les tâches
-    # planifiées (tasks.py) sont ce qui maintient ce statut synchronisé avec
-    # la réalité (essai expiré -> EXPIRED, cycle non renouvelé -> PAST_DUE) ;
-    # sans elles, un abonnement resterait TRIALING/ACTIVE indéfiniment même
-    # après la date de fin de période.
-    STATUTS_AVEC_ACCES = (
-        Abonnement.Statut.TRIALING,
-        Abonnement.Statut.ACTIVE,
-        Abonnement.Statut.PAST_DUE,
-        Abonnement.Statut.GRACE_PERIOD,
-    )
-
     def abonnement_courant(self, organisation):
+        if organisation.statut != "ACTIVE":
+            return None
+        maintenant = timezone.now()
         return (
             organisation.abonnements
-            .filter(statut__in=self.STATUTS_AVEC_ACCES)
+            .filter(
+                Q(
+                    statut__in=(Abonnement.Statut.TRIALING, Abonnement.Statut.ACTIVE),
+                    fin_periode__gt=maintenant,
+                )
+                | Q(
+                    statut__in=(Abonnement.Statut.PAST_DUE, Abonnement.Statut.GRACE_PERIOD),
+                    fin_grace__gt=maintenant,
+                )
+            )
             .order_by("-debut")
             .first()
         )
+
+    def organisations_avec_acces(self, utilisateur):
+        """Retourne uniquement les organisations dont le compte a encore un accès valide."""
+        from organizations.models import Organisation
+
+        return Organisation.objects.filter(
+            membres__utilisateur=utilisateur,
+            statut=Organisation.Statut.ACTIVE,
+        ).filter(
+            Q(
+                abonnements__statut__in=(Abonnement.Statut.TRIALING, Abonnement.Statut.ACTIVE),
+                abonnements__fin_periode__gt=timezone.now(),
+            )
+            | Q(
+                abonnements__statut__in=(Abonnement.Statut.PAST_DUE, Abonnement.Statut.GRACE_PERIOD),
+                abonnements__fin_grace__gt=timezone.now(),
+            )
+        ).distinct()
 
     def can_use_feature(self, organisation, feature_code: str) -> bool:
         abonnement = self.abonnement_courant(organisation)
@@ -82,13 +96,13 @@ class BillingAccessService:
         cette logique de présentation ailleurs."""
         abonnement = self.abonnement_courant(organisation)
         if abonnement is None:
-            return {"acces": False, "statut": None, "message": "Aucun abonnement actif."}
+            return {"acces": False, "statut": None, "message": "Aucun essai ou abonnement actif."}
 
         message = None
         if abonnement.statut == Abonnement.Statut.PAST_DUE:
             message = "Votre paiement a échoué. Merci de régulariser votre abonnement."
         elif abonnement.statut == Abonnement.Statut.GRACE_PERIOD:
-            jours_restants = max((abonnement.fin_periode - timezone.now()).days, 0)
+            jours_restants = max(((abonnement.fin_grace or timezone.now()) - timezone.now()).days, 0)
             message = f"Vous disposez encore de {jours_restants} jour(s) pour régulariser votre abonnement."
         elif abonnement.statut == Abonnement.Statut.TRIALING:
             jours_restants = max((abonnement.fin_periode - timezone.now()).days, 0)
@@ -111,7 +125,7 @@ class SubscriptionService:
             periodicite="MENSUEL",
             debut=maintenant,
             fin_periode=maintenant + timedelta(days=DUREE_ESSAI_JOURS),
-            fournisseur=Abonnement.Fournisseur.MANUAL,
+            fournisseur=Abonnement.Fournisseur.PAYDUNYA,
         )
         self._historiser(abonnement, ancien_statut="", nouveau_statut=abonnement.statut, raison="essai_gratuit_demarre")
         return abonnement
@@ -126,7 +140,8 @@ class SubscriptionService:
     def mettre_en_grace(self, abonnement: Abonnement) -> None:
         ancien_statut = abonnement.statut
         abonnement.statut = Abonnement.Statut.GRACE_PERIOD
-        abonnement.save(update_fields=("statut",))
+        abonnement.fin_grace = max(abonnement.fin_periode, timezone.now()) + timedelta(days=DUREE_GRACE_JOURS)
+        abonnement.save(update_fields=("statut", "fin_grace"))
         self._historiser(abonnement, ancien_statut=ancien_statut, nouveau_statut=abonnement.statut, raison="paiement_echoue")
 
     def suspendre(self, abonnement: Abonnement) -> None:
@@ -179,11 +194,15 @@ class InvoiceService:
     un paiement est une tentative — jamais fusionnés (voir document partagé)."""
 
     def generer_facture_cycle(self, abonnement: Abonnement) -> Facture:
+        debut_periode = max(abonnement.fin_periode, timezone.now()) if (
+            abonnement.statut == Abonnement.Statut.EXPIRED
+        ) else abonnement.fin_periode
+
         # Idempotence : ne jamais générer deux factures pour le même cycle
         # (même si cette méthode est appelée deux fois — souscription manuelle
         # ET tâche de renouvellement automatique, par exemple).
         existante = Facture.objects.filter(
-            abonnement=abonnement, periode_debut=abonnement.fin_periode
+            abonnement=abonnement, periode_debut=debut_periode
         ).first()
         if existante:
             return existante
@@ -203,9 +222,9 @@ class InvoiceService:
             taxes=Decimal("0"),
             montant_total=montant_ht,
             devise=abonnement.plan.devise,
-            periode_debut=abonnement.fin_periode,
-            periode_fin=abonnement.fin_periode + duree,
-            date_echeance=abonnement.fin_periode,
+            periode_debut=debut_periode,
+            periode_fin=debut_periode + duree,
+            date_echeance=debut_periode,
             statut=Facture.Statut.OPEN,
         )
 

@@ -37,10 +37,17 @@ def _verifier_appartenance(request, organisation, nom_champ: str):
 class RecommandationSerializer(serializers.ModelSerializer):
     """Sérialiseur pour la gestion et le suivi des pistes d'économies d'énergie."""
 
+    objectif_nom = serializers.CharField(source="objectif.nom", read_only=True)
+    objectif_valeur_cible = serializers.DecimalField(
+        source="objectif.valeur_cible", max_digits=18, decimal_places=6, read_only=True
+    )
+    objectif_unite = serializers.CharField(source="objectif.unite", read_only=True)
+
     class Meta:
         model = Recommandation
         fields = (
-            "id", "objectif", "anomalie", "titre", "description", "impact_estime",
+            "id", "objectif", "objectif_nom", "objectif_valeur_cible", "objectif_unite",
+            "anomalie", "titre", "description", "impact_estime",
             "economie_estimee", "unite", "priorite", "statut",
             "date_echeance", "date_decision",
         )

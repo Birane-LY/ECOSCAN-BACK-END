@@ -4,6 +4,21 @@ from django.conf import settings
 from rest_framework.permissions import BasePermission
 
 from organizations.models import UtilisateurOrganisation
+from .services import BillingAccessService
+
+
+class EstAbonnementActif(BasePermission):
+    """Refuse les fonctionnalités métier sans essai ou abonnement non expiré."""
+
+    message = "Un essai gratuit ou un abonnement actif est nécessaire pour accéder à cet espace."
+
+    def has_permission(self, request, view):
+        utilisateur = request.user
+        return (
+            utilisateur.is_authenticated
+            and utilisateur.actif
+            and BillingAccessService().organisations_avec_acces(utilisateur).exists()
+        )
 
 
 class EstSuperAdminEcoScan(BasePermission):

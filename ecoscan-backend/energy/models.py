@@ -2,6 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class FichierSource(models.Model):
@@ -193,6 +194,126 @@ class DonneeEnergetique(models.Model):
 
     def __str__(self):
         return f"{self.compteur.reference} : {self.valeur} {self.unite}"
+
+
+class PointSuiviEnergetique(models.Model):
+    """An organisation-scoped manual measurement point, optionally linked to a site or meter."""
+
+    class ModeMesure(models.TextChoices):
+        INDEX_CUMULATIF = "INDEX_CUMULATIF", "Index cumulatif (SENELEC)"
+        SOLDE_WOYOFAL = "SOLDE_WOYOFAL", "Solde restant (Woyofal)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey(
+        "organizations.Organisation",
+        on_delete=models.CASCADE,
+        related_name="points_suivi_energetique",
+    )
+    site = models.ForeignKey(
+        "organizations.Site",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="points_suivi_energetique",
+    )
+    compteur = models.ForeignKey(
+        "organizations.Compteur",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="points_suivi_energetique",
+    )
+    nom = models.CharField(max_length=150)
+    mode_mesure = models.CharField(max_length=24, choices=ModeMesure.choices)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("organisation__nom", "site__nom", "nom")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("site", "nom"),
+                name="point_suivi_site_nom_unique",
+            ),
+            models.UniqueConstraint(
+                fields=("organisation", "nom"),
+                condition=models.Q(site__isnull=True),
+                name="point_suivi_org_sans_site_nom_unique",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.site.nom if self.site_id else self.organisation.nom} — {self.nom}"
+
+
+class ReleveRituelEnergetique(models.Model):
+    """Manual readings at four checkpoints during the business day."""
+
+    class Creneau(models.TextChoices):
+        HUIT_HEURES = "08:00", "08:00 — Matin"
+        DOUZE_HEURES = "12:00", "12:00 — Midi"
+        SEIZE_HEURES = "16:00", "16:00 — Après-midi"
+        VINGT_HEURES = "20:00", "20:00 — Soir"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    client_id = models.UUIDField(default=uuid.uuid4, unique=True)
+    point_suivi = models.ForeignKey(
+        PointSuiviEnergetique,
+        on_delete=models.CASCADE,
+        related_name="releves_rituel",
+    )
+    date_releve = models.DateField()
+    creneau = models.CharField(max_length=5, choices=Creneau.choices)
+    valeur_kwh = models.DecimalField(max_digits=18, decimal_places=6)
+    note = models.CharField(max_length=500, blank=True)
+    observe_le = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ("-date_releve", "creneau")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("point_suivi", "date_releve", "creneau"),
+                name="releve_rituel_point_date_creneau_unique",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(valeur_kwh__gte=0),
+                name="releve_rituel_valeur_non_negative",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.point_suivi} — {self.date_releve} {self.creneau}"
+
+
+class RechargeRituelWoyofal(models.Model):
+    """Recharge captured manually to account for credits between Woyofal balances."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    client_id = models.UUIDField(default=uuid.uuid4, unique=True)
+    point_suivi = models.ForeignKey(
+        PointSuiviEnergetique,
+        on_delete=models.CASCADE,
+        related_name="recharges_rituel",
+    )
+    montant_fcfa = models.DecimalField(max_digits=14, decimal_places=2)
+    kwh_credites = models.DecimalField(max_digits=12, decimal_places=3)
+    effectuee_le = models.DateTimeField(default=timezone.now)
+    note = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        ordering = ("-effectuee_le",)
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(montant_fcfa__gt=0),
+                name="recharge_rituel_montant_positif",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(kwh_credites__gt=0),
+                name="recharge_rituel_kwh_positifs",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.point_suivi} — {self.kwh_credites} kWh"
 
 
 class HistoriquePerformance(models.Model):

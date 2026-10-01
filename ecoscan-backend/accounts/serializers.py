@@ -68,17 +68,18 @@ class OnboardingAdminOrganisationSerializer(serializers.Serializer):
         allowed_fields = {"profil", "nombre_sites", "sources", "maturite", "objectifs"}
         details = {key: value[key] for key in allowed_fields if key in value}
         plan_id = value.get("plan_id")
-        if plan_id:
-            try:
-                plan = Plan.objects.get(pk=plan_id, actif=True)
-            except (Plan.DoesNotExist, DjangoValidationError, ValueError, TypeError):
-                raise serializers.ValidationError("La formule sélectionnée n’est plus disponible.")
-            details["plan_id"] = str(plan.pk)
-            details["plan_nom"] = plan.nom
+        if not plan_id:
+            raise serializers.ValidationError("Choisissez une formule avant de créer votre espace.")
+        try:
+            plan = Plan.objects.get(pk=plan_id, actif=True)
+        except (Plan.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+            raise serializers.ValidationError("La formule sélectionnée n’est plus disponible.")
+        details["plan_id"] = str(plan.pk)
+        details["plan_nom"] = plan.nom
         return details
 
     def create(self, validated_data):
-        """Crée atomiquement le compte inactif, l'organisation en attente et leur lien."""
+        """Crée atomiquement le compte, l'organisation en attente et leur lien."""
         with transaction.atomic():
             utilisateur = Utilisateur.objects.create(
                 email=validated_data["email_connexion"],
@@ -90,6 +91,8 @@ class OnboardingAdminOrganisationSerializer(serializers.Serializer):
             utilisateur.set_unusable_password()
             utilisateur.save(update_fields=("password", "mot_de_passe_hash"))
 
+            details_demande = validated_data.get("details_demande", {})
+            details_demande["inscription_autonome"] = True
             organisation = Organisation.objects.create(
                 nom=validated_data["nom_organisation"],
                 secteur=validated_data["secteur"],
@@ -122,11 +125,15 @@ class UtilisateurSerializer(serializers.ModelSerializer):
     nom = serializers.CharField(
         error_messages={"blank": "Le nom est obligatoire."}
     )
+    invitation_en_attente = serializers.SerializerMethodField()
 
     class Meta:
         model = Utilisateur
-        fields = ("id", "nom", "email", "role", "date_creation", "actif")
-        read_only_fields = ("id", "date_creation")
+        fields = ("id", "nom", "email", "role", "date_creation", "actif", "invitation_en_attente")
+        read_only_fields = ("id", "date_creation", "actif")
+
+    def get_invitation_en_attente(self, utilisateur):
+        return not utilisateur.has_usable_password()
 
     def validate_email(self, value):
         """Vérifie et normalise l'e-mail avec email-validator."""
@@ -322,17 +329,42 @@ class FinaliserInscriptionSerializer(serializers.Serializer):
         
         if not default_token_generator.check_token(utilisateur, data["token"]):
             raise serializers.ValidationError("Ce lien d'invitation a expiré ou a déjà été utilisé pour configurer ce compte.")
-        
+
+        organisations_en_essai = list(
+            Organisation.objects.filter(
+                membres__utilisateur=utilisateur,
+                statut=Organisation.Statut.EN_ATTENTE,
+                details_demande__inscription_autonome=True,
+            )
+        )
+        for organisation in organisations_en_essai:
+            plan_id = organisation.details_demande.get("plan_id")
+            plan_disponible = (
+                Plan.objects.filter(pk=plan_id, actif=True).exists()
+                if plan_id
+                else Plan.objects.filter(code="standard", actif=True).exists()
+            )
+            if not plan_disponible:
+                raise serializers.ValidationError(
+                    "La formule choisie n’est plus disponible. Contactez EcoScan pour finaliser votre inscription."
+                )
+
         self.context["utilisateur"] = utilisateur
+        self.context["organisations_en_essai"] = organisations_en_essai
         return data
 
     def save(self):
-        """Active le profil utilisateur avec le nouveau mot de passe."""
+        """Active le compte et démarre l'essai après vérification de l'e-mail."""
         utilisateur = self.context["utilisateur"]
         mot_de_passe = self.validated_data["mot_de_passe"]
-        utilisateur.set_password(mot_de_passe)
-        utilisateur.actif = True
-        utilisateur.save()
+        with transaction.atomic():
+            utilisateur.set_password(mot_de_passe)
+            utilisateur.actif = True
+            utilisateur.save(update_fields=("password", "mot_de_passe_hash", "actif"))
+            for organisation in self.context["organisations_en_essai"]:
+                organisation.statut = Organisation.Statut.ACTIVE
+                organisation.save(update_fields=("statut",))
+        self.context["essai_demarre"] = bool(self.context["organisations_en_essai"])
         return utilisateur
 
 

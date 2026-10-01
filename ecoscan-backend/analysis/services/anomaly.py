@@ -19,6 +19,7 @@ CODES_METRIQUES_COMPATIBLES = (
     "variation_vs_baseline",
     "variation_facture_vs_facture_precedente",
     "variation_woyofal_vs_moyenne_recente",
+    "variation_woyofal_rituelle_vs_moyenne_recente",
 )
 
 

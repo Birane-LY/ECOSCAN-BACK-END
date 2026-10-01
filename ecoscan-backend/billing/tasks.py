@@ -34,7 +34,7 @@ def expirer_periodes_de_grace() -> int:
     service = SubscriptionService()
     candidats = Abonnement.objects.filter(
         statut=Abonnement.Statut.GRACE_PERIOD,
-        fin_periode__lt=timezone.now(),
+        fin_grace__lte=timezone.now(),
     )
     compte = 0
     for abonnement in candidats:
@@ -54,7 +54,7 @@ def expirer_essais_termines() -> int:
     service = SubscriptionService()
     candidats = Abonnement.objects.filter(
         statut=Abonnement.Statut.TRIALING,
-        fin_periode__lt=timezone.now(),
+        fin_periode__lte=timezone.now(),
     )
     compte = 0
     for abonnement in candidats:

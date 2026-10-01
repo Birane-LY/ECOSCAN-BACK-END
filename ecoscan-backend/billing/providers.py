@@ -130,7 +130,11 @@ class PayDunyaProvider(PaymentProvider):
                 },
             },
             "store": {"name": "EcoScan"},
-            "actions": {"return_url": return_url, "cancel_url": cancel_url},
+            "actions": {
+                "return_url": return_url,
+                "cancel_url": cancel_url,
+                "callback_url": getattr(settings, "PAYDUNYA_CALLBACK_URL", ""),
+            },
             # custom_data est un nœud racine, frère de "invoice" — PAS un enfant.
             "custom_data": {"facture_id": str(facture.id)},
         }

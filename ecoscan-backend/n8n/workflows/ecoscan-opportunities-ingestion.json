@@ -1,0 +1,555 @@
+{
+  "name": "EcoScan - Collecte et ingestion des aides",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Lancement manuel",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Collecte quotidienne",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [\n  { json: { organisme: 'FONSIS', url: 'https://www.fonsis.org/', secteur_attendu: 'énergie' } },\n  { json: { organisme: 'AEME', url: 'https://www.aeme.sn/', secteur_attendu: 'énergie' } },\n  { json: { organisme: 'ANER', url: 'https://aner.sn/', secteur_attendu: 'énergies renouvelables' } },\n  { json: { organisme: 'ASER', url: 'https://www.aser.sn/', secteur_attendu: 'électrification rurale' } },\n  { json: { organisme: 'BNDE', url: 'https://www.bnde.sn/', secteur_attendu: 'financement énergie' } },\n  { json: { organisme: 'DER/FJ', url: 'https://der.sn/', secteur_attendu: 'énergie / activité productive' } },\n  { json: { organisme: 'AFD Sénégal', url: 'https://www.afd.fr/fr/page-region-pays/senegal', secteur_attendu: 'financement climat' } },\n  { json: { organisme: 'GIZ Sénégal', url: 'https://www.giz.de/en/worldwide/365.html', secteur_attendu: 'énergie / climat' } }\n];"
+      },
+      "id": "source-config",
+      "name": "Configuration des sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 80]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "fetch-sources",
+      "name": "Collecter les pages sources",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 80],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "merge-source-pages",
+      "name": "Conserver les métadonnées source",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [700, 80]
+    },
+    {
+      "parameters": {
+        "jsCode": "const html = String($json.data ?? $json.body ?? $json.html ?? '');\nconst decode = (value) => value\n  .replace(/&nbsp;/gi, ' ')\n  .replace(/&amp;/gi, '&')\n  .replace(/&quot;/gi, '\"')\n  .replace(/&#39;|&apos;/gi, \"'\")\n  .replace(/&lt;/gi, '<')\n  .replace(/&gt;/gi, '>');\nconst text = decode(html\n  .replace(/<script\\b[^>]*>[\\s\\S]*?<\\/script>/gi, ' ')\n  .replace(/<style\\b[^>]*>[\\s\\S]*?<\\/style>/gi, ' ')\n  .replace(/<[^>]+>/g, ' '))\n  .replace(/\\s+/g, ' ')\n  .trim();\nconst keywords = ['appel à projets', 'appel a projets', 'appel à candidatures', 'appel a candidatures', 'financement', 'subvention', 'programme', 'fonds', 'grant', 'funding', 'challenge', 'concours', 'accompagnement', 'prêt', 'garantie', 'énergie', 'climat', 'renouvelable'];\nconst links = [];\nconst linkPattern = /<a\\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;\nlet match;\nwhile ((match = linkPattern.exec(html)) !== null) {\n  try {\n    const url = new URL(decode(match[1]), $json.url);\n    const sourceHost = new URL($json.url).hostname.toLowerCase();\n    const host = url.hostname.toLowerCase();\n    const isIpLiteral = /^\\d{1,3}(?:\\.\\d{1,3}){3}$/.test(host) || host.includes(':');\n    const isLocalHost = ['localhost', 'localhost.localdomain'].includes(host) || ['.localhost', '.local', '.internal'].some((suffix) => host.endsWith(suffix));\n    const sameHost = host === sourceHost;\n    if (!['http:', 'https:'].includes(url.protocol) || isIpLiteral || isLocalHost || url.username || url.password || url.port || (!sameHost && url.protocol !== 'https:')) continue;\n    const label = decode(match[2].replace(/<[^>]+>/g, ' ')).replace(/\\s+/g, ' ').trim();\n    if (label && keywords.some((keyword) => `${label} ${url.href}`.toLocaleLowerCase('fr').includes(keyword))) {\n      links.push({ url: url.href, label });\n    }\n  } catch {}\n}\nconst uniqueLinks = [...new Map(links.map((link) => [link.url, link])).values()].slice(0, 20);\nconst candidates = uniqueLinks.length ? uniqueLinks : [{ url: $json.url, label: `Page source officielle ${$json.organisme}` }];\nreturn candidates.map((link) => ({ json: { organisme_source: $json.organisme, source_url: $json.url, secteur_attendu: $json.secteur_attendu, candidate_url: link.url, candidate_label: link.label, page_text: text.slice(0, 18000) } }));"
+      },
+      "id": "extract-candidates",
+      "name": "Extraire les liens candidats",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 80]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "candidate-loop",
+      "name": "Traiter les candidats un par un",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1120, 80]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.candidate_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "fetch-candidates",
+      "name": "Lire la page candidate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1360, 80],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "merge-candidate-pages",
+      "name": "Conserver les candidats",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1580, 80]
+    },
+    {
+      "parameters": {
+        "jsCode": "const html = String($json.data ?? $json.body ?? $json.html ?? '');\nconst decode = (value) => value.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '\"').replace(/&#39;|&apos;/gi, \"'\").replace(/&lt;/gi, '<').replace(/&gt;/gi, '>');\nconst page = decode(html.replace(/<script\\b[^>]*>[\\s\\S]*?<\\/script>/gi, ' ').replace(/<style\\b[^>]*>[\\s\\S]*?<\\/style>/gi, ' ').replace(/<[^>]+>/g, ' ')).replace(/\\s+/g, ' ').trim();\nreturn [{ json: { ...$json, candidate_text: page.slice(0, 24000) } }];"
+      },
+      "id": "prepare-candidate-text",
+      "name": "Préparer le texte candidat",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1800, 80]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ECOSCAN_LLM_ENDPOINT || 'https://api.groq.com/openai/v1/chat/completions' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.GROQ_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: $env.ECOSCAN_FAST_MODEL || 'openai/gpt-oss-20b', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'Classe le contenu comme opportunité de financement, subvention, appel à projets ou programme d’accompagnement réellement ouvert ou annoncé pour des entreprises. Réponds uniquement en JSON avec is_opportunity (booléen), reason (texte), confidence (nombre entre 0 et 1). N’invente rien.' }, { role: 'user', content: JSON.stringify({ organisme: $json.organisme_source, secteur: $json.secteur_attendu, url: $json.candidate_url, titre_lien: $json.candidate_label, contenu: $json.candidate_text }) }] } }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "detect-opportunity",
+      "name": "Détecter une opportunité",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2020, 80]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "merge-detection",
+      "name": "Conserver le résultat de détection",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [2240, 80]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.choices?.[0]?.message?.content ?? '{}';\nlet detection;\ntry { detection = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { detection = { is_opportunity: false, reason: 'Réponse JSON invalide', confidence: 0 }; }\nreturn [{ json: { ...$json, detection } }];"
+      },
+      "id": "parse-detection",
+      "name": "Analyser la détection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2460, 80]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.detection.is_opportunity }}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      },
+      "id": "if-opportunity",
+      "name": "Est-ce une opportunité ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2680, 80]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ECOSCAN_LLM_ENDPOINT || 'https://api.groq.com/openai/v1/chat/completions' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.GROQ_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: $env.ECOSCAN_EXTRACTION_MODEL || 'openai/gpt-oss-20b', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'Extrais uniquement les informations explicitement présentes sur cette opportunité. Ne complète pas les données absentes. Retourne un objet JSON avec titre, organisme, description, criteres_eligibilite, secteur, montant_max, devise, taux_financement_pct, date_limite, url_source, confiance_extraction. Les champs absents doivent être null ou chaîne vide. confiance_extraction est un nombre de 0 à 1 décrivant la fiabilité de l’extraction, pas l’éligibilité.' }, { role: 'user', content: JSON.stringify({ organisme_source: $json.organisme_source, secteur_attendu: $json.secteur_attendu, url_source: $json.candidate_url, titre_lien: $json.candidate_label, contenu: $json.candidate_text }) }] } }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "id": "extract-opportunity",
+      "name": "Extraire les données de l’offre",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2900, 0]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "merge-extraction",
+      "name": "Conserver les données extraites",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [3120, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.choices?.[0]?.message?.content ?? '{}';\nlet extracted;\ntry { extracted = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { extracted = {}; }\nconst numberOrNull = (value) => {\n  if (value === null || value === undefined || value === '') return null;\n  const parsed = Number(String(value).replace(/[^0-9,.-]/g, '').replace(',', '.'));\n  return Number.isFinite(parsed) ? parsed : null;\n};\nconst title = String(extracted.titre ?? $json.candidate_label ?? '').trim();\nconst organization = String(extracted.organisme ?? $json.organisme_source ?? '').trim();\nconst sourceUrl = String(extracted.url_source ?? $json.candidate_url ?? '').trim();\nconst deadline = extracted.date_limite || null;\nconst confidence = numberOrNull(extracted.confiance_extraction);\nconst amount = numberOrNull(extracted.montant_max);\nconst rate = numberOrNull(extracted.taux_financement_pct);\n        const validDate = !deadline || (/^\\d{4}-\\d{2}-\\d{2}$/.test(String(deadline)) && !Number.isNaN(Date.parse(`${deadline}T00:00:00`)) && new Date(`${deadline}T00:00:00`).toISOString().slice(0, 10) === deadline);\nconst validUrl = /^https?:\\/\\//i.test(sourceUrl);\nconst ready = Boolean(title && organization && validUrl && validDate && (rate === null || (rate >= 0 && rate <= 100)));\nreturn [{ json: {\n  _ready_for_ingestion: ready,\n  titre: title,\n  organisme: organization,\n  description: String(extracted.description ?? '').trim(),\n  criteres_eligibilite: String(extracted.criteres_eligibilite ?? '').trim(),\n  secteur: String(extracted.secteur ?? $json.secteur_attendu ?? '').trim(),\n  montant_max: amount,\n  devise: String(extracted.devise ?? 'FCFA').trim() || 'FCFA',\n  taux_financement_pct: rate,\n  date_limite: deadline,\n  url_source: sourceUrl,\n  confiance_extraction: confidence\n} }];"
+      },
+      "id": "map-backend-payload",
+      "name": "Valider et mapper vers EcoScan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3340, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json._ready_for_ingestion }}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      },
+      "id": "if-valid-payload",
+      "name": "Données prêtes pour EcoScan ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3560, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ECOSCAN_INGESTION_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Ingestion-Token",
+              "value": "={{ $env.N8N_INGESTION_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { organisme: $json.organisme, titre: $json.titre, description: $json.description, criteres_eligibilite: $json.criteres_eligibilite, secteur: $json.secteur, montant_max: $json.montant_max, devise: $json.devise, taux_financement_pct: $json.taux_financement_pct, date_limite: $json.date_limite, url_source: $json.url_source, confiance_extraction: $json.confiance_extraction } }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "send-to-ecoscan",
+      "name": "Envoyer l’offre à EcoScan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3780, -80]
+    }
+  ],
+  "connections": {
+    "Lancement manuel": {
+      "main": [
+        [
+          {
+            "node": "Configuration des sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collecte quotidienne": {
+      "main": [
+        [
+          {
+            "node": "Configuration des sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuration des sources": {
+      "main": [
+        [
+          {
+            "node": "Collecter les pages sources",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Conserver les métadonnées source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collecter les pages sources": {
+      "main": [
+        [
+          {
+            "node": "Conserver les métadonnées source",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Conserver les métadonnées source": {
+      "main": [
+        [
+          {
+            "node": "Extraire les liens candidats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraire les liens candidats": {
+      "main": [
+        [
+          {
+            "node": "Traiter les candidats un par un",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Traiter les candidats un par un": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Lire la page candidate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Conserver les candidats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lire la page candidate": {
+      "main": [
+        [
+          {
+            "node": "Conserver les candidats",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Conserver les candidats": {
+      "main": [
+        [
+          {
+            "node": "Préparer le texte candidat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Préparer le texte candidat": {
+      "main": [
+        [
+          {
+            "node": "Détecter une opportunité",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Conserver le résultat de détection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Détecter une opportunité": {
+      "main": [
+        [
+          {
+            "node": "Conserver le résultat de détection",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Conserver le résultat de détection": {
+      "main": [
+        [
+          {
+            "node": "Analyser la détection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyser la détection": {
+      "main": [
+        [
+          {
+            "node": "Est-ce une opportunité ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Est-ce une opportunité ?": {
+      "main": [
+        [
+          {
+            "node": "Extraire les données de l’offre",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Conserver les données extraites",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Traiter les candidats un par un",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraire les données de l’offre": {
+      "main": [
+        [
+          {
+            "node": "Conserver les données extraites",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Conserver les données extraites": {
+      "main": [
+        [
+          {
+            "node": "Valider et mapper vers EcoScan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valider et mapper vers EcoScan": {
+      "main": [
+        [
+          {
+            "node": "Données prêtes pour EcoScan ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Données prêtes pour EcoScan ?": {
+      "main": [
+        [
+          {
+            "node": "Envoyer l’offre à EcoScan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Traiter les candidats un par un",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Envoyer l’offre à EcoScan": {
+      "main": [
+        [
+          {
+            "node": "Traiter les candidats un par un",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "description": "Collecte quotidienne de pages officielles, extraction des opportunités et ingestion idempotente dans EcoScan. Configurez les variables d’environnement côté n8n avant activation."
+  },
+  "tags": []
+}

@@ -167,6 +167,7 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
+MEDIA_ROOT = Path(os.getenv("DJANGO_MEDIA_ROOT", BASE_DIR / "media"))
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 AUTH_USER_MODEL = "accounts.Utilisateur"
 
@@ -221,11 +222,17 @@ PAYDUNYA_TOKEN = os.getenv("PAYDUNYA_TOKEN", "")
 PAYDUNYA_MODE = os.getenv("PAYDUNYA_MODE", "test")
 
 DJANGO_INTERNAL_TOKEN = os.getenv("DJANGO_INTERNAL_TOKEN", "")
+AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://localhost:8001")
 AI_SERVICE_INTERNAL_TOKEN = os.getenv("AI_SERVICE_INTERNAL_TOKEN", "")
+AI_SERVICE_TIMEOUT = float(os.getenv("AI_SERVICE_TIMEOUT", "90"))
 N8N_INGESTION_TOKEN = os.getenv("N8N_INGESTION_TOKEN", "")
 N8N_SHARED_SECRET = os.getenv("N8N_SHARED_SECRET", "")
 N8N_RELANCE_WEBHOOK_URL = os.getenv("N8N_RELANCE_WEBHOOK_URL", "")
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
+PAYDUNYA_CALLBACK_URL = os.getenv(
+    "PAYDUNYA_CALLBACK_URL",
+    f"{BACKEND_BASE_URL.rstrip('/')}/api/billing/webhooks/paydunya/",
+)
 
 SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "False").lower() == "true"
 SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "False").lower() == "true"

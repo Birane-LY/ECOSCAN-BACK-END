@@ -1,0 +1,23 @@
+services:
+  n8n:
+    image: n8nio/n8n
+    container_name: ecoscan-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      TZ: ${TZ:-Africa/Dakar}
+      GENERIC_TIMEZONE: ${TZ:-Africa/Dakar}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      GROQ_API_KEY: ${GROQ_API_KEY:?Set GROQ_API_KEY in n8n/.env}
+      ECOSCAN_INGESTION_URL: ${ECOSCAN_INGESTION_URL:-http://host.docker.internal:8000/api/analyses/opportunites-financement/ingestion/}
+      N8N_INGESTION_TOKEN: ${N8N_INGESTION_TOKEN:?Set N8N_INGESTION_TOKEN in n8n/.env}
+      ECOSCAN_LLM_ENDPOINT: ${ECOSCAN_LLM_ENDPOINT:-https://api.groq.com/openai/v1/chat/completions}
+      ECOSCAN_FAST_MODEL: ${ECOSCAN_FAST_MODEL:-openai/gpt-oss-20b}
+      ECOSCAN_EXTRACTION_MODEL: ${ECOSCAN_EXTRACTION_MODEL:-openai/gpt-oss-20b}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
+    external: true

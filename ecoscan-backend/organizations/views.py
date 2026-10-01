@@ -19,6 +19,7 @@ from energy.models import DonneeEnergetique, Objectif
 from analysis.models import Anomalie, Recommandation, MemoireStrategique
 from accounts.models import Utilisateur
 from accounts.services import envoyer_email_activation
+from billing.services import BillingAccessService
 
 from .serializers import (
     OrganisationSerializer,
@@ -29,6 +30,7 @@ from .serializers import (
     CompteurSerializer,
     ConfigurationSecuriteSerializer,
 )
+from billing.permissions import EstAbonnementActif
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +51,12 @@ class EstMembreDeLOrganisation(permissions.BasePermission):
     """
 
     def has_permission(self, request, view):
-        return request.user and request.user.is_authenticated and request.user.actif
+        return (
+            request.user
+            and request.user.is_authenticated
+            and request.user.actif
+            and BillingAccessService().organisations_avec_acces(request.user).exists()
+        )
 
     def has_object_permission(self, request, view, obj):
         # Détermination dynamique de l'organisation selon l'objet ciblé
@@ -66,9 +73,9 @@ class EstMembreDeLOrganisation(permissions.BasePermission):
 
         # Le Super Admin doit lui aussi être affilié à l'organisation 
         # pour pouvoir consulter ou interagir avec ses objets métiers (Privacy by Design).
-        return UtilisateurOrganisation.objects.filter(
-            organisation=organisation,
-            utilisateur=request.user
+        return BillingAccessService().organisations_avec_acces(request.user).filter(
+            pk=organisation.pk,
+            membres__utilisateur=request.user,
         ).exists()
 
 
@@ -91,8 +98,9 @@ class PeutGererOrganisation(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         if getattr(request.user, "role", None) == "SUPER_ADMIN":
             return True
-        return UtilisateurOrganisation.objects.filter(
-            organisation=obj, utilisateur=request.user
+        return BillingAccessService().organisations_avec_acces(request.user).filter(
+            pk=obj.pk,
+            membres__utilisateur=request.user,
         ).exists()
 
 
@@ -110,7 +118,7 @@ class OrganisationScopedViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         # Récupération de la liste des organisations de l'utilisateur connecté
-        organisations = Organisation.objects.filter(membres__utilisateur=user)
+        organisations = BillingAccessService().organisations_avec_acces(user)
 
         # Application dynamique du filtre selon la profondeur de la relation dans le modèle
         if self.organisation_field == "organisation":
@@ -144,7 +152,11 @@ class OrganisationViewSet(viewsets.ModelViewSet):
             if defaut_paiement is not None:
                 queryset = queryset.filter(defaut_paiement=defaut_paiement.lower() in ("true", "1"))
             return queryset
-        return self.queryset.filter(membres__utilisateur=self.request.user).distinct()
+        return self.queryset.filter(
+            pk__in=BillingAccessService()
+            .organisations_avec_acces(self.request.user)
+            .values("pk")
+        )
 
     def perform_create(self, serializer):
         """Réservé aux ADMIN_ORGANISATION — un UTILISATEUR_ORGANISATION/CONSULTANT
@@ -191,6 +203,14 @@ class OrganisationViewSet(viewsets.ModelViewSet):
                 demande_en_attente = instance.statut == Organisation.Statut.EN_ATTENTE
                 if demande_en_attente and nouveau_statut != Organisation.Statut.ACTIVE:
                     raise PermissionDenied("Une demande en attente ne peut être qu’approuvée ou laissée en attente.")
+                if (
+                    demande_en_attente
+                    and nouveau_statut == Organisation.Statut.ACTIVE
+                    and instance.details_demande.get("inscription_autonome")
+                ):
+                    raise ValidationError(
+                        {"statut": "Le compte démarre son essai après activation du lien envoyé par e-mail."}
+                    )
                 if demande_en_attente and nouveau_statut == Organisation.Statut.ACTIVE:
                     from billing.models import Plan
                     plan_id_demande = instance.details_demande.get("plan_id")
@@ -310,17 +330,17 @@ class CompteurViewSet(OrganisationScopedViewSet):
 class ConfigurationSecuriteView(APIView):
     """GET accessible à tout membre de l'organisation (pour savoir si le 2FA
     est exigé) ; PATCH réservé aux admins."""
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
 
     def get(self, request):
-        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        organisation = BillingAccessService().organisations_avec_acces(request.user).first()
         if organisation is None:
             return Response({"error": "Aucune organisation associée."}, status=status.HTTP_409_CONFLICT)
         config, _ = ConfigurationSecurite.objects.get_or_create(organisation=organisation)
         return Response(ConfigurationSecuriteSerializer(config).data)
 
     def patch(self, request):
-        organisation = Organisation.objects.filter(membres__utilisateur=request.user).first()
+        organisation = BillingAccessService().organisations_avec_acces(request.user).first()
         if organisation is None:
             return Response({"error": "Aucune organisation associée."}, status=status.HTTP_409_CONFLICT)
 

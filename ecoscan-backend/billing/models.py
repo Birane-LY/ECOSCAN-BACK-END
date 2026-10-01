@@ -57,6 +57,7 @@ class Abonnement(models.Model):
 
     debut = models.DateTimeField()
     fin_periode = models.DateTimeField()
+    fin_grace = models.DateTimeField(null=True, blank=True)
     annule_le = models.DateTimeField(null=True, blank=True)
     fin_acces_si_annule = models.DateTimeField(null=True, blank=True)
 

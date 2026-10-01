@@ -30,10 +30,6 @@ class Recommandation(models.Model):
         on_delete=models.CASCADE,
         related_name="recommandations",
     )
-    # Anomalie à l'origine de la recommandation (nullable : une recommandation peut
-    # aussi être créée sans diagnostic). Ferme la boucle anomalie -> hypothèse ->
-    # recommandation -> actions -> mémoire : sans ce lien, « impossible de savoir
-    # quelle action a suivi quelle anomalie » (limite notée dans memory_service).
     anomalie = models.ForeignKey(
         "analysis.Anomalie",
         on_delete=models.SET_NULL,
@@ -112,8 +108,7 @@ class Action(models.Model):
 
     # Mesure d'impact réel (impact_service.py) — distincts de
     # Recommandation.economie_estimee, qui reste la prévision AVANT exécution.
-    # Restent à None tant qu'aucune mesure n'a été faite : ne jamais les
-    # confondre avec "aucun impact".
+    # Restent à None tant qu'aucune mesure n'a été faite 
     economie_realisee_fcfa = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     taux_realisation_impact = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     date_mesure_impact = models.DateTimeField(null=True, blank=True)

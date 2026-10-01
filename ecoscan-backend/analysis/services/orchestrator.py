@@ -121,7 +121,11 @@ def regenerer_hypotheses_manquantes(organisation) -> int:
     lors de la détection). Retourne le nombre d'hypothèses créées."""
     anomalies = Anomalie.objects.filter(
         organisation=organisation, hypotheses__isnull=True,
-        statut__in=(Anomalie.Statut.DETECTED, Anomalie.Statut.NEEDS_CONTEXT),
+        statut__in=(
+            Anomalie.Statut.DETECTED,
+            Anomalie.Statut.NEEDS_CONTEXT,
+            Anomalie.Statut.ACTION_CREATED,
+        ),
     )
     crees = 0
     for anomalie in anomalies:

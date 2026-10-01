@@ -225,6 +225,48 @@ REGISTRE_METRIQUES = {
         proprietaire="energy_analytics",
         version="1.0",
     ),
+    "consommation_woyofal_rituelle_08_20": DefinitionMetrique(
+        code="consommation_woyofal_rituelle_08_20",
+        nom="Consommation Woyofal mesurée entre 08 h et 20 h",
+        objectif="Suivre la consommation mesurée dans les créneaux du rituel énergétique.",
+        question_metier="Quelle énergie les points Woyofal ont-ils consommée entre 08 h et 20 h ?",
+        decision_associee="Établir une référence comparable sur les fenêtres journalières effectivement relevées.",
+        formule_description=(
+            "Somme, sur tous les points Woyofal de l'organisation, des trois intervalles "
+            "08–12, 12–16 et 16–20. Les recharges du créneau sont ajoutées au solde initial."
+        ),
+        unite="kWh",
+        frequence="quotidienne",
+        sources_requises=("releves_rituels_woyofal", "recharges_rituelles_woyofal"),
+        qualite_requise=QualiteRequise(completude_min=1.0, nombre_observations_min=4),
+        limites=(
+            "Mesure uniquement la fenêtre de 08 h à 20 h ; la consommation nocturne n'est pas observée.",
+            "Tous les créneaux et tous les points Woyofal de l'organisation doivent être relevés.",
+            "Les soldes sont saisis manuellement ; une recharge omise rend l'intervalle non calculable.",
+        ),
+        proprietaire="energy_analytics",
+        version="1.0",
+    ),
+    "variation_woyofal_rituelle_vs_moyenne_recente": DefinitionMetrique(
+        code="variation_woyofal_rituelle_vs_moyenne_recente",
+        nom="Variation Woyofal (08 h–20 h) par rapport aux jours précédents",
+        objectif="Détecter une dérive sur la fenêtre journalière couverte par les relevés rituels.",
+        question_metier="La consommation Woyofal entre 08 h et 20 h a-t-elle varié par rapport aux jours précédents ?",
+        decision_associee="Examiner un écart avant de proposer une action.",
+        formule_description="(consommation 08–20 du jour - moyenne des jours précédents) / moyenne × 100.",
+        unite="%",
+        frequence="quotidienne",
+        sources_requises=("consommation_woyofal_rituelle_08_20",),
+        qualite_requise=QualiteRequise(completude_min=1.0, nombre_observations_min=4),
+        baseline=DefinitionBaseline(type="moyenne_simple", parametres={"nombre_jours": 7}),
+        limites=(
+            "La comparaison porte sur 08 h–20 h, pas sur une journée complète.",
+            "Au moins 4 des 7 jours précédents doivent avoir tous leurs créneaux calculables.",
+            "La variation ne prouve pas sa cause ; l'hypothèse doit être validée par une personne.",
+        ),
+        proprietaire="energy_analytics",
+        version="1.0",
+    ),
 }
 
 
