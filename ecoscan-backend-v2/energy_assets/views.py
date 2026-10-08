@@ -21,6 +21,7 @@ from .serializers import (
     ProfilFonctionnementSerializer,
     ZoneSerializer,
 )
+from .services import synchroniser_etat_equipement
 
 
 class OrganisationScopedViewSet:
@@ -97,9 +98,10 @@ class MesureCapteurViewSet(
     def perform_create(self, serializer):
         capteur = serializer.validated_data["capteur"]
         with transaction.atomic():
-            serializer.save()
+            mesure = serializer.save()
             capteur.derniere_communication = timezone.now()
             capteur.save(update_fields=("derniere_communication",))
+            synchroniser_etat_equipement(mesure)
 
 
 class EtatEquipementViewSet(OrganisationScopedViewSet, viewsets.ReadOnlyModelViewSet):
