@@ -8,6 +8,7 @@ from .views import (
     EtatEquipementViewSet,
     MesureCapteurViewSet,
     ProfilFonctionnementViewSet,
+    SiteAnomaliesView,
     ZoneViewSet,
 )
 
@@ -31,5 +32,10 @@ router.register(
 router.register("etats-equipements", EtatEquipementViewSet, basename="etat-equipement")
 
 urlpatterns = [
+    path(
+        "sites/<uuid:site_id>/anomalies/",
+        SiteAnomaliesView.as_view(),
+        name="site-anomalies",
+    ),
     path("", include(router.urls)),
 ]
