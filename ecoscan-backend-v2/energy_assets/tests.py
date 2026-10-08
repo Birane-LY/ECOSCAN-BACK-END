@@ -262,6 +262,34 @@ class EnergyAssetApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("capteur", response.data)
 
+    def test_create_measurement_rejects_inactive_sensor(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Capteur hors service",
+            categorie="AUTRE",
+            puissance_nominale_kw="0.500",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="INACTIVE-001",
+            type="POWER",
+            statut=Capteur.Statut.INACTIVE,
+        )
+
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(sensor.id),
+                "valeur": "1.000000",
+                "unite": "kW",
+                "date_mesure": timezone.now().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("capteur", response.data)
+
 
 class EnergyAssetModelTests(TestCase):
     def setUp(self):
