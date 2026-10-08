@@ -1,0 +1,114 @@
+{
+  "name": "EcoScan - Notification des anomalies",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "anomalie-detectee",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "anomaly-webhook",
+      "name": "Recevoir une anomalie",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "9ed097cc-2ddd-4ddd-9384-6c15fc8b00a8"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst headers = input.headers ?? {};\nconst token = Object.entries(headers).find(([name]) => name.toLowerCase() === 'x-n8n-webhook-token')?.[1];\nconst expected = $env.N8N_WEBHOOK_TOKEN;\nif (!expected || !token || token !== expected) {\n  throw new Error('Unauthorized anomaly notification webhook request');\n}\n\nconst payload = input.body ?? input;\nconst anomaly = payload.anomalie;\nconst site = payload.site;\nconst organization = payload.organisation;\nconst recipients = organization?.emails_admin;\nif (!anomaly?.id || !site?.nom || !organization?.nom || !Array.isArray(recipients) || recipients.length === 0) {\n  throw new Error('Invalid anomaly notification payload');\n}\nif (recipients.some((email) => typeof email !== 'string' || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))) {\n  throw new Error('Invalid administrator email address in anomaly notification payload');\n}\n\nconst percent = `${anomaly.ecart_pourcentage}%`;\nconst direction = anomaly.type === 'consumption_drop' ? 'a diminué' : 'a augmenté';\nconst subject = `[EcoScan] Anomalie de consommation - ${site.nom}`;\nconst text = [\n  `Une anomalie de consommation ${direction} a été détectée pour ${site.nom} (${organization.nom}).`,\n  '',\n  `Sévérité : ${anomaly.severite}`,\n  `Écart : ${percent}`,\n  `Consommation observée : ${anomaly.valeur_observee} kWh`,\n  `Consommation attendue : ${anomaly.valeur_attendue} kWh`,\n  `Date de détection : ${anomaly.date_detection}`,\n  '',\n  `Consulter les anomalies du site : ${payload.url_api_anomalies}`,\n  `Identifiant de l'anomalie : ${anomaly.id}`\n].join('\\n');\n\nreturn [{ json: { recipients, subject, text } }];"
+      },
+      "id": "validate-and-format",
+      "name": "Vérifier et préparer l'alerte",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.ECOSCAN_NOTIFICATION_FROM_EMAIL }}",
+        "toEmail": "={{ $json.recipients.join(',') }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {}
+      },
+      "id": "send-email",
+      "name": "Envoyer l'alerte par e-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        500,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"ok\":true,\"event\":\"anomalie-detectee\",\"notification\":\"sent\"}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "webhook-response",
+      "name": "Confirmer l'envoi",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        760,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Recevoir une anomalie": {
+      "main": [
+        [
+          {
+            "node": "Vérifier et préparer l'alerte",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vérifier et préparer l'alerte": {
+      "main": [
+        [
+          {
+            "node": "Envoyer l'alerte par e-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Envoyer l'alerte par e-mail": {
+      "main": [
+        [
+          {
+            "node": "Confirmer l'envoi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5bcb0067-3587-4f2d-84eb-67959791764f",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

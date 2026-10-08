@@ -16,6 +16,7 @@ from analysis.services.anomaly import (
 )
 
 from .models import Capteur, MesureCapteur
+from .notifications import notifier_anomalie_detectee
 from .services import convertir_mesure
 
 
@@ -194,6 +195,10 @@ def analyser_anomalies_site(site, jour=None, maintenant=None):
         periode_fin=fin,
         defaults=metric_defaults,
     )
+    statut_anomalie_precedent = Anomalie.objects.filter(
+        organisation=site.organisation,
+        resultat_metrique=resultat_metrique,
+    ).values_list("statut", flat=True).first()
     anomalie = detecter_anomalie(resultat_metrique)
 
     if anomalie is None:
@@ -221,6 +226,13 @@ def analyser_anomalies_site(site, jour=None, maintenant=None):
     if anomalie.statut == Anomalie.Statut.RESOLVED:
         anomalie.statut = Anomalie.Statut.DETECTED
     anomalie.save(update_fields=(*champs, "statut"))
+    if statut_anomalie_precedent in (
+        None,
+        Anomalie.Statut.RESOLVED,
+    ):
+        transaction.on_commit(
+            lambda: notifier_anomalie_detectee(anomalie, site)
+        )
     return {
         "status": "anomaly_detected",
         "anomaly": anomalie,

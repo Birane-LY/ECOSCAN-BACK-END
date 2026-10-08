@@ -1,6 +1,7 @@
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from io import StringIO
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
@@ -852,6 +853,38 @@ class EnergyAssetAnomalyDetectionTests(TestCase):
             )
         return maintenant
 
+    def creer_admin_organisation(self):
+        admin = get_user_model().objects.create_user(
+            email="admin-anomalies@example.com",
+            password="test-password",
+            nom="Administrateur",
+            role="ADMIN_ORGANISATION",
+            actif=True,
+        )
+        UtilisateurOrganisation.objects.create(
+            organisation=self.site.organisation,
+            utilisateur=admin,
+        )
+
+    def modifier_consommation_jour_analyse(self, consommation):
+        debut = timezone.make_aware(
+            datetime.combine(self.date_analysee, time.min)
+        )
+        MesureCapteur.objects.filter(
+            capteur=self.sensor,
+            date_mesure__gte=debut,
+            date_mesure__lt=debut + timedelta(days=1),
+        ).order_by("date_mesure", "date_reception").update(
+            valeur="240.000000"
+        )
+        releve_final = MesureCapteur.objects.filter(
+            capteur=self.sensor,
+            date_mesure__gte=debut,
+            date_mesure__lt=debut + timedelta(days=1),
+        ).order_by("-date_mesure", "-date_reception").first()
+        releve_final.valeur = Decimal("240") + Decimal(consommation)
+        releve_final.save(update_fields=("valeur",))
+
     def test_anomaly_uses_four_same_weekdays_and_reuses_existing_event(self):
         maintenant = self.creer_releves_journaliers(ecart_jour_cible=36)
 
@@ -879,6 +912,82 @@ class EnergyAssetAnomalyDetectionTests(TestCase):
         self.assertEqual(repetition["anomaly"].id, anomalie.id)
         self.assertEqual(repetition["anomaly"].statut, Anomalie.Statut.CONFIRMED)
         self.assertEqual(Anomalie.objects.count(), 1)
+
+    @override_settings(BACKEND_BASE_URL="https://api.ecoscan.test")
+    def test_new_anomaly_notifies_organization_admin_once_through_n8n(self):
+        maintenant = self.creer_releves_journaliers(ecart_jour_cible=36)
+        self.creer_admin_organisation()
+
+        with patch(
+            "energy_assets.notifications._post_event",
+            return_value=False,
+        ) as post_event:
+            with self.captureOnCommitCallbacks(execute=True):
+                resultat = analyser_anomalies_site(
+                    self.site,
+                    jour=self.date_analysee,
+                    maintenant=maintenant,
+                )
+                repetition = analyser_anomalies_site(
+                    self.site,
+                    jour=self.date_analysee,
+                    maintenant=maintenant,
+                )
+
+        self.assertEqual(resultat["status"], "anomaly_detected")
+        self.assertEqual(repetition["status"], "anomaly_detected")
+        post_event.assert_called_once()
+        chemin, payload = post_event.call_args.args
+        self.assertEqual(chemin, "/anomalie-detectee")
+        self.assertEqual(
+            payload["organisation"]["emails_admin"],
+            ["admin-anomalies@example.com"],
+        )
+        self.assertEqual(payload["site"]["id"], str(self.site.id))
+        self.assertEqual(
+            payload["anomalie"]["id"],
+            str(resultat["anomaly"].id),
+        )
+        self.assertEqual(
+            payload["url_api_anomalies"],
+            f"https://api.ecoscan.test/api/energy-assets/sites/{self.site.id}/anomalies/",
+        )
+
+    def test_resolved_anomaly_notifies_again_when_redetected(self):
+        maintenant = self.creer_releves_journaliers(ecart_jour_cible=36)
+        self.creer_admin_organisation()
+
+        with patch(
+            "energy_assets.notifications._post_event",
+            return_value=True,
+        ) as post_event:
+            with self.captureOnCommitCallbacks(execute=True):
+                anomalie_initiale = analyser_anomalies_site(
+                    self.site,
+                    jour=self.date_analysee,
+                    maintenant=maintenant,
+                )
+                self.modifier_consommation_jour_analyse(32)
+                resultat_normal = analyser_anomalies_site(
+                    self.site,
+                    jour=self.date_analysee,
+                    maintenant=maintenant,
+                )
+                self.modifier_consommation_jour_analyse(36)
+                anomalie_reactivee = analyser_anomalies_site(
+                    self.site,
+                    jour=self.date_analysee,
+                    maintenant=maintenant,
+                )
+
+        self.assertEqual(anomalie_initiale["status"], "anomaly_detected")
+        self.assertEqual(resultat_normal["status"], "normal")
+        self.assertEqual(anomalie_reactivee["status"], "anomaly_detected")
+        self.assertEqual(
+            anomalie_reactivee["anomaly"].statut,
+            Anomalie.Statut.DETECTED,
+        )
+        self.assertEqual(post_event.call_count, 2)
 
     def test_anomaly_severity_matches_existing_percentage_thresholds(self):
         self.assertEqual(
