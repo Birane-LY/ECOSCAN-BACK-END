@@ -7,6 +7,7 @@ from billing.services import BillingAccessService
 
 from .models import (
     Capteur,
+    CommandeEquipement,
     Equipement,
     EtatEquipement,
     MesureCapteur,
@@ -15,6 +16,7 @@ from .models import (
 )
 from .serializers import (
     CapteurSerializer,
+    CommandeEquipementSerializer,
     EquipementSerializer,
     EtatEquipementSerializer,
     MesureCapteurSerializer,
@@ -102,6 +104,22 @@ class MesureCapteurViewSet(
             capteur.derniere_communication = timezone.now()
             capteur.save(update_fields=("derniere_communication",))
             synchroniser_etat_equipement(mesure)
+
+
+class CommandeEquipementViewSet(
+    OrganisationScopedViewSet,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Expose les demandes de commande sans exécuter de commande matérielle."""
+
+    organisation_lookup = "equipement__site__organisation"
+    queryset = CommandeEquipement.objects.select_related(
+        "equipement__site__organisation",
+        "demande_par",
+    ).order_by("-date_creation")
+    serializer_class = CommandeEquipementSerializer
 
 
 class EtatEquipementViewSet(OrganisationScopedViewSet, viewsets.ReadOnlyModelViewSet):
