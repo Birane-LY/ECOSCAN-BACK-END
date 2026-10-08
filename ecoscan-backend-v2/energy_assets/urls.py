@@ -5,6 +5,7 @@ from .views import (
     CapteurViewSet,
     EquipementViewSet,
     EtatEquipementViewSet,
+    MesureCapteurViewSet,
     ProfilFonctionnementViewSet,
     ZoneViewSet,
 )
@@ -20,6 +21,7 @@ router.register(
     basename="profil-fonctionnement",
 )
 router.register("capteurs", CapteurViewSet, basename="capteur")
+router.register("mesures", MesureCapteurViewSet, basename="mesure")
 router.register("etats-equipements", EtatEquipementViewSet, basename="etat-equipement")
 
 urlpatterns = [
