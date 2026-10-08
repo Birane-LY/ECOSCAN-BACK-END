@@ -8,3 +8,6 @@ staticfiles/
 test_upload.py
 test_ocr.py
 fichiers-sources/
+gateway/.env
+gateway/equipment-entities.json
+gateway/data/
