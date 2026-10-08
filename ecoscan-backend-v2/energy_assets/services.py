@@ -128,6 +128,19 @@ def demander_commande(equipement, action, utilisateur):
 
 
 @transaction.atomic
+def prendre_prochaine_commande():
+    commande = (
+        CommandeEquipement.objects.select_for_update()
+        .filter(statut=CommandeEquipement.Statut.PENDING)
+        .order_by("date_creation", "id")
+        .first()
+    )
+    if commande is None:
+        return None
+    return marquer_commande_envoyee(commande)
+
+
+@transaction.atomic
 def marquer_commande_envoyee(commande):
     commande = CommandeEquipement.objects.select_for_update().get(pk=commande.pk)
     if commande.statut != CommandeEquipement.Statut.PENDING:
