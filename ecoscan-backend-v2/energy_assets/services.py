@@ -52,6 +52,7 @@ def synchroniser_etat_equipement(mesure):
     ):
         return
 
+    etat.date_etat_rapporte = mesure.date_mesure
     fields_to_update = ["date_etat_rapporte"]
     if type_mesure == "POWER":
         etat.puissance_actuelle_kw = valeur_standard
