@@ -186,6 +186,238 @@ class EnergyAssetApiTests(APITestCase):
         sensor.refresh_from_db()
         self.assertIsNotNone(sensor.derniere_communication)
 
+    def test_power_measurement_converts_watts_and_synchronizes_reported_state(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation",
+            categorie="VENTILATION",
+            puissance_nominale_kw="2.000",
+        )
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="POWER-VENT-001",
+            type="POWER",
+        )
+
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(sensor.id),
+                "valeur": "450.000000",
+                "unite": "W",
+                "date_mesure": timezone.now().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        state.refresh_from_db()
+        self.assertEqual(str(state.puissance_actuelle_kw), "0.450")
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(
+            state.statut_synchronisation,
+            EtatEquipement.StatutSynchronisation.SYNCHRONIZED,
+        )
+
+    def test_zero_power_marks_equipment_off_and_out_of_sync(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Pompe",
+            categorie="POMPE",
+            puissance_nominale_kw="1.000",
+        )
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="POWER-POMPE-001",
+            type="POWER",
+        )
+
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(sensor.id),
+                "valeur": "0",
+                "unite": "kW",
+                "date_mesure": timezone.now().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        state.refresh_from_db()
+        self.assertEqual(state.puissance_actuelle_kw, 0)
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.OFF)
+        self.assertEqual(
+            state.statut_synchronisation,
+            EtatEquipement.StatutSynchronisation.OUT_OF_SYNC,
+        )
+
+    def test_energy_measurement_converts_watt_hours_without_changing_power_state(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compteur",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="1.000",
+        )
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="0.300",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="ENERGY-COMPTEUR-001",
+            type="ENERGY",
+        )
+
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(sensor.id),
+                "valeur": "2500",
+                "unite": "Wh",
+                "date_mesure": timezone.now().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        state.refresh_from_db()
+        self.assertEqual(str(state.energie_cumulee_kwh), "2.500000")
+        self.assertEqual(str(state.puissance_actuelle_kw), "0.300")
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(
+            state.statut_synchronisation,
+            EtatEquipement.StatutSynchronisation.UNKNOWN,
+        )
+
+    def test_older_power_measurement_does_not_replace_current_state(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Moteur",
+            categorie="MOTEUR",
+            puissance_nominale_kw="2.000",
+        )
+        state = EtatEquipement.objects.create(equipement=equipment)
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="POWER-MOTEUR-001",
+            type="POWER",
+        )
+        measured_at = timezone.now()
+        for value, timestamp in (
+            ("0.700", measured_at),
+            ("0", measured_at - timedelta(minutes=1)),
+        ):
+            response = self.client.post(
+                "/api/energy-assets/mesures/",
+                {
+                    "capteur": str(sensor.id),
+                    "valeur": value,
+                    "unite": "kW",
+                    "date_mesure": timestamp.isoformat(),
+                },
+                format="json",
+            )
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_201_CREATED,
+                response.data,
+            )
+            state.refresh_from_db()
+            if value == "0.700":
+                self.assertEqual(
+                    str(state.puissance_actuelle_kw),
+                    "0.700",
+                    f"response={response.data}; state={state.__dict__}",
+                )
+
+        state.refresh_from_db()
+        self.assertEqual(
+            str(state.puissance_actuelle_kw),
+            "0.700",
+            f"reported_at={state.date_etat_rapporte}; expected={measured_at}",
+        )
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(state.date_etat_rapporte, measured_at)
+
+    def test_power_measurement_rejects_unknown_unit_and_negative_value(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Climatiseur",
+            categorie="CLIMATISATION",
+            puissance_nominale_kw="1.000",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="POWER-CLIM-001",
+            type="POWER",
+        )
+
+        for value, unit in (("1", "V"), ("-1", "kW")):
+            response = self.client.post(
+                "/api/energy-assets/mesures/",
+                {
+                    "capteur": str(sensor.id),
+                    "valeur": value,
+                    "unite": unit,
+                    "date_mesure": timezone.now().isoformat(),
+                },
+                format="json",
+            )
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_400_BAD_REQUEST,
+                response.data,
+            )
+
+        self.assertEqual(MesureCapteur.objects.count(), 0)
+
+    def test_other_sensor_types_are_stored_without_changing_equipment_state(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Local technique",
+            categorie="AUTRE",
+            puissance_nominale_kw="0.500",
+        )
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="0.250",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="TEMP-LOCAL-001",
+            type="TEMPERATURE",
+        )
+        reported_at = state.date_etat_rapporte
+
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(sensor.id),
+                "valeur": "24.5",
+                "unite": "°C",
+                "date_mesure": timezone.now().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(str(state.puissance_actuelle_kw), "0.250")
+        self.assertEqual(state.date_etat_rapporte, reported_at)
+
     def test_sensor_measurements_are_scoped_to_accessible_organizations(self):
         allowed_equipment = Equipement.objects.create(
             site=self.site,
