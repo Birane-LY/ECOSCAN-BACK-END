@@ -335,20 +335,84 @@ class EnergyAssetApiTests(APITestCase):
             )
             state.refresh_from_db()
             if value == "0.700":
-                self.assertEqual(
-                    str(state.puissance_actuelle_kw),
-                    "0.700",
-                    f"response={response.data}; state={state.__dict__}",
-                )
+                self.assertEqual(str(state.puissance_actuelle_kw), "0.700")
 
         state.refresh_from_db()
-        self.assertEqual(
-            str(state.puissance_actuelle_kw),
-            "0.700",
-            f"reported_at={state.date_etat_rapporte}; expected={measured_at}",
-        )
+        self.assertEqual(str(state.puissance_actuelle_kw), "0.700")
         self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
         self.assertEqual(state.date_etat_rapporte, measured_at)
+
+    def test_power_and_energy_measurements_keep_independent_latest_values(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Centrale technique",
+            categorie="AUTRE",
+            puissance_nominale_kw="3.000",
+        )
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="0.300",
+            energie_cumulee_kwh="1.000000",
+        )
+        power_sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="POWER-CENTRALE-001",
+            type="POWER",
+        )
+        energy_sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="ENERGY-CENTRALE-001",
+            type="ENERGY",
+        )
+        power_at = timezone.now() - timedelta(minutes=2)
+        MesureCapteur.objects.create(
+            capteur=power_sensor,
+            valeur="0.300",
+            unite="kW",
+            date_mesure=power_at,
+        )
+        state.date_etat_rapporte = power_at
+        state.save(update_fields=("date_etat_rapporte",))
+
+        energy_at = timezone.now()
+        for value, timestamp in (
+            ("2.000000", energy_at),
+            ("1.500000", energy_at - timedelta(minutes=1)),
+        ):
+            response = self.client.post(
+                "/api/energy-assets/mesures/",
+                {
+                    "capteur": str(energy_sensor.id),
+                    "valeur": value,
+                    "unite": "kWh",
+                    "date_mesure": timestamp.isoformat(),
+                },
+                format="json",
+            )
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_201_CREATED,
+                response.data,
+            )
+
+        newer_power_at = energy_at - timedelta(seconds=30)
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(power_sensor.id),
+                "valeur": "0.750",
+                "unite": "kW",
+                "date_mesure": newer_power_at.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        state.refresh_from_db()
+        self.assertEqual(str(state.puissance_actuelle_kw), "0.750")
+        self.assertEqual(str(state.energie_cumulee_kwh), "2.000000")
+        self.assertEqual(state.date_etat_rapporte, newer_power_at)
 
     def test_power_measurement_rejects_unknown_unit_and_negative_value(self):
         equipment = Equipement.objects.create(
