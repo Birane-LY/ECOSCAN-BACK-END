@@ -1,3 +1,5 @@
+"""Calcul des indicateurs de monitoring et de consommation des sites."""
+
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -12,10 +14,12 @@ ZERO_KW = Decimal("0.000")
 
 
 def _maintenant():
+    """Retourne l'heure courante, isolée pour faciliter les tests."""
     return timezone.now()
 
 
 def _equipements_suivis(site):
+    """Retourne les équipements suivis du site avec leurs relations utiles."""
     return (
         Equipement.objects.filter(site=site, monitoring_active=True)
         .select_related("zone", "etat")
@@ -24,6 +28,7 @@ def _equipements_suivis(site):
 
 
 def _est_hors_ligne(equipement, date_limite):
+    """Indique si aucun capteur actif de l'équipement n'a communiqué récemment."""
     capteurs_actifs = [
         capteur
         for capteur in equipement.capteurs.all()
@@ -37,11 +42,13 @@ def _est_hors_ligne(equipement, date_limite):
 
 
 def _puissance_actuelle(equipement):
+    """Retourne la puissance courante de l'équipement, ou zéro si inconnue."""
     etat = _etat_equipement(equipement)
     return etat.puissance_actuelle_kw if etat else ZERO_KW
 
 
 def _etat_equipement(equipement):
+    """Retourne l'état associé à l'équipement, s'il existe."""
     try:
         return equipement.etat
     except EtatEquipement.DoesNotExist:
@@ -49,11 +56,13 @@ def _etat_equipement(equipement):
 
 
 def _debut_journee(jour):
+    """Construit l'instant local correspondant au début du jour donné."""
     debut = datetime.combine(jour, datetime.min.time())
     return timezone.make_aware(debut, timezone.get_current_timezone())
 
 
 def _consommation_periode(capteurs, debut, fin):
+    """Calcule l'énergie consommée à partir des index cumulés des capteurs."""
     total = Decimal("0")
     total_capteurs = len(capteurs)
     capteurs_complets = 0
@@ -103,10 +112,8 @@ def _consommation_periode(capteurs, debut, fin):
     }
 
 
-
-
-
 def obtenir_indicateurs_site(site):
+    """Agrège les indicateurs de monitoring et les consommateurs du site."""
     maintenant = _maintenant()
     aujourd_hui = timezone.localdate(maintenant)
     debut_aujourd_hui = _debut_journee(aujourd_hui)

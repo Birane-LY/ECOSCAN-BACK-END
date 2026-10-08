@@ -1,3 +1,5 @@
+"""Services métier pour les mesures, états et commandes des équipements."""
+
 from decimal import Decimal
 
 from django.db import transaction
@@ -13,6 +15,7 @@ from .models import (
 
 
 def _actualiser_statut_synchronisation(etat):
+    """Met à jour la synchronisation selon les états souhaité et rapporté."""
     if etat.etat_rapporte == Equipement.Etat.UNKNOWN:
         etat.statut_synchronisation = EtatEquipement.StatutSynchronisation.UNKNOWN
     elif etat.etat_rapporte == etat.etat_souhaite:
@@ -26,6 +29,7 @@ def _actualiser_statut_synchronisation(etat):
 
 
 def convertir_mesure(type_capteur, valeur, unite):
+    """Valide et convertit une mesure en kW ou kWh selon son type."""
     type_capteur = type_capteur.strip().upper()
     unite = unite.strip().casefold()
 
@@ -52,6 +56,7 @@ def convertir_mesure(type_capteur, valeur, unite):
 
 @transaction.atomic
 def synchroniser_etat_equipement(mesure):
+    """Synchronise l'état de l'équipement depuis sa mesure la plus récente."""
     conversion = convertir_mesure(
         mesure.capteur.type,
         mesure.valeur,
@@ -105,6 +110,7 @@ def synchroniser_etat_equipement(mesure):
 
 @transaction.atomic
 def demander_commande(equipement, action, utilisateur):
+    """Enregistre une demande de commande et met à jour l'état souhaité."""
     equipement = Equipement.objects.select_for_update().get(pk=equipement.pk)
     etat, _ = EtatEquipement.objects.get_or_create(equipement=equipement)
     maintenant = timezone.now()
@@ -129,6 +135,7 @@ def demander_commande(equipement, action, utilisateur):
 
 @transaction.atomic
 def prendre_prochaine_commande():
+    """Réserve la prochaine commande en attente et la marque comme envoyée."""
     commande = (
         CommandeEquipement.objects.select_for_update()
         .filter(statut=CommandeEquipement.Statut.PENDING)
@@ -142,6 +149,7 @@ def prendre_prochaine_commande():
 
 @transaction.atomic
 def marquer_commande_envoyee(commande):
+    """Passe une commande en attente à l'état envoyée."""
     commande = CommandeEquipement.objects.select_for_update().get(pk=commande.pk)
     if commande.statut != CommandeEquipement.Statut.PENDING:
         raise ValueError("Seule une commande en attente peut être envoyée.")
@@ -154,6 +162,7 @@ def marquer_commande_envoyee(commande):
 
 @transaction.atomic
 def confirmer_commande(commande):
+    """Confirme une commande envoyée et synchronise l'état rapporté."""
     commande = CommandeEquipement.objects.select_for_update().get(pk=commande.pk)
     if commande.statut != CommandeEquipement.Statut.SENT:
         raise ValueError("Seule une commande envoyée peut être confirmée.")
@@ -182,6 +191,7 @@ def confirmer_commande(commande):
 
 @transaction.atomic
 def echouer_commande(commande, detail):
+    """Marque une commande en attente ou envoyée comme échouée."""
     commande = CommandeEquipement.objects.select_for_update().get(pk=commande.pk)
     if commande.statut not in (
         CommandeEquipement.Statut.PENDING,
