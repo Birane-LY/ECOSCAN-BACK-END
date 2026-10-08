@@ -3,7 +3,14 @@ from rest_framework import serializers
 from billing.services import BillingAccessService
 from organizations.models import Organisation, Site
 
-from .models import Capteur, Equipement, EtatEquipement, ProfilFonctionnement, Zone
+from .models import (
+    Capteur,
+    Equipement,
+    EtatEquipement,
+    MesureCapteur,
+    ProfilFonctionnement,
+    Zone,
+)
 
 
 class OrganisationAccessibleSerializer(serializers.ModelSerializer):
@@ -66,6 +73,28 @@ class CapteurSerializer(OrganisationAccessibleSerializer):
 
     def validate_equipement(self, value):
         return self._valider_equipement_accessible(value)
+
+
+class MesureCapteurSerializer(OrganisationAccessibleSerializer):
+    """Sérialiseur pour l'ingestion des mesures des capteurs."""
+
+    class Meta:
+        model = MesureCapteur
+        fields = (
+            "id",
+            "capteur",
+            "valeur",
+            "unite",
+            "date_mesure",
+            "date_reception",
+        )
+        read_only_fields = ("id", "date_reception")
+
+    def validate_capteur(self, value):
+        self._valider_equipement_accessible(value.equipement)
+        if value.statut != Capteur.Statut.ACTIVE:
+            raise serializers.ValidationError("Ce capteur est inactif.")
+        return value
 
 
 class ProfilFonctionnementSerializer(OrganisationAccessibleSerializer):
