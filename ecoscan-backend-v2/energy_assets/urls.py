@@ -3,6 +3,7 @@ from rest_framework.routers import SimpleRouter
 
 from .views import (
     CapteurViewSet,
+    CommandeEquipementViewSet,
     EquipementViewSet,
     EtatEquipementViewSet,
     MesureCapteurViewSet,
@@ -22,6 +23,11 @@ router.register(
 )
 router.register("capteurs", CapteurViewSet, basename="capteur")
 router.register("mesures", MesureCapteurViewSet, basename="mesure")
+router.register(
+    "commandes",
+    CommandeEquipementViewSet,
+    basename="commande-equipement",
+)
 router.register("etats-equipements", EtatEquipementViewSet, basename="etat-equipement")
 
 urlpatterns = [
