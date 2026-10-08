@@ -27,6 +27,8 @@ class CommandeInterneSerializer(serializers.ModelSerializer):
             "statut",
             "date_creation",
             "date_envoi",
+            "date_finalisation",
+            "detail_echec",
         )
 
 
@@ -34,10 +36,15 @@ class EchecCommandeSerializer(serializers.Serializer):
     detail = serializers.CharField(allow_blank=False, trim_whitespace=True)
 
 
-class ProchaineCommandeInterneView(APIView):
+class ServiceInterneAPIView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny, JetonServiceInternePermission]
 
+    def get_authenticate_header(self, request):
+        return "X-Internal-Service-Token"
+
+
+class ProchaineCommandeInterneView(ServiceInterneAPIView):
     def post(self, request):
         commande = prendre_prochaine_commande()
         if commande is None:
@@ -45,9 +52,7 @@ class ProchaineCommandeInterneView(APIView):
         return Response(CommandeInterneSerializer(commande).data)
 
 
-class TransitionCommandeInterneView(APIView):
-    authentication_classes = []
-    permission_classes = [AllowAny, JetonServiceInternePermission]
+class TransitionCommandeInterneView(ServiceInterneAPIView):
     transition = None
 
     def post(self, request, commande_id):
