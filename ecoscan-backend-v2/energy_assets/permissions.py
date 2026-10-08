@@ -1,6 +1,7 @@
 import secrets
 
 from django.conf import settings
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.permissions import BasePermission
 
 
@@ -10,4 +11,6 @@ class JetonServiceInternePermission(BasePermission):
     def has_permission(self, request, view):
         attendu = getattr(settings, "DJANGO_INTERNAL_TOKEN", "") or ""
         recu = request.headers.get("X-Internal-Service-Token", "")
-        return bool(attendu) and secrets.compare_digest(recu, attendu)
+        if not attendu or not secrets.compare_digest(recu, attendu):
+            raise AuthenticationFailed("Jeton de service invalide.")
+        return True
