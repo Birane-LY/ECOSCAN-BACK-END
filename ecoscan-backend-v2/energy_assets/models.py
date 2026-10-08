@@ -178,6 +178,33 @@ class Capteur(models.Model):
         return self.identifiant
 
 
+class MesureCapteur(models.Model):
+    """Enregistre une mesure horodatée reçue d'un capteur."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    capteur = models.ForeignKey(
+        Capteur,
+        on_delete=models.CASCADE,
+        related_name="mesures",
+    )
+    valeur = models.DecimalField(max_digits=20, decimal_places=6)
+    unite = models.CharField(max_length=24, blank=True)
+    date_mesure = models.DateTimeField()
+    date_reception = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_mesure",)
+        indexes = [
+            models.Index(
+                fields=("capteur", "date_mesure"),
+                name="mesure_capteur_date_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.capteur.identifiant} — {self.valeur} {self.unite}".strip()
+
+
 class EtatEquipement(models.Model):
     """Conserve l'état souhaité, l'état rapporté et les dernières mesures d'un équipement."""
 
