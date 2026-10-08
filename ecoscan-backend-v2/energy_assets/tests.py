@@ -1,6 +1,10 @@
 from datetime import timedelta
+from decimal import Decimal
+from io import StringIO
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -24,6 +28,10 @@ from .services import (
     demander_commande,
     echouer_commande,
     marquer_commande_envoyee,
+)
+from .simulation import (
+    generer_mesure_simulee,
+    generer_mesures_capteurs_simules,
 )
 
 
@@ -819,6 +827,132 @@ class EnergyAssetModelTests(TestCase):
         self.assertEqual(mesures[0].unite, "°C")
         self.assertIsNotNone(mesures[0].date_reception)
         self.assertEqual(str(mesures[1].valeur), "-2.500000")
+
+    def test_simulated_power_sensor_generates_due_telemetry_and_updates_state(self):
+        equipment = self.create_equipment()
+        state = EtatEquipement.objects.create(equipement=equipment)
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-POWER-CLIM-001",
+            type="POWER",
+        )
+        now = timezone.now()
+
+        measurement = generer_mesure_simulee(sensor.id, maintenant=now)
+
+        self.assertEqual(measurement.valeur, Decimal(equipment.puissance_nominale_kw))
+        self.assertEqual(measurement.unite, "kW")
+        self.assertEqual(measurement.date_mesure, now)
+        self.assertIsNone(
+            generer_mesure_simulee(
+                sensor.id,
+                maintenant=now + timedelta(seconds=14),
+            )
+        )
+        prochaine_mesure = generer_mesure_simulee(
+            sensor.id,
+            maintenant=now + timedelta(seconds=15),
+        )
+        self.assertIsNotNone(prochaine_mesure)
+        state.refresh_from_db()
+        sensor.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(
+            state.puissance_actuelle_kw,
+            Decimal(equipment.puissance_nominale_kw),
+        )
+        self.assertEqual(sensor.derniere_communication, now + timedelta(seconds=15))
+
+    def test_simulated_power_sensor_uses_standby_power_when_requested_off(self):
+        equipment = self.create_equipment(puissance_veille_kw="0.125")
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.OFF,
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-POWER-OFF-001",
+            type="POWER",
+        )
+
+        measurement = generer_mesure_simulee(sensor.id)
+
+        self.assertEqual(measurement.valeur, Decimal("0.125"))
+        self.assertEqual(measurement.unite, "kW")
+
+    def test_simulated_energy_sensor_integrates_power_since_previous_reading(self):
+        equipment = self.create_equipment(puissance_nominale_kw="1.500")
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-ENERGY-CLIM-001",
+            type="ENERGY",
+        )
+        start = timezone.now()
+        MesureCapteur.objects.create(
+            capteur=sensor,
+            valeur="3.000000",
+            unite="kWh",
+            date_mesure=start,
+        )
+
+        measurement = generer_mesure_simulee(
+            sensor.id,
+            maintenant=start + timedelta(seconds=15),
+        )
+
+        self.assertEqual(measurement.valeur, Decimal("3.006250"))
+        self.assertEqual(measurement.unite, "kWh")
+        state.refresh_from_db()
+        self.assertEqual(state.energie_cumulee_kwh, Decimal("3.006250"))
+
+    def test_simulator_ignores_real_and_unsupported_sensors(self):
+        equipment = self.create_equipment()
+        real_sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="REAL-POWER-CLIM-001",
+            type="POWER",
+            mode=Capteur.Mode.REAL,
+        )
+        unsupported_sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-TEMP-CLIM-001",
+            type="TEMPERATURE",
+        )
+
+        self.assertIsNone(generer_mesure_simulee(real_sensor.id))
+        self.assertIsNone(generer_mesure_simulee(unsupported_sensor.id))
+        self.assertEqual(MesureCapteur.objects.count(), 0)
+
+    def test_simulator_management_command_can_run_one_cycle(self):
+        equipment = self.create_equipment()
+        Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-POWER-ONCE-001",
+            type="POWER",
+        )
+        output = StringIO()
+
+        call_command("simuler_capteurs", "--once", stdout=output)
+
+        self.assertIn("Mesures simulées générées : 1", output.getvalue())
+        self.assertEqual(MesureCapteur.objects.count(), 1)
+
+    def test_simulator_rejects_non_positive_frequency_and_loop_interval(self):
+        sensor = Capteur.objects.create(
+            equipement=self.create_equipment(),
+            identifiant="SIM-POWER-FREQ-001",
+            type="POWER",
+            frequence_secondes=0,
+        )
+        with self.assertRaisesMessage(ValueError, "fréquence positive"):
+            generer_mesure_simulee(sensor.id)
+
+        with self.assertRaisesMessage(CommandError, "intervalle"):
+            call_command("simuler_capteurs", "--interval", "0")
 
     def test_equipment_rejects_negative_nominal_power(self):
         with self.assertRaises(IntegrityError):
