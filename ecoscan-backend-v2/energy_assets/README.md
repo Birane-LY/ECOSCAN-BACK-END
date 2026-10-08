@@ -2,6 +2,17 @@
 
 ## Capteur simulator
 
+From the `ecoscan-backend-v2` directory, initialize or update the database
+schema before the first run:
+
+```powershell
+python manage.py migrate
+```
+
+The simulator needs the V2 `energy_assets` tables created by these migrations.
+Use the same Python environment and database configuration for migration and
+simulation.
+
 Run the simulator as a separate process alongside Django:
 
 ```powershell
