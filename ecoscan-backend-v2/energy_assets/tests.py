@@ -154,6 +154,114 @@ class EnergyAssetApiTests(APITestCase):
             [str(allowed_equipment.id)],
         )
 
+    def test_create_sensor_measurement_updates_communication_timestamp(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compteur principal",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="1.000",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="REAL-COMPTEUR-001",
+            type="POWER",
+        )
+        measured_at = timezone.now()
+
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(sensor.id),
+                "valeur": "0.450000",
+                "unite": "kW",
+                "date_mesure": measured_at.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["valeur"], "0.450000")
+        self.assertEqual(response.data["unite"], "kW")
+        self.assertIsNotNone(response.data["date_reception"])
+        sensor.refresh_from_db()
+        self.assertIsNotNone(sensor.derniere_communication)
+
+    def test_sensor_measurements_are_scoped_to_accessible_organizations(self):
+        allowed_equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Équipement autorisé",
+            categorie="AUTRE",
+            puissance_nominale_kw="0.500",
+        )
+        allowed_sensor = Capteur.objects.create(
+            equipement=allowed_equipment,
+            identifiant="SIM-AUTORISE-001",
+            type="ENERGY",
+        )
+        allowed_measurement = MesureCapteur.objects.create(
+            capteur=allowed_sensor,
+            valeur="1.000000",
+            unite="kWh",
+            date_mesure=timezone.now(),
+        )
+
+        other_organisation = self.create_organisation("Organisation étrangère")
+        other_site = self.create_site(other_organisation, "Site étranger")
+        other_equipment = Equipement.objects.create(
+            site=other_site,
+            nom="Équipement étranger",
+            categorie="AUTRE",
+            puissance_nominale_kw="0.500",
+        )
+        other_sensor = Capteur.objects.create(
+            equipement=other_equipment,
+            identifiant="SIM-ETRANGER-001",
+            type="ENERGY",
+        )
+        MesureCapteur.objects.create(
+            capteur=other_sensor,
+            valeur="2.000000",
+            unite="kWh",
+            date_mesure=timezone.now(),
+        )
+
+        response = self.client.get("/api/energy-assets/mesures/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item["id"] for item in response.data["results"]],
+            [str(allowed_measurement.id)],
+        )
+
+    def test_create_measurement_rejects_sensor_from_another_organization(self):
+        other_organisation = self.create_organisation("Organisation étrangère")
+        other_site = self.create_site(other_organisation, "Site étranger")
+        other_equipment = Equipement.objects.create(
+            site=other_site,
+            nom="Équipement étranger",
+            categorie="AUTRE",
+            puissance_nominale_kw="0.500",
+        )
+        other_sensor = Capteur.objects.create(
+            equipement=other_equipment,
+            identifiant="REAL-ETRANGER-001",
+            type="POWER",
+        )
+
+        response = self.client.post(
+            "/api/energy-assets/mesures/",
+            {
+                "capteur": str(other_sensor.id),
+                "valeur": "1.000000",
+                "unite": "kW",
+                "date_mesure": timezone.now().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("capteur", response.data)
+
 
 class EnergyAssetModelTests(TestCase):
     def setUp(self):
