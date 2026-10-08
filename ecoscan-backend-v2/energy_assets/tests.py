@@ -10,7 +10,14 @@ from rest_framework.test import APITestCase
 from billing.models import Abonnement, Plan
 from organizations.models import Organisation, Site, UtilisateurOrganisation
 
-from .models import Capteur, Equipement, EtatEquipement, ProfilFonctionnement, Zone
+from .models import (
+    Capteur,
+    Equipement,
+    EtatEquipement,
+    MesureCapteur,
+    ProfilFonctionnement,
+    Zone,
+)
 
 
 class EnergyAssetApiTests(APITestCase):
@@ -197,6 +204,38 @@ class EnergyAssetModelTests(TestCase):
         self.assertEqual(profile.equipement, equipment)
         self.assertEqual(state.etat_souhaite, Equipement.Etat.UNKNOWN)
         self.assertEqual(state.etat_rapporte, Equipement.Etat.UNKNOWN)
+
+    def test_sensor_measurements_keep_signed_values_and_order_by_measurement_time(self):
+        equipment = self.create_equipment()
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="REAL-CLIM-001",
+            type="TEMPERATURE",
+        )
+        maintenant = timezone.now()
+        mesure_recente = MesureCapteur.objects.create(
+            capteur=sensor,
+            valeur="21.500000",
+            unite="°C",
+            date_mesure=maintenant,
+        )
+        mesure_ancienne = MesureCapteur.objects.create(
+            capteur=sensor,
+            valeur="-2.500000",
+            unite="°C",
+            date_mesure=maintenant - timedelta(minutes=1),
+        )
+
+        mesures = list(sensor.mesures.all())
+
+        self.assertEqual(
+            [mesure.id for mesure in mesures],
+            [mesure_recente.id, mesure_ancienne.id],
+        )
+        self.assertEqual(str(mesures[0].valeur), "21.500000")
+        self.assertEqual(mesures[0].unite, "°C")
+        self.assertIsNotNone(mesures[0].date_reception)
+        self.assertEqual(str(mesures[1].valeur), "-2.500000")
 
     def test_equipment_rejects_negative_nominal_power(self):
         with self.assertRaises(IntegrityError):
