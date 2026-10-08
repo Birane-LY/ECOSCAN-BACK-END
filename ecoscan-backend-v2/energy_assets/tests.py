@@ -12,11 +12,18 @@ from organizations.models import Organisation, Site, UtilisateurOrganisation
 
 from .models import (
     Capteur,
+    CommandeEquipement,
     Equipement,
     EtatEquipement,
     MesureCapteur,
     ProfilFonctionnement,
     Zone,
+)
+from .services import (
+    confirmer_commande,
+    demander_commande,
+    echouer_commande,
+    marquer_commande_envoyee,
 )
 
 
@@ -585,6 +592,150 @@ class EnergyAssetApiTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("capteur", response.data)
+
+    def test_equipment_command_is_created_pending_without_changing_reported_state(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation",
+            categorie="VENTILATION",
+            puissance_nominale_kw="2.000",
+        )
+        state = EtatEquipement.objects.create(equipement=equipment)
+
+        response = self.client.post(
+            "/api/energy-assets/commandes/",
+            {
+                "equipement": str(equipment.id),
+                "action": CommandeEquipement.Action.ON,
+                "statut": CommandeEquipement.Statut.SENT,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["statut"], CommandeEquipement.Statut.PENDING)
+        self.assertIsNone(response.data["date_envoi"])
+        self.assertEqual(response.data["demande_par"], self.user.id)
+        state.refresh_from_db()
+        self.assertEqual(state.etat_souhaite, Equipement.Etat.ON)
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.UNKNOWN)
+
+    def test_command_list_and_creation_are_organization_scoped(self):
+        allowed_equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Équipement autorisé",
+            categorie="AUTRE",
+            puissance_nominale_kw="0.500",
+        )
+        allowed_command = demander_commande(
+            allowed_equipment,
+            CommandeEquipement.Action.ON,
+            self.user,
+        )
+
+        other_organisation = self.create_organisation("Organisation étrangère")
+        other_site = self.create_site(other_organisation, "Site étranger")
+        other_equipment = Equipement.objects.create(
+            site=other_site,
+            nom="Équipement étranger",
+            categorie="AUTRE",
+            puissance_nominale_kw="0.500",
+        )
+        response = self.client.post(
+            "/api/energy-assets/commandes/",
+            {
+                "equipement": str(other_equipment.id),
+                "action": CommandeEquipement.Action.OFF,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("equipement", response.data)
+
+        response = self.client.get("/api/energy-assets/commandes/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item["id"] for item in response.data["results"]],
+            [str(allowed_command.id)],
+        )
+
+    def test_command_lifecycle_confirms_and_updates_reported_state(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Pompe",
+            categorie="POMPE",
+            puissance_nominale_kw="1.000",
+        )
+        state = EtatEquipement.objects.create(equipement=equipment)
+        command = demander_commande(
+            equipment,
+            CommandeEquipement.Action.ON,
+            self.user,
+        )
+
+        command = marquer_commande_envoyee(command)
+        self.assertEqual(command.statut, CommandeEquipement.Statut.SENT)
+        self.assertIsNotNone(command.date_envoi)
+
+        command = confirmer_commande(command)
+
+        self.assertEqual(command.statut, CommandeEquipement.Statut.CONFIRMED)
+        self.assertIsNotNone(command.date_finalisation)
+        state.refresh_from_db()
+        self.assertEqual(state.etat_souhaite, Equipement.Etat.ON)
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(
+            state.statut_synchronisation,
+            EtatEquipement.StatutSynchronisation.SYNCHRONIZED,
+        )
+
+    def test_command_failure_records_reason_and_keeps_reported_state_unchanged(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compresseur",
+            categorie="COMPRESSEUR",
+            puissance_nominale_kw="1.000",
+        )
+        state = EtatEquipement.objects.create(equipement=equipment)
+        command = demander_commande(
+            equipment,
+            CommandeEquipement.Action.ON,
+            self.user,
+        )
+        marquer_commande_envoyee(command)
+
+        command = echouer_commande(command, "Passerelle indisponible")
+
+        self.assertEqual(command.statut, CommandeEquipement.Statut.FAILED)
+        self.assertEqual(command.detail_echec, "Passerelle indisponible")
+        self.assertIsNotNone(command.date_finalisation)
+        state.refresh_from_db()
+        self.assertEqual(state.etat_souhaite, Equipement.Etat.ON)
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.UNKNOWN)
+
+    def test_invalid_command_transitions_are_rejected(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Chaudière",
+            categorie="CHAUFFAGE",
+            puissance_nominale_kw="1.000",
+        )
+        command = demander_commande(
+            equipment,
+            CommandeEquipement.Action.OFF,
+            self.user,
+        )
+
+        with self.assertRaises(ValueError):
+            confirmer_commande(command)
+        with self.assertRaises(ValueError):
+            echouer_commande(command, " ")
+
+        command = marquer_commande_envoyee(command)
+        command = confirmer_commande(command)
+        with self.assertRaises(ValueError):
+            echouer_commande(command, "Commande déjà confirmée")
 
 
 class EnergyAssetModelTests(TestCase):
