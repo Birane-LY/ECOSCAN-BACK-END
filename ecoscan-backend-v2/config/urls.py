@@ -6,6 +6,10 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('accounts.urls')),
     path("api/internal/organisations/<str:organisation_id>/ai-context/", AIContextView.as_view()),
+    path(
+        "api/internal/energy-assets/",
+        include("energy_assets.internal_urls"),
+    ),
     path('api/organisations/', include('organizations.urls')), 
     path("api/energies/", include("energy.urls", namespace="energy")),
     path("api/energy-assets/", include("energy_assets.urls")),
