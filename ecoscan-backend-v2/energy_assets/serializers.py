@@ -5,13 +5,14 @@ from organizations.models import Organisation, Site
 
 from .models import (
     Capteur,
+    CommandeEquipement,
     Equipement,
     EtatEquipement,
     MesureCapteur,
     ProfilFonctionnement,
     Zone,
 )
-from .services import convertir_mesure
+from .services import convertir_mesure, demander_commande
 
 
 class OrganisationAccessibleSerializer(serializers.ModelSerializer):
@@ -107,6 +108,44 @@ class MesureCapteurSerializer(OrganisationAccessibleSerializer):
             except ValueError as exc:
                 raise serializers.ValidationError(str(exc)) from exc
         return attrs
+
+
+class CommandeEquipementSerializer(OrganisationAccessibleSerializer):
+    """Expose la demande et le suivi des commandes sans accès direct au transport."""
+
+    class Meta:
+        model = CommandeEquipement
+        fields = (
+            "id",
+            "equipement",
+            "action",
+            "statut",
+            "demande_par",
+            "date_creation",
+            "date_envoi",
+            "date_finalisation",
+            "detail_echec",
+        )
+        read_only_fields = (
+            "id",
+            "statut",
+            "demande_par",
+            "date_creation",
+            "date_envoi",
+            "date_finalisation",
+            "detail_echec",
+        )
+
+    def validate_equipement(self, value):
+        return self._valider_equipement_accessible(value)
+
+    def create(self, validated_data):
+        request = self.context["request"]
+        return demander_commande(
+            equipement=validated_data["equipement"],
+            action=validated_data["action"],
+            utilisateur=request.user,
+        )
 
 
 class ProfilFonctionnementSerializer(OrganisationAccessibleSerializer):
