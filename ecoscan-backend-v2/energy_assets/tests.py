@@ -2,7 +2,7 @@ from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -836,3 +836,151 @@ class EnergyAssetModelTests(TestCase):
                     heure_debut="18:00",
                     heure_fin="08:00",
                 )
+
+
+@override_settings(DJANGO_INTERNAL_TOKEN="test-internal-service-token")
+class InternalEquipmentCommandApiTests(APITestCase):
+    token_headers = {"HTTP_X_INTERNAL_SERVICE_TOKEN": "test-internal-service-token"}
+
+    def setUp(self):
+        organisation = Organisation.objects.create(
+            nom="Organisation passerelle",
+            secteur="Industrie",
+            localisation="Dakar",
+            statut=Organisation.Statut.ACTIVE,
+        )
+        site = Site.objects.create(
+            organisation=organisation,
+            nom="Site passerelle",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        self.equipement = Equipement.objects.create(
+            site=site,
+            nom="Pompe passerelle",
+            categorie="POMPE",
+            puissance_nominale_kw="1.000",
+        )
+        self.etat = EtatEquipement.objects.create(equipement=self.equipement)
+
+    def create_command(self, action=CommandeEquipement.Action.ON):
+        return CommandeEquipement.objects.create(
+            equipement=self.equipement,
+            action=action,
+        )
+
+    def test_internal_command_endpoints_require_the_shared_service_token(self):
+        for headers in (
+            {},
+            {"HTTP_X_INTERNAL_SERVICE_TOKEN": "incorrect-token"},
+        ):
+            response = self.client.post(
+                "/api/internal/energy-assets/commandes/suivante/",
+                {},
+                format="json",
+                **headers,
+            )
+            self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_next_command_returns_oldest_pending_and_marks_it_sent(self):
+        first = self.create_command()
+        second = self.create_command(CommandeEquipement.Action.OFF)
+        CommandeEquipement.objects.filter(pk=first.pk).update(
+            date_creation=timezone.now() - timedelta(minutes=1)
+        )
+
+        response = self.client.post(
+            "/api/internal/energy-assets/commandes/suivante/",
+            {},
+            format="json",
+            **self.token_headers,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["id"], str(first.id))
+        self.assertEqual(response.data["equipement_id"], str(self.equipement.id))
+        self.assertEqual(response.data["statut"], CommandeEquipement.Statut.SENT)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.statut, CommandeEquipement.Statut.SENT)
+        self.assertIsNotNone(first.date_envoi)
+        self.assertEqual(second.statut, CommandeEquipement.Statut.PENDING)
+
+        second_response = self.client.post(
+            "/api/internal/energy-assets/commandes/suivante/",
+            {},
+            format="json",
+            **self.token_headers,
+        )
+        self.assertEqual(second_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(second_response.data["id"], str(second.id))
+
+        empty_response = self.client.post(
+            "/api/internal/energy-assets/commandes/suivante/",
+            {},
+            format="json",
+            **self.token_headers,
+        )
+        self.assertEqual(empty_response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_internal_confirmation_updates_reported_state(self):
+        self.etat.etat_souhaite = Equipement.Etat.ON
+        self.etat.save(update_fields=("etat_souhaite",))
+        command = self.create_command()
+        marquer_commande_envoyee(command)
+
+        response = self.client.post(
+            f"/api/internal/energy-assets/commandes/{command.id}/confirmer/",
+            {},
+            format="json",
+            **self.token_headers,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["statut"], CommandeEquipement.Statut.CONFIRMED)
+        self.etat.refresh_from_db()
+        self.assertEqual(self.etat.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(
+            self.etat.statut_synchronisation,
+            EtatEquipement.StatutSynchronisation.SYNCHRONIZED,
+        )
+
+    def test_internal_failure_requires_a_reason_and_keeps_reported_state(self):
+        command = self.create_command()
+        marquer_commande_envoyee(command)
+        url = f"/api/internal/energy-assets/commandes/{command.id}/echouer/"
+
+        invalid_response = self.client.post(
+            url,
+            {"detail": "  "},
+            format="json",
+            **self.token_headers,
+        )
+        self.assertEqual(invalid_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self.client.post(
+            url,
+            {"detail": " Passerelle indisponible "},
+            format="json",
+            **self.token_headers,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["statut"], CommandeEquipement.Statut.FAILED)
+        command.refresh_from_db()
+        self.assertEqual(command.detail_echec, "Passerelle indisponible")
+        self.etat.refresh_from_db()
+        self.assertEqual(self.etat.etat_rapporte, Equipement.Etat.UNKNOWN)
+
+    def test_internal_api_rejects_invalid_transitions(self):
+        command = self.create_command()
+
+        response = self.client.post(
+            f"/api/internal/energy-assets/commandes/{command.id}/confirmer/",
+            {},
+            format="json",
+            **self.token_headers,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
