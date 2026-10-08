@@ -1,17 +1,27 @@
 from django.db import transaction
-from rest_framework import permissions, viewsets
+from django.utils import timezone
+from rest_framework import mixins, permissions, viewsets
 
 from billing.permissions import EstAbonnementActif
 from billing.services import BillingAccessService
 
-from .models import Capteur, Equipement, EtatEquipement, ProfilFonctionnement, Zone
+from .models import (
+    Capteur,
+    Equipement,
+    EtatEquipement,
+    MesureCapteur,
+    ProfilFonctionnement,
+    Zone,
+)
 from .serializers import (
     CapteurSerializer,
     EquipementSerializer,
     EtatEquipementSerializer,
+    MesureCapteurSerializer,
     ProfilFonctionnementSerializer,
     ZoneSerializer,
 )
+from .services import synchroniser_etat_equipement
 
 
 class OrganisationScopedViewSet:
@@ -69,6 +79,29 @@ class CapteurViewSet(OrganisationScopedViewSet, viewsets.ModelViewSet):
         "equipement__site__organisation"
     ).order_by("identifiant")
     serializer_class = CapteurSerializer
+
+
+class MesureCapteurViewSet(
+    OrganisationScopedViewSet,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Expose la consultation et l'ingestion des mesures des capteurs."""
+
+    organisation_lookup = "capteur__equipement__site__organisation"
+    queryset = MesureCapteur.objects.select_related(
+        "capteur__equipement__site__organisation"
+    ).order_by("-date_mesure")
+    serializer_class = MesureCapteurSerializer
+
+    def perform_create(self, serializer):
+        capteur = serializer.validated_data["capteur"]
+        with transaction.atomic():
+            mesure = serializer.save()
+            capteur.derniere_communication = timezone.now()
+            capteur.save(update_fields=("derniere_communication",))
+            synchroniser_etat_equipement(mesure)
 
 
 class EtatEquipementViewSet(OrganisationScopedViewSet, viewsets.ReadOnlyModelViewSet):
