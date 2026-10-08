@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.sqlite3
+media/
+staticfiles/
+test_upload.py
+test_ocr.py
+fichiers-sources/
