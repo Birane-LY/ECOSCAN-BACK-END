@@ -5,9 +5,13 @@ from .views import (
     CapteurViewSet,
     CommandeEquipementViewSet,
     EquipementViewSet,
+    EquipmentTelemetryHistoryView,
     EtatEquipementViewSet,
     MesureCapteurViewSet,
     ProfilFonctionnementViewSet,
+    SiteCurrentLoadView,
+    SiteMonitoringSummaryView,
+    SiteTopConsumersView,
     ZoneViewSet,
 )
 
@@ -31,5 +35,25 @@ router.register(
 router.register("etats-equipements", EtatEquipementViewSet, basename="etat-equipement")
 
 urlpatterns = [
+    path(
+        "sites/<uuid:site_id>/monitoring/summary/",
+        SiteMonitoringSummaryView.as_view(),
+        name="site-monitoring-summary",
+    ),
+    path(
+        "sites/<uuid:site_id>/monitoring/current-load/",
+        SiteCurrentLoadView.as_view(),
+        name="site-current-load",
+    ),
+    path(
+        "sites/<uuid:site_id>/monitoring/top-consumers/",
+        SiteTopConsumersView.as_view(),
+        name="site-top-consumers",
+    ),
+    path(
+        "equipements/<uuid:equipement_id>/telemetry/",
+        EquipmentTelemetryHistoryView.as_view(),
+        name="equipement-telemetry",
+    ),
     path("", include(router.urls)),
 ]

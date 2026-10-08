@@ -1,4 +1,5 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
@@ -76,6 +77,76 @@ class EnergyAssetApiTests(APITestCase):
             adresse="Dakar",
             pays="Sénégal",
             fuseau_horaire="Africa/Dakar",
+        )
+
+    def test_site_monitoring_summary_calculates_energy_from_cumulative_readings(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compteur général",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="5.000",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="ENERGY-SITE-001",
+            type="ENERGY",
+        )
+        with timezone.override("Africa/Dakar"):
+            now = timezone.make_aware(datetime(2025, 5, 15, 12))
+            readings = (
+                ("20.000000", datetime(2025, 4, 30, 23, 59)),
+                ("22.000000", datetime(2025, 5, 1, 1)),
+                ("25.000000", datetime(2025, 5, 14, 23)),
+                ("26.500000", datetime(2025, 5, 15, 11)),
+            )
+            for value, measured_at in readings:
+                MesureCapteur.objects.create(
+                    capteur=sensor,
+                    valeur=value,
+                    unite="kWh",
+                    date_mesure=timezone.make_aware(measured_at),
+                )
+
+            with patch("energy_assets.monitoring._maintenant", return_value=now):
+                response = self.client.get(
+                    f"/api/energy-assets/sites/{self.site.id}/monitoring/summary/"
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["today_energy_kwh"], "1.500000")
+        self.assertEqual(response.data["yesterday_energy_kwh"], "3.000000")
+        self.assertEqual(response.data["month_energy_kwh"], "6.500000")
+        self.assertEqual(
+            response.data["energy_coverage"],
+            {
+                "today": {"complete_sensors": 1, "total_sensors": 1},
+                "yesterday": {"complete_sensors": 1, "total_sensors": 1},
+                "month": {"complete_sensors": 1, "total_sensors": 1},
+            },
+        )
+
+    def test_site_monitoring_summary_marks_energy_unavailable_without_baseline(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compteur général",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="5.000",
+        )
+        Capteur.objects.create(
+            equipement=equipment,
+            identifiant="ENERGY-SITE-EMPTY-001",
+            type="ENERGY",
+        )
+
+        response = self.client.get(
+            f"/api/energy-assets/sites/{self.site.id}/monitoring/summary/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNone(response.data["today_energy_kwh"])
+        self.assertEqual(
+            response.data["energy_coverage"]["today"],
+            {"complete_sensors": 0, "total_sensors": 1},
         )
 
     def test_create_equipment_initializes_state_and_returns_its_sensor(self):
@@ -159,6 +230,218 @@ class EnergyAssetApiTests(APITestCase):
         self.assertEqual(
             [item["id"] for item in response.data["results"]],
             [str(allowed_equipment.id)],
+        )
+
+    def test_site_monitoring_summary_aggregates_only_monitored_equipment(self):
+        active_equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation",
+            categorie="VENTILATION",
+            puissance_nominale_kw="2.000",
+        )
+        active_state = EtatEquipement.objects.create(
+            equipement=active_equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="1.250",
+            date_etat_rapporte=timezone.now(),
+        )
+        Capteur.objects.create(
+            equipement=active_equipment,
+            identifiant="LIVE-VENT-001",
+            type="POWER",
+            derniere_communication=timezone.now(),
+        )
+
+        offline_equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Pompe",
+            categorie="POMPE",
+            puissance_nominale_kw="1.000",
+        )
+        EtatEquipement.objects.create(
+            equipement=offline_equipment,
+            etat_rapporte=Equipement.Etat.OFF,
+            puissance_actuelle_kw="0.000",
+        )
+        Capteur.objects.create(
+            equipement=offline_equipment,
+            identifiant="STALE-POMPE-001",
+            type="POWER",
+            derniere_communication=timezone.now() - timedelta(minutes=6),
+        )
+
+        unmonitored_equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Équipement non suivi",
+            categorie="AUTRE",
+            puissance_nominale_kw="3.000",
+            monitoring_active=False,
+        )
+        EtatEquipement.objects.create(
+            equipement=unmonitored_equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="3.000",
+        )
+
+        response = self.client.get(
+            f"/api/energy-assets/sites/{self.site.id}/monitoring/summary/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["site_id"], str(self.site.id))
+        self.assertEqual(response.data["current_power_kw"], "1.250")
+        self.assertEqual(response.data["monitored_equipment_count"], 2)
+        self.assertEqual(response.data["active_equipment_count"], 1)
+        self.assertEqual(response.data["offline_equipment_count"], 1)
+        self.assertEqual(
+            response.data["top_consumer"]["equipment_id"],
+            str(active_equipment.id),
+        )
+        self.assertEqual(response.data["latest_measurement_at"], active_state.date_etat_rapporte.isoformat().replace("+00:00", "Z"))
+
+    def test_site_current_load_returns_per_equipment_state_and_power(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Climatiseur",
+            categorie="CLIMATISATION",
+            puissance_nominale_kw="1.500",
+        )
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="0.850",
+        )
+        Capteur.objects.create(
+            equipement=equipment,
+            identifiant="CLIM-LIVE-001",
+            type="POWER",
+            derniere_communication=timezone.now(),
+        )
+
+        response = self.client.get(
+            f"/api/energy-assets/sites/{self.site.id}/monitoring/current-load/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["current_power_kw"], "0.850")
+        self.assertEqual(len(response.data["equipment"]), 1)
+        self.assertEqual(response.data["equipment"][0]["name"], "Climatiseur")
+        self.assertEqual(response.data["equipment"][0]["power_kw"], "0.850")
+        self.assertTrue(response.data["equipment"][0]["is_online"])
+
+    def test_site_top_consumers_are_sorted_and_include_power_share(self):
+        expected_consumers = []
+        for name, power, identifier in (
+            ("Pompe", "0.500", "TOP-POMPE-001"),
+            ("Ventilation", "1.500", "TOP-VENT-001"),
+        ):
+            equipment = Equipement.objects.create(
+                site=self.site,
+                nom=name,
+                categorie="AUTRE",
+                puissance_nominale_kw="2.000",
+            )
+            EtatEquipement.objects.create(
+                equipement=equipment,
+                etat_rapporte=Equipement.Etat.ON,
+                puissance_actuelle_kw=power,
+            )
+            Capteur.objects.create(
+                equipement=equipment,
+                identifiant=identifier,
+                type="POWER",
+                derniere_communication=timezone.now(),
+            )
+            expected_consumers.append((equipment, power))
+
+        response = self.client.get(
+            f"/api/energy-assets/sites/{self.site.id}/monitoring/top-consumers/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            [item["name"] for item in response.data],
+            ["Ventilation", "Pompe"],
+        )
+        self.assertEqual(response.data[0]["power_kw"], 1.5)
+        self.assertEqual(response.data[0]["share_percent"], 75.0)
+
+    def test_monitoring_endpoints_hide_sites_from_other_organizations(self):
+        other_organisation = self.create_organisation("Organisation étrangère")
+        other_site = self.create_site(other_organisation, "Site étranger")
+
+        for suffix in ("summary/", "current-load/", "top-consumers/"):
+            response = self.client.get(
+                f"/api/energy-assets/sites/{other_site.id}/monitoring/{suffix}"
+            )
+            self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_equipment_telemetry_history_is_scoped_and_newest_first(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compteur principal",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="1.000",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="HISTORY-001",
+            type="TEMPERATURE",
+            mode=Capteur.Mode.SIMULATED,
+        )
+        latest_at = timezone.now()
+        latest = MesureCapteur.objects.create(
+            capteur=sensor,
+            valeur="22.500000",
+            unite="°C",
+            date_mesure=latest_at,
+        )
+        MesureCapteur.objects.create(
+            capteur=sensor,
+            valeur="21.000000",
+            unite="°C",
+            date_mesure=latest_at - timedelta(minutes=1),
+        )
+
+        other_organisation = self.create_organisation("Organisation étrangère")
+        other_site = self.create_site(other_organisation, "Site étranger")
+        other_equipment = Equipement.objects.create(
+            site=other_site,
+            nom="Autre compteur",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="1.000",
+        )
+        other_sensor = Capteur.objects.create(
+            equipement=other_equipment,
+            identifiant="HISTORY-OTHER-001",
+            type="TEMPERATURE",
+        )
+        MesureCapteur.objects.create(
+            capteur=other_sensor,
+            valeur="30",
+            unite="°C",
+            date_mesure=latest_at,
+        )
+
+        response = self.client.get(
+            f"/api/energy-assets/equipements/{equipment.id}/telemetry/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            response.data["results"][0]["telemetry_id"],
+            str(latest.id),
+        )
+        self.assertEqual(response.data["results"][0]["sensor_identifier"], "HISTORY-001")
+        self.assertEqual(response.data["results"][0]["source"], Capteur.Mode.SIMULATED)
+
+        forbidden_response = self.client.get(
+            f"/api/energy-assets/equipements/{other_equipment.id}/telemetry/"
+        )
+        self.assertEqual(
+            forbidden_response.status_code,
+            status.HTTP_404_NOT_FOUND,
         )
 
     def test_create_sensor_measurement_updates_communication_timestamp(self):
