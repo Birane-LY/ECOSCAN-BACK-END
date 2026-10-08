@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.db import models
 
 
@@ -262,3 +263,57 @@ class EtatEquipement(models.Model):
 
     def __str__(self):
         return f"{self.equipement.nom} — {self.get_etat_rapporte_display()}"
+
+
+class CommandeEquipement(models.Model):
+    """Enregistre une demande de changement d'état sans piloter directement l'appareil."""
+
+    class Action(models.TextChoices):
+        ON = Equipement.Etat.ON, "Mettre en marche"
+        OFF = Equipement.Etat.OFF, "Arrêter"
+
+    class Statut(models.TextChoices):
+        PENDING = "PENDING", "En attente d'envoi"
+        SENT = "SENT", "Envoyée"
+        CONFIRMED = "CONFIRMED", "Confirmée"
+        FAILED = "FAILED", "Échouée"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    equipement = models.ForeignKey(
+        Equipement,
+        on_delete=models.CASCADE,
+        related_name="commandes",
+    )
+    action = models.CharField(max_length=3, choices=Action.choices)
+    statut = models.CharField(
+        max_length=10,
+        choices=Statut.choices,
+        default=Statut.PENDING,
+    )
+    demande_par = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="commandes_equipements",
+    )
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_envoi = models.DateTimeField(null=True, blank=True)
+    date_finalisation = models.DateTimeField(null=True, blank=True)
+    detail_echec = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ("-date_creation",)
+        indexes = [
+            models.Index(
+                fields=("equipement", "statut", "date_creation"),
+                name="cmd_equip_status_date_idx",
+            ),
+            models.Index(
+                fields=("statut", "date_creation"),
+                name="cmd_status_date_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.equipement.nom} — {self.get_action_display()} ({self.get_statut_display()})"
