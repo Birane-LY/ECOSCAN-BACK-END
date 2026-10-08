@@ -45,16 +45,24 @@ def synchroniser_etat_equipement(mesure):
         pk=mesure.capteur.equipement_id
     )
     etat, _ = EtatEquipement.objects.get_or_create(equipement=equipement)
-
-    if (
-        etat.date_etat_rapporte is not None
-        and mesure.date_mesure <= etat.date_etat_rapporte
-    ):
+    derniere_mesure = (
+        MesureCapteur.objects.filter(
+            capteur__equipement_id=equipement.id,
+            capteur__type__iexact=mesure.capteur.type,
+        )
+        .exclude(pk=mesure.pk)
+        .order_by("-date_mesure", "-date_reception")
+        .first()
+    )
+    if derniere_mesure and (
+        derniere_mesure.date_mesure,
+        derniere_mesure.date_reception,
+    ) >= (mesure.date_mesure, mesure.date_reception):
         return
 
-    etat.date_etat_rapporte = mesure.date_mesure
-    fields_to_update = ["date_etat_rapporte"]
+    fields_to_update = []
     if type_mesure == "POWER":
+        etat.date_etat_rapporte = mesure.date_mesure
         etat.puissance_actuelle_kw = valeur_standard
         etat.etat_rapporte = (
             Equipement.Etat.ON if valeur_standard > 0 else Equipement.Etat.OFF
@@ -70,7 +78,12 @@ def synchroniser_etat_equipement(mesure):
                 EtatEquipement.StatutSynchronisation.OUT_OF_SYNC
             )
         fields_to_update.extend(
-            ("puissance_actuelle_kw", "etat_rapporte", "statut_synchronisation")
+            (
+                "date_etat_rapporte",
+                "puissance_actuelle_kw",
+                "etat_rapporte",
+                "statut_synchronisation",
+            )
         )
     else:
         etat.energie_cumulee_kwh = valeur_standard
