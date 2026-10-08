@@ -11,6 +11,7 @@ from .models import (
     ProfilFonctionnement,
     Zone,
 )
+from .services import convertir_mesure
 
 
 class OrganisationAccessibleSerializer(serializers.ModelSerializer):
@@ -95,6 +96,17 @@ class MesureCapteurSerializer(OrganisationAccessibleSerializer):
         if value.statut != Capteur.Statut.ACTIVE:
             raise serializers.ValidationError("Ce capteur est inactif.")
         return value
+
+    def validate(self, attrs):
+        capteur = attrs.get("capteur", self.instance.capteur if self.instance else None)
+        valeur = attrs.get("valeur", self.instance.valeur if self.instance else None)
+        unite = attrs.get("unite", self.instance.unite if self.instance else None)
+        if capteur and valeur is not None and unite is not None:
+            try:
+                convertir_mesure(capteur.type, valeur, unite)
+            except ValueError as exc:
+                raise serializers.ValidationError(str(exc)) from exc
+        return attrs
 
 
 class ProfilFonctionnementSerializer(OrganisationAccessibleSerializer):
