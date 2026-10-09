@@ -13,6 +13,7 @@ from .views import (
     SiteCurrentLoadView,
     SiteMonitoringSummaryView,
     SiteTopConsumersView,
+    SiteAnomaliesView,
     ZoneViewSet,
 )
 
@@ -60,6 +61,11 @@ urlpatterns = [
         "equipements/<uuid:equipement_id>/telemetry/",
         EquipmentTelemetryHistoryView.as_view(),
         name="equipement-telemetry",
+    ),
+    path(
+        "sites/<uuid:site_id>/anomalies/",
+        SiteAnomaliesView.as_view(),
+        name="site-anomalies",
     ),
     path("", include(router.urls)),
 ]

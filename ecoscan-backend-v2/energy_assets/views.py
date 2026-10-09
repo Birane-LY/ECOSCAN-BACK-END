@@ -7,6 +7,8 @@ from rest_framework import generics, mixins, permissions, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from analysis.models import Anomalie
+from analysis.serializers import AnomalieSerializer
 from billing.permissions import EstAbonnementActif
 from billing.services import BillingAccessService
 from organizations.models import Site
@@ -35,6 +37,7 @@ from .serializers import (
     ZoneSerializer,
 )
 from .monitoring import obtenir_indicateurs_site
+from .anomalies import code_metrique_site
 from .services import synchroniser_etat_equipement
 
 
@@ -232,3 +235,23 @@ class EquipmentTelemetryHistoryView(generics.ListAPIView):
             .select_related("capteur")
             .order_by("-date_mesure", "-date_reception")
         )
+
+
+class SiteAnomaliesView(generics.ListAPIView):
+    """Expose les anomalies de consommation du site accessible demandé."""
+
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
+    serializer_class = AnomalieSerializer
+
+    def get_queryset(self):
+        organisations = BillingAccessService().organisations_avec_acces(
+            self.request.user
+        )
+        site = get_object_or_404(
+            Site.objects.filter(organisation__in=organisations),
+            pk=self.kwargs["site_id"],
+        )
+        return Anomalie.objects.filter(
+            organisation=site.organisation,
+            resultat_metrique__code_metrique=code_metrique_site(site),
+        ).select_related("resultat_metrique").prefetch_related("recommandations")

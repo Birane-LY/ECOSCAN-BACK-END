@@ -21,6 +21,7 @@ CODES_METRIQUES_COMPATIBLES = (
     "variation_woyofal_vs_moyenne_recente",
     "variation_woyofal_rituelle_vs_moyenne_recente",
 )
+PREFIXE_METRIQUE_SITE_TELEMETRIE = "variation_site_energy_assets_"
 
 
 def _classer_severite(ecart_absolu: Decimal) -> Optional[str]:
@@ -38,7 +39,12 @@ def _classer_severite(ecart_absolu: Decimal) -> Optional[str]:
 def detecter_anomalie(resultat_variation: ResultatMetrique) -> Optional[Anomalie]:
     """Crée/met à jour l'Anomalie correspondant à un ResultatMetrique de variation
     si l'écart dépasse le seuil de surveillance."""
-    if resultat_variation.code_metrique not in CODES_METRIQUES_COMPATIBLES:
+    if (
+        resultat_variation.code_metrique not in CODES_METRIQUES_COMPATIBLES
+        and not resultat_variation.code_metrique.startswith(
+            PREFIXE_METRIQUE_SITE_TELEMETRIE
+        )
+    ):
         raise ValueError(
             f"detecter_anomalie attend un ResultatMetrique parmi {CODES_METRIQUES_COMPATIBLES}, "
             f"reçu '{resultat_variation.code_metrique}'."
