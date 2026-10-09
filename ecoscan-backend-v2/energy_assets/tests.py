@@ -1,4 +1,5 @@
 from datetime import timedelta
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
@@ -7,10 +8,13 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from analysis.models import Recommandation
 from billing.models import Abonnement, Plan
+from energy.models import Objectif
 from organizations.models import Organisation, Site, UtilisateurOrganisation
 
 from .models import (
+    ActionVirtuelle,
     Capteur,
     CommandeEquipement,
     Equipement,
@@ -76,6 +80,26 @@ class EnergyAssetApiTests(APITestCase):
             adresse="Dakar",
             pays="Sénégal",
             fuseau_horaire="Africa/Dakar",
+        )
+
+    def create_recommendation(self, organisation=None):
+        maintenant = timezone.now()
+        objectif = Objectif.objects.create(
+            organisation=organisation or self.organisation,
+            nom="Réduction des consommations",
+            type="ENERGIE",
+            valeur_cible="100.000000",
+            unite="kWh",
+            date_debut=maintenant,
+            date_fin=maintenant + timedelta(days=90),
+        )
+        return Recommandation.objects.create(
+            objectif=objectif,
+            titre="Réduire la consommation hors horaires",
+            description="Arrêter l'équipement lorsque le site est fermé.",
+            impact_estime="100.000000",
+            economie_estimee="100.000000",
+            unite="kWh",
         )
 
     def test_create_equipment_initializes_state_and_returns_its_sensor(self):
@@ -736,6 +760,191 @@ class EnergyAssetApiTests(APITestCase):
         command = confirmer_commande(command)
         with self.assertRaises(ValueError):
             echouer_commande(command, "Commande déjà confirmée")
+
+    def test_virtual_action_estimates_savings_without_changing_equipment_or_queueing_command(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Climatiseur",
+            categorie="CLIMATISATION",
+            puissance_nominale_kw="2.000",
+            puissance_veille_kw="0.100",
+            quantite=2,
+        )
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="2.500",
+        )
+        recommendation = self.create_recommendation()
+
+        response = self.client.post(
+            "/api/energy-assets/actions-virtuelles/",
+            {
+                "recommandation": str(recommendation.id),
+                "equipement": str(equipment.id),
+                "etat_cible": ActionVirtuelle.EtatCible.OFF,
+                "duree_heures": "4.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["puissance_reference_kw"], "2.500")
+        self.assertEqual(response.data["puissance_scenario_kw"], "0.200")
+        self.assertEqual(response.data["variation_energie_kwh"], "9.200000")
+        self.assertEqual(
+            response.data["source_puissance_reference"],
+            ActionVirtuelle.SourcePuissance.MESURE,
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertEqual(state.etat_souhaite, Equipement.Etat.ON)
+        self.assertEqual(state.puissance_actuelle_kw, Decimal("2.500"))
+        self.assertFalse(CommandeEquipement.objects.exists())
+
+    def test_virtual_action_requires_a_reported_equipment_state(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Pompe",
+            categorie="POMPE",
+            puissance_nominale_kw="1.000",
+        )
+        EtatEquipement.objects.create(equipement=equipment)
+        recommendation = self.create_recommendation()
+
+        response = self.client.post(
+            "/api/energy-assets/actions-virtuelles/",
+            {
+                "recommandation": str(recommendation.id),
+                "equipement": str(equipment.id),
+                "etat_cible": ActionVirtuelle.EtatCible.OFF,
+                "duree_heures": "1.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("equipement", response.data)
+        self.assertFalse(ActionVirtuelle.objects.exists())
+
+    def test_virtual_action_rejects_recommendation_from_another_organization(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation",
+            categorie="VENTILATION",
+            puissance_nominale_kw="1.000",
+        )
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_rapporte=Equipement.Etat.ON,
+        )
+        other_organisation = self.create_organisation("Organisation étrangère")
+        recommendation = self.create_recommendation(other_organisation)
+
+        response = self.client.post(
+            "/api/energy-assets/actions-virtuelles/",
+            {
+                "recommandation": str(recommendation.id),
+                "equipement": str(equipment.id),
+                "etat_cible": ActionVirtuelle.EtatCible.OFF,
+                "duree_heures": "1.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("recommandation", response.data)
+        self.assertFalse(ActionVirtuelle.objects.exists())
+
+    def test_virtual_action_duration_is_limited_to_24_hours(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Éclairage",
+            categorie="ECLAIRAGE",
+            puissance_nominale_kw="0.500",
+        )
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="0.500",
+        )
+        recommendation = self.create_recommendation()
+
+        response = self.client.post(
+            "/api/energy-assets/actions-virtuelles/",
+            {
+                "recommandation": str(recommendation.id),
+                "equipement": str(equipment.id),
+                "etat_cible": ActionVirtuelle.EtatCible.OFF,
+                "duree_heures": "24.01",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("duree_heures", response.data)
+        self.assertFalse(ActionVirtuelle.objects.exists())
+
+    def test_virtual_action_history_is_scoped_to_accessible_organizations(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation autorisée",
+            categorie="VENTILATION",
+            puissance_nominale_kw="1.000",
+        )
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="1.000",
+        )
+        recommendation = self.create_recommendation()
+        create_response = self.client.post(
+            "/api/energy-assets/actions-virtuelles/",
+            {
+                "recommandation": str(recommendation.id),
+                "equipement": str(equipment.id),
+                "etat_cible": ActionVirtuelle.EtatCible.OFF,
+                "duree_heures": "1.00",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            create_response.status_code,
+            status.HTTP_201_CREATED,
+            create_response.data,
+        )
+
+        other_organisation = self.create_organisation("Organisation étrangère")
+        other_site = self.create_site(other_organisation, "Site étranger")
+        other_equipment = Equipement.objects.create(
+            site=other_site,
+            nom="Ventilation étrangère",
+            categorie="VENTILATION",
+            puissance_nominale_kw="1.000",
+        )
+        other_recommendation = self.create_recommendation(other_organisation)
+        foreign_action = ActionVirtuelle.objects.create(
+            recommandation=other_recommendation,
+            equipement=other_equipment,
+            etat_cible=ActionVirtuelle.EtatCible.OFF,
+            duree_heures="1.00",
+            puissance_reference_kw="1.000",
+            puissance_scenario_kw="0.000",
+            variation_energie_kwh="1.000000",
+            source_puissance_reference=ActionVirtuelle.SourcePuissance.NOMINALE,
+        )
+
+        response = self.client.get("/api/energy-assets/actions-virtuelles/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item["id"] for item in response.data["results"]],
+            [create_response.data["id"]],
+        )
+        self.assertNotIn(
+            str(foreign_action.id),
+            [item["id"] for item in response.data["results"]],
+        )
 
 
 class EnergyAssetModelTests(TestCase):

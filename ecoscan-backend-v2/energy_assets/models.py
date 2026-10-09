@@ -317,3 +317,64 @@ class CommandeEquipement(models.Model):
 
     def __str__(self):
         return f"{self.equipement.nom} — {self.get_action_display()} ({self.get_statut_display()})"
+
+
+class ActionVirtuelle(models.Model):
+    """Persiste une estimation énergétique sans modifier l'état ni commander l'équipement."""
+
+    class EtatCible(models.TextChoices):
+        ON = Equipement.Etat.ON, "En marche"
+        OFF = Equipement.Etat.OFF, "À l'arrêt"
+
+    class SourcePuissance(models.TextChoices):
+        MESURE = "MESURE", "Puissance mesurée"
+        NOMINALE = "NOMINALE", "Puissance nominale estimée"
+        VEILLE = "VEILLE", "Puissance de veille estimée"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    recommandation = models.ForeignKey(
+        "analysis.Recommandation",
+        on_delete=models.PROTECT,
+        related_name="actions_virtuelles",
+    )
+    equipement = models.ForeignKey(
+        Equipement,
+        on_delete=models.CASCADE,
+        related_name="actions_virtuelles",
+    )
+    etat_cible = models.CharField(max_length=3, choices=EtatCible.choices)
+    duree_heures = models.DecimalField(max_digits=5, decimal_places=2)
+    puissance_reference_kw = models.DecimalField(max_digits=14, decimal_places=3)
+    puissance_scenario_kw = models.DecimalField(max_digits=14, decimal_places=3)
+    variation_energie_kwh = models.DecimalField(max_digits=18, decimal_places=6)
+    source_puissance_reference = models.CharField(
+        max_length=10,
+        choices=SourcePuissance.choices,
+    )
+    cree_par = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="actions_virtuelles",
+    )
+    date_simulation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_simulation",)
+        indexes = [
+            models.Index(
+                fields=("recommandation", "date_simulation"),
+                name="action_virt_reco_date_idx",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(duree_heures__gt=0)
+                & models.Q(duree_heures__lte=24),
+                name="action_virt_duree_1_24h",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.equipement.nom} — simulation {self.etat_cible}"
