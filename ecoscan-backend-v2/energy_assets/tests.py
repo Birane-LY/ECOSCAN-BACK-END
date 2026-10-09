@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
@@ -12,7 +12,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from analysis.models import Recommandation
+from analysis.models import Anomalie, Recommandation, ResultatMetrique
 from billing.models import Abonnement, Plan
 from energy.models import Objectif
 from organizations.models import Organisation, Site, UtilisateurOrganisation
@@ -27,6 +27,8 @@ from .models import (
     ProfilFonctionnement,
     Zone,
 )
+from .anomalies import analyser_anomalies_site, code_metrique_site
+from analysis.services.anomaly import _classer_severite
 from .services import (
     confirmer_commande,
     demander_commande,
@@ -473,6 +475,47 @@ class EnergyAssetApiTests(APITestCase):
         self.assertEqual(
             forbidden_response.status_code,
             status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_site_anomaly_list_is_scoped_to_accessible_organization(self):
+        allowed_anomaly = self.create_site_anomaly(self.site)
+        other_organisation = self.create_organisation("Organisation étrangère")
+        other_site = self.create_site(other_organisation, "Site étranger")
+        self.create_site_anomaly(other_site)
+
+        response = self.client.get(
+            f"/api/energy-assets/sites/{self.site.id}/anomalies/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertEqual(response.data["results"][0]["id"], str(allowed_anomaly.id))
+
+    @staticmethod
+    def create_site_anomaly(site):
+        debut = timezone.make_aware(datetime(2025, 6, 4))
+        resultat = ResultatMetrique.objects.create(
+            organisation=site.organisation,
+            code_metrique=code_metrique_site(site),
+            version_metrique="1.0",
+            valeur="10.000000",
+            unite="%",
+            periode_debut=debut,
+            periode_fin=debut + timedelta(days=1),
+            baseline_type="moyenne_jour_semaine",
+            baseline_valeur="10.000000",
+            baseline_nombre_observations=4,
+            completude="1.0000",
+            statut_qualite=ResultatMetrique.StatutQualite.FIABLE,
+        )
+        return Anomalie.objects.create(
+            organisation=site.organisation,
+            resultat_metrique=resultat,
+            type="consumption_spike",
+            severite=Anomalie.Severite.SURVEILLANCE,
+            valeur_observee="11.000000",
+            valeur_attendue="10.000000",
+            ecart_pourcentage="10.00",
         )
 
     def test_create_sensor_measurement_updates_communication_timestamp(self):
@@ -1234,6 +1277,201 @@ class EnergyAssetApiTests(APITestCase):
         self.assertNotIn(
             str(foreign_action.id),
             [item["id"] for item in response.data["results"]],
+        )
+
+
+class EnergyAssetAnomalyDetectionTests(TestCase):
+    date_analysee = date(2025, 6, 4)
+
+    def setUp(self):
+        organisation = Organisation.objects.create(
+            nom="Organisation anomalies",
+            secteur="Commerce",
+            localisation="Dakar",
+        )
+        self.site = Site.objects.create(
+            organisation=organisation,
+            nom="Site anomalies",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compteur général",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="5.000",
+        )
+        self.sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="ENERGY-ANALYSE-001",
+            type="ENERGY",
+        )
+
+    def creer_releves_journaliers(self, ecart_jour_cible=30, omettre_jour=None):
+        jours = [
+            self.date_analysee - timedelta(days=28),
+            self.date_analysee - timedelta(days=21),
+            self.date_analysee - timedelta(days=14),
+            self.date_analysee - timedelta(days=7),
+            self.date_analysee,
+        ]
+        with timezone.override("Africa/Dakar"):
+            for index, jour in enumerate(jours):
+                if jour == omettre_jour:
+                    continue
+                index_initial = Decimal("100") + Decimal(index * 30)
+                consommation = (
+                    ecart_jour_cible if jour == self.date_analysee else 30
+                )
+                for heure, increment in (
+                    (1, 0),
+                    (6, 10),
+                    (12, 20),
+                    (18, consommation),
+                ):
+                    date_mesure = timezone.make_aware(
+                        datetime.combine(jour, time(heure))
+                    )
+                    MesureCapteur.objects.create(
+                        capteur=self.sensor,
+                        valeur=index_initial + Decimal(increment),
+                        unite="kWh",
+                        date_mesure=date_mesure,
+                    )
+            maintenant = timezone.make_aware(
+                datetime.combine(
+                    self.date_analysee + timedelta(days=1),
+                    time(12),
+                )
+            )
+        return maintenant
+
+    def test_anomaly_uses_four_same_weekdays_and_reuses_existing_event(self):
+        maintenant = self.creer_releves_journaliers(ecart_jour_cible=36)
+
+        resultat = analyser_anomalies_site(
+            self.site,
+            jour=self.date_analysee,
+            maintenant=maintenant,
+        )
+
+        anomalie = resultat["anomaly"]
+        self.assertEqual(resultat["status"], "anomaly_detected")
+        self.assertEqual(anomalie.type, "consumption_spike")
+        self.assertEqual(anomalie.severite, Anomalie.Severite.ALERTE)
+        self.assertEqual(anomalie.ecart_pourcentage, Decimal("20.00"))
+        self.assertEqual(anomalie.valeur_attendue, Decimal("30.000000"))
+        self.assertEqual(anomalie.valeur_observee, Decimal("36.000000"))
+        self.assertEqual(anomalie.resultat_metrique.baseline_nombre_observations, 4)
+        anomalie.statut = Anomalie.Statut.CONFIRMED
+        anomalie.save(update_fields=("statut",))
+        repetition = analyser_anomalies_site(
+            self.site,
+            jour=self.date_analysee,
+            maintenant=maintenant,
+        )
+        self.assertEqual(repetition["anomaly"].id, anomalie.id)
+        self.assertEqual(repetition["anomaly"].statut, Anomalie.Statut.CONFIRMED)
+        self.assertEqual(Anomalie.objects.count(), 1)
+
+    def test_anomaly_severity_matches_existing_percentage_thresholds(self):
+        self.assertEqual(
+            _classer_severite(Decimal("10")),
+            Anomalie.Severite.SURVEILLANCE,
+        )
+        self.assertEqual(
+            _classer_severite(Decimal("20")),
+            Anomalie.Severite.ALERTE,
+        )
+        self.assertEqual(
+            _classer_severite(Decimal("40")),
+            Anomalie.Severite.INVESTIGATION_PRIORITAIRE,
+        )
+
+    def test_anomaly_detection_returns_insufficient_when_a_reference_day_is_missing(self):
+        jour_manquant = self.date_analysee - timedelta(days=14)
+        maintenant = self.creer_releves_journaliers(omettre_jour=jour_manquant)
+
+        resultat = analyser_anomalies_site(
+            self.site,
+            jour=self.date_analysee,
+            maintenant=maintenant,
+        )
+
+        self.assertEqual(resultat["status"], "insufficient_data")
+        self.assertEqual(resultat["baseline_days"], 3)
+        self.assertEqual(resultat["required_baseline_days"], 4)
+        self.assertEqual(Anomalie.objects.count(), 0)
+
+    def test_normal_variation_does_not_create_anomaly(self):
+        maintenant = self.creer_releves_journaliers(ecart_jour_cible=32)
+
+        resultat = analyser_anomalies_site(
+            self.site,
+            jour=self.date_analysee,
+            maintenant=maintenant,
+        )
+
+        self.assertEqual(resultat["status"], "normal")
+        self.assertEqual(resultat["variation_percent"], Decimal("6.67"))
+        self.assertEqual(Anomalie.objects.count(), 0)
+
+    def test_reanalysis_resolves_anomaly_when_corrected_readings_are_normal(self):
+        maintenant = self.creer_releves_journaliers(ecart_jour_cible=36)
+        analyser_anomalies_site(
+            self.site,
+            jour=self.date_analysee,
+            maintenant=maintenant,
+        )
+        with timezone.override("Africa/Dakar"):
+            debut = timezone.make_aware(
+                datetime.combine(self.date_analysee, time.min)
+            )
+            fin = timezone.make_aware(
+                datetime.combine(
+                    self.date_analysee + timedelta(days=1),
+                    time.min,
+                )
+            )
+            releves = MesureCapteur.objects.filter(
+                capteur=self.sensor,
+                date_mesure__gte=debut,
+                date_mesure__lt=fin,
+            ).order_by("date_mesure", "date_reception")
+        for releve, valeur in zip(
+            releves,
+            ("220.000000", "230.000000", "240.000000", "252.000000"),
+        ):
+            releve.valeur = valeur
+            releve.save(update_fields=("valeur",))
+
+        resultat = analyser_anomalies_site(
+            self.site,
+            jour=self.date_analysee,
+            maintenant=maintenant,
+        )
+
+        self.assertEqual(resultat["status"], "normal")
+        anomaly = Anomalie.objects.get(organisation=self.site.organisation)
+        self.assertEqual(anomaly.statut, Anomalie.Statut.RESOLVED)
+
+    def test_management_command_analyzes_a_specific_site_and_date(self):
+        self.creer_releves_journaliers(ecart_jour_cible=45)
+        output = StringIO()
+
+        call_command(
+            "analyser_anomalies_telemetrie",
+            date=self.date_analysee,
+            site=str(self.site.id),
+            stdout=output,
+        )
+
+        self.assertIn("anomalies : 1", output.getvalue())
+        anomalie = Anomalie.objects.get(organisation=self.site.organisation)
+        self.assertEqual(
+            anomalie.severite,
+            Anomalie.Severite.INVESTIGATION_PRIORITAIRE,
         )
 
 

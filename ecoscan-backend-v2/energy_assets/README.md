@@ -9,11 +9,8 @@ schema before the first run:
 python manage.py migrate
 ```
 
-The simulator needs the V2 `energy_assets` tables created by these migrations.
 Use the same Python environment and database configuration for migration and
-simulation.
-
-Run the simulator as a separate process alongside Django:
+simulation. Run the simulator as a separate process alongside Django:
 
 ```powershell
 python manage.py simuler_capteurs
@@ -35,6 +32,31 @@ The generated measurements use the regular telemetry synchronization service,
 so they update equipment state, cumulative energy, and sensor communication
 timestamps in the same way as ingested readings. The simulator does not send
 commands to physical equipment.
+
+## Consumption anomaly detection
+
+Apply the V2 migrations before running the analysis:
+
+```powershell
+python manage.py migrate
+```
+
+Run `python manage.py analyser_anomalies_telemetrie` once per day after daily
+energy readings are available. By default, it analyzes the previous local
+calendar day for each site. Use `--date YYYY-MM-DD` to select a local day and
+`--site <UUID>` to analyze a single site.
+
+For a site to be analyzed, each active `ENERGY` sensor on monitored equipment
+must have at least four readings on the analyzed day and on each of the four
+previous matching weekdays. Daily usage is the difference between the first
+and last cumulative reading for that day. If any day or sensor lacks sufficient
+readings, the analysis reports insufficient data and creates no anomaly.
+
+The observed daily usage is compared with the simple average of the four
+reference days, following the existing analysis baseline quality requirements.
+Variations below 10% are considered normal; 10%, 20%, and 40% mark surveillance,
+alert, and priority-investigation thresholds. Detected anomalies are available
+at `/api/energy-assets/sites/{site_id}/anomalies/`.
 
 ## Actions virtuelles
 
