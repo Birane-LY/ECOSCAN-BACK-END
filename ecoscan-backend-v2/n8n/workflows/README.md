@@ -26,3 +26,34 @@ Le workflow lit ces variables avec `$env`. Le fichier Compose fourni active `N8N
 5. Vérifiez que la réponse de l’endpoint indique des enregistrements créés ou mis à jour, puis activez **Collecte quotidienne**.
 
 Chaque offre est envoyée individuellement à l’endpoint d’ingestion, qui effectue une mise à jour ou création par titre et organisme. Django publie les offres dont la confiance d’extraction atteint le seuil configuré ; les autres attendent la validation d’un administrateur avant d’apparaître au catalogue.
+
+## Workflow de notification des anomalies
+
+Le fichier `ecoscan-anomaly-notification.json` reçoit les événements Django
+`POST /webhook/anomalie-detectee`, vérifie le jeton d'authentification,
+valide les adresses des administrateurs puis envoie un e-mail texte aux
+destinataires de l'organisation. Le webhook ne répond avec succès qu'après
+l'envoi SMTP ; une erreur de validation ou d'envoi reste visible comme échec
+d'exécution dans n8n.
+
+### Configuration
+
+1. Dans `n8n/.env`, configurez `N8N_WEBHOOK_TOKEN` avec la même valeur que
+   `N8N_WEBHOOK_TOKEN` dans Django, et définissez
+   `ECOSCAN_NOTIFICATION_FROM_EMAIL` sur une adresse expéditrice vérifiée.
+   Ne réutilisez pas le jeton d'ingestion des opportunités.
+2. Redémarrez n8n avec `docker compose up -d` pour charger les variables
+   d'environnement.
+3. Importez `ecoscan-anomaly-notification.json` et sélectionnez un credential
+   SMTP valide dans le nœud **Envoyer l'alerte par e-mail**.
+4. Activez le workflow. Django doit avoir
+   `N8N_WEBHOOK_BASE_URL=https://<n8n-host>/webhook` et
+   `BACKEND_BASE_URL=https://<backend-host>`.
+5. Lancez l'analyse des anomalies sur un jour de test et vérifiez l'exécution
+   n8n ainsi que la réception de l'e-mail. Les exécutions actives ne renvoient
+   pas de notification ; une anomalie résolue puis détectée à nouveau envoie
+   un nouvel événement.
+
+Ne placez aucun vrai jeton ni credential SMTP dans le fichier JSON, `.env.example`
+ou Git. Le workflow emploie les variables d'environnement uniquement pour le
+jeton et l'adresse expéditrice ; le credential SMTP se configure dans n8n.

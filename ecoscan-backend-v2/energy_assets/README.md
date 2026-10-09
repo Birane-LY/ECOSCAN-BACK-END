@@ -54,9 +54,10 @@ readings, the analysis reports insufficient data and creates no anomaly.
 
 The observed daily usage is compared with the simple average of the four
 reference days, following the existing analysis baseline quality requirements.
-Variations below 10% are considered normal; 10%, 20%, and 40% mark surveillance,
-alert, and priority-investigation thresholds. Detected anomalies are available
-at `/api/energy-assets/sites/{site_id}/anomalies/`.
+Variations below 10% are considered normal; 10%, 20%, and 40% mark the
+surveillance, alert, and priority-investigation thresholds used by the existing
+anomaly service. Detected anomalies are available at
+`/api/energy-assets/sites/{site_id}/anomalies/`.
 
 ## Actions virtuelles
 
@@ -101,3 +102,22 @@ multipliée par la quantité.
 est une économie potentielle ; une valeur négative est une hausse potentielle.
 Les résultats sont des estimations fondées sur les puissances disponibles, pas
 une mesure garantie de consommation ni une promesse d'économie.
+
+## Administrator notifications
+
+When an anomaly is first detected, or is detected again after being resolved,
+Django posts an `anomalie-detectee` event to
+`{N8N_WEBHOOK_BASE_URL}/anomalie-detectee` using the existing
+`X-N8N-Webhook-Token` authentication. Set `N8N_WEBHOOK_BASE_URL` to the n8n
+production webhook prefix, normally `https://<n8n-host>/webhook`. The payload
+includes the anomaly values, site and organization details, active organization
+administrator email addresses, and the site anomaly API URL. Re-running an
+analysis for an anomaly that is already active does not send a duplicate event.
+
+Configure an authenticated n8n webhook workflow for the `anomalie-detectee`
+path and use its organization administrator email list to deliver the
+notification. Configure the matching `X-N8N-Webhook-Token` credential and any
+email or messaging credentials in n8n; no delivery credentials belong in Django
+or in a workflow export. Event delivery uses the existing best effort n8n
+client, so connection failures are logged and do not roll back anomaly
+detection.
