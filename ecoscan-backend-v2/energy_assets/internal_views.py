@@ -47,6 +47,7 @@ class ServiceInterneAPIView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowAny, JetonServiceInternePermission]
+    throttle_classes = []
 
     def get_authenticate_header(self, request):
         """Indique le nom de l'en-tête requis pour authentifier le service."""
@@ -80,8 +81,12 @@ class TransitionCommandeInterneView(ServiceInterneAPIView):
 
         try:
             if self.transition == "confirmer":
+                if commande.statut == CommandeEquipement.Statut.CONFIRMED:
+                    return Response(CommandeInterneSerializer(commande).data)
                 commande = confirmer_commande(commande)
             else:
+                if commande.statut == CommandeEquipement.Statut.FAILED:
+                    return Response(CommandeInterneSerializer(commande).data)
                 commande = echouer_commande(commande, transition_data)
         except ValueError as exc:
             return Response(
