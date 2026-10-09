@@ -1,3 +1,5 @@
+"""Endpoints internes pour la distribution et le retour des commandes."""
+
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers, status
 from rest_framework.permissions import AllowAny
@@ -14,6 +16,8 @@ from .services import (
 
 
 class CommandeInterneSerializer(serializers.ModelSerializer):
+    """Sérialise les informations de commande destinées au service interne."""
+
     equipement_id = serializers.UUIDField(read_only=True)
     equipement_nom = serializers.CharField(source="equipement.nom", read_only=True)
 
@@ -33,19 +37,25 @@ class CommandeInterneSerializer(serializers.ModelSerializer):
 
 
 class EchecCommandeSerializer(serializers.Serializer):
+    """Valide le motif transmis lors de l'échec d'une commande."""
+
     detail = serializers.CharField(allow_blank=False, trim_whitespace=True)
 
 
 class ServiceInterneAPIView(APIView):
+    """Base des vues internes protégées par le jeton du service."""
+
     authentication_classes = []
     permission_classes = [AllowAny, JetonServiceInternePermission]
 
     def get_authenticate_header(self, request):
+        """Indique le nom de l'en-tête requis pour authentifier le service."""
         return "X-Internal-Service-Token"
 
 
 class ProchaineCommandeInterneView(ServiceInterneAPIView):
     def post(self, request):
+        """Retourne la prochaine commande à traiter, si elle existe."""
         commande = prendre_prochaine_commande()
         if commande is None:
             return Response(status=status.HTTP_204_NO_CONTENT)
@@ -56,6 +66,7 @@ class TransitionCommandeInterneView(ServiceInterneAPIView):
     transition = None
 
     def post(self, request, commande_id):
+        """Applique la transition interne demandée à une commande."""
         commande = get_object_or_404(
             CommandeEquipement.objects.select_related("equipement"),
             pk=commande_id,
