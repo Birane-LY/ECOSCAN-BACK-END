@@ -1,9 +1,13 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
+from analysis.models import Recommandation
 from billing.services import BillingAccessService
 from organizations.models import Organisation, Site
 
 from .models import (
+    ActionVirtuelle,
     Capteur,
     CommandeEquipement,
     Equipement,
@@ -13,6 +17,7 @@ from .models import (
     Zone,
 )
 from .services import convertir_mesure, demander_commande
+from .virtual_actions import simuler_action_virtuelle
 
 
 class OrganisationAccessibleSerializer(serializers.ModelSerializer):
@@ -146,6 +151,91 @@ class CommandeEquipementSerializer(OrganisationAccessibleSerializer):
             action=validated_data["action"],
             utilisateur=request.user,
         )
+
+
+class ActionVirtuelleSerializer(OrganisationAccessibleSerializer):
+    """Valide et expose un scénario énergétique sans commande physique."""
+
+    duree_heures = serializers.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+        max_value=Decimal("24"),
+    )
+
+    class Meta:
+        model = ActionVirtuelle
+        fields = (
+            "id",
+            "recommandation",
+            "equipement",
+            "etat_cible",
+            "duree_heures",
+            "puissance_reference_kw",
+            "puissance_scenario_kw",
+            "variation_energie_kwh",
+            "source_puissance_reference",
+            "cree_par",
+            "date_simulation",
+        )
+        read_only_fields = (
+            "id",
+            "puissance_reference_kw",
+            "puissance_scenario_kw",
+            "variation_energie_kwh",
+            "source_puissance_reference",
+            "cree_par",
+            "date_simulation",
+        )
+
+    def validate_equipement(self, value):
+        return self._valider_equipement_accessible(value)
+
+    def validate_recommandation(self, value):
+        organisation_id = value.objectif.organisation_id
+        if not self._organisations_accessibles().filter(pk=organisation_id).exists():
+            raise serializers.ValidationError(
+                "Vous n'avez pas accès à l'organisation de cette recommandation."
+            )
+        return value
+
+    def validate(self, attrs):
+        equipement = attrs.get(
+            "equipement",
+            self.instance.equipement if self.instance else None,
+        )
+        recommandation = attrs.get(
+            "recommandation",
+            self.instance.recommandation if self.instance else None,
+        )
+        if (
+            equipement
+            and recommandation
+            and equipement.site.organisation_id
+            != recommandation.objectif.organisation_id
+        ):
+            raise serializers.ValidationError(
+                {
+                    "recommandation": (
+                        "La recommandation et l'équipement doivent appartenir "
+                        "à la même organisation."
+                    )
+                }
+            )
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context["request"]
+        try:
+            return simuler_action_virtuelle(
+                recommandation=validated_data["recommandation"],
+                equipement=validated_data["equipement"],
+                etat_cible=validated_data["etat_cible"],
+                duree_heures=validated_data["duree_heures"],
+                utilisateur=request.user,
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError({"equipement": str(exc)}) from exc
 
 
 class ProfilFonctionnementSerializer(OrganisationAccessibleSerializer):

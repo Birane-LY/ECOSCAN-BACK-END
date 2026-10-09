@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import mixins, permissions, viewsets
@@ -6,6 +8,7 @@ from billing.permissions import EstAbonnementActif
 from billing.services import BillingAccessService
 
 from .models import (
+    ActionVirtuelle,
     Capteur,
     CommandeEquipement,
     Equipement,
@@ -15,6 +18,7 @@ from .models import (
     Zone,
 )
 from .serializers import (
+    ActionVirtuelleSerializer,
     CapteurSerializer,
     CommandeEquipementSerializer,
     EquipementSerializer,
@@ -120,6 +124,34 @@ class CommandeEquipementViewSet(
         "demande_par",
     ).order_by("-date_creation")
     serializer_class = CommandeEquipementSerializer
+
+
+class ActionVirtuelleViewSet(
+    OrganisationScopedViewSet,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Expose l'historique et la création de simulations énergétiques virtuelles."""
+
+    organisation_lookup = "equipement__site__organisation"
+    queryset = ActionVirtuelle.objects.select_related(
+        "equipement__site__organisation",
+        "recommandation__objectif__organisation",
+        "cree_par",
+    )
+    serializer_class = ActionVirtuelleSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        recommandation_id = self.request.query_params.get("recommandation")
+        if not recommandation_id:
+            return queryset
+        try:
+            UUID(str(recommandation_id))
+        except ValueError:
+            return queryset.none()
+        return queryset.filter(recommandation_id=recommandation_id)
 
 
 class EtatEquipementViewSet(OrganisationScopedViewSet, viewsets.ReadOnlyModelViewSet):
