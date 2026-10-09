@@ -1895,6 +1895,16 @@ class InternalEquipmentCommandApiTests(APITestCase):
         )
         self.assertEqual(empty_response.status_code, status.HTTP_204_NO_CONTENT)
 
+    def test_internal_command_polling_is_not_limited_by_public_api_throttle(self):
+        for _ in range(12):
+            response = self.client.post(
+                "/api/internal/energy-assets/commandes/suivante/",
+                {},
+                format="json",
+                **self.token_headers,
+            )
+            self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
     def test_internal_confirmation_updates_reported_state(self):
         self.etat.etat_souhaite = Equipement.Etat.ON
         self.etat.save(update_fields=("etat_souhaite",))
@@ -1915,6 +1925,31 @@ class InternalEquipmentCommandApiTests(APITestCase):
         self.assertEqual(
             self.etat.statut_synchronisation,
             EtatEquipement.StatutSynchronisation.SYNCHRONIZED,
+        )
+
+    def test_internal_confirmation_callback_is_idempotent(self):
+        command = self.create_command()
+        marquer_commande_envoyee(command)
+        url = f"/api/internal/energy-assets/commandes/{command.id}/confirmer/"
+
+        first_response = self.client.post(
+            url,
+            {},
+            format="json",
+            **self.token_headers,
+        )
+        repeated_response = self.client.post(
+            url,
+            {},
+            format="json",
+            **self.token_headers,
+        )
+
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(repeated_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            repeated_response.data["statut"],
+            CommandeEquipement.Statut.CONFIRMED,
         )
 
     def test_internal_failure_requires_a_reason_and_keeps_reported_state(self):
@@ -1943,6 +1978,32 @@ class InternalEquipmentCommandApiTests(APITestCase):
         self.assertEqual(command.detail_echec, "Passerelle indisponible")
         self.etat.refresh_from_db()
         self.assertEqual(self.etat.etat_rapporte, Equipement.Etat.UNKNOWN)
+
+    def test_internal_failure_callback_is_idempotent(self):
+        command = self.create_command()
+        marquer_commande_envoyee(command)
+        url = f"/api/internal/energy-assets/commandes/{command.id}/echouer/"
+        payload = {"detail": "Actionneur indisponible."}
+
+        first_response = self.client.post(
+            url,
+            payload,
+            format="json",
+            **self.token_headers,
+        )
+        repeated_response = self.client.post(
+            url,
+            payload,
+            format="json",
+            **self.token_headers,
+        )
+
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(repeated_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            repeated_response.data["statut"],
+            CommandeEquipement.Statut.FAILED,
+        )
 
     def test_internal_api_rejects_invalid_transitions(self):
         command = self.create_command()
