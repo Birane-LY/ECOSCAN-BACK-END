@@ -1,11 +1,15 @@
 from uuid import UUID
 
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import mixins, permissions, viewsets
+from rest_framework import generics, mixins, permissions, viewsets
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from billing.permissions import EstAbonnementActif
 from billing.services import BillingAccessService
+from organizations.models import Site
 
 from .models import (
     ActionVirtuelle,
@@ -21,12 +25,16 @@ from .serializers import (
     ActionVirtuelleSerializer,
     CapteurSerializer,
     CommandeEquipementSerializer,
+    CurrentLoadSerializer,
     EquipementSerializer,
     EtatEquipementSerializer,
     MesureCapteurSerializer,
+    MonitoringSummarySerializer,
     ProfilFonctionnementSerializer,
+    TelemetryHistorySerializer,
     ZoneSerializer,
 )
+from .monitoring import obtenir_indicateurs_site
 from .services import synchroniser_etat_equipement
 
 
@@ -162,3 +170,65 @@ class EtatEquipementViewSet(OrganisationScopedViewSet, viewsets.ReadOnlyModelVie
         "equipement__site__organisation"
     ).order_by("equipement__nom")
     serializer_class = EtatEquipementSerializer
+
+
+class SiteMonitoringAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
+
+    def get_site(self, request, site_id):
+        organisations = BillingAccessService().organisations_avec_acces(request.user)
+        return get_object_or_404(
+            Site.objects.select_related("organisation"),
+            pk=site_id,
+            organisation__in=organisations,
+        )
+
+
+class SiteMonitoringSummaryView(SiteMonitoringAPIView):
+    def get(self, request, site_id):
+        site = self.get_site(request, site_id)
+        summary, _ = obtenir_indicateurs_site(site)
+        return Response(MonitoringSummarySerializer(summary).data)
+
+
+class SiteCurrentLoadView(SiteMonitoringAPIView):
+    def get(self, request, site_id):
+        site = self.get_site(request, site_id)
+        summary, _ = obtenir_indicateurs_site(site)
+        current_load = {
+            key: summary[key]
+            for key in (
+                "site_id",
+                "site_name",
+                "current_power_kw",
+                "latest_measurement_at",
+                "equipment",
+            )
+        }
+        return Response(CurrentLoadSerializer(current_load).data)
+
+
+class SiteTopConsumersView(SiteMonitoringAPIView):
+    def get(self, request, site_id):
+        site = self.get_site(request, site_id)
+        _, consumers = obtenir_indicateurs_site(site)
+        return Response(consumers[:10])
+
+
+class EquipmentTelemetryHistoryView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated, EstAbonnementActif]
+    serializer_class = TelemetryHistorySerializer
+
+    def get_queryset(self):
+        organisations = BillingAccessService().organisations_avec_acces(
+            self.request.user
+        )
+        equipement = get_object_or_404(
+            Equipement.objects.filter(site__organisation__in=organisations),
+            pk=self.kwargs["equipement_id"],
+        )
+        return (
+            MesureCapteur.objects.filter(capteur__equipement=equipement)
+            .select_related("capteur")
+            .order_by("-date_mesure", "-date_reception")
+        )

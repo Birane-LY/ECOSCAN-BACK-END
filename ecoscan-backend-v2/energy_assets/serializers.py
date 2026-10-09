@@ -293,6 +293,88 @@ class EtatEquipementSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class ChargeEquipementSerializer(serializers.Serializer):
+    equipment_id = serializers.UUIDField()
+    name = serializers.CharField()
+    zone_id = serializers.UUIDField(allow_null=True)
+    zone_name = serializers.CharField(allow_null=True)
+    power_kw = serializers.DecimalField(max_digits=12, decimal_places=3)
+    reported_state = serializers.ChoiceField(choices=Equipement.Etat.choices)
+    is_online = serializers.BooleanField()
+
+
+class ConsommateurPrincipalSerializer(ChargeEquipementSerializer):
+    share_percent = serializers.DecimalField(max_digits=5, decimal_places=1)
+
+
+class MonitoringSummarySerializer(serializers.Serializer):
+    site_id = serializers.UUIDField()
+    site_name = serializers.CharField()
+    current_power_kw = serializers.DecimalField(max_digits=16, decimal_places=3)
+    today_energy_kwh = serializers.DecimalField(
+        max_digits=20,
+        decimal_places=6,
+        allow_null=True,
+    )
+    yesterday_energy_kwh = serializers.DecimalField(
+        max_digits=20,
+        decimal_places=6,
+        allow_null=True,
+    )
+    month_energy_kwh = serializers.DecimalField(
+        max_digits=20,
+        decimal_places=6,
+        allow_null=True,
+    )
+    energy_coverage = serializers.DictField(
+        child=serializers.DictField(child=serializers.IntegerField())
+    )
+    monitored_equipment_count = serializers.IntegerField()
+    active_equipment_count = serializers.IntegerField()
+    offline_equipment_count = serializers.IntegerField()
+    top_consumer = ConsommateurPrincipalSerializer(allow_null=True)
+    latest_measurement_at = serializers.DateTimeField(allow_null=True)
+
+
+class CurrentLoadSerializer(serializers.Serializer):
+    site_id = serializers.UUIDField()
+    site_name = serializers.CharField()
+    current_power_kw = serializers.DecimalField(max_digits=16, decimal_places=3)
+    latest_measurement_at = serializers.DateTimeField(allow_null=True)
+    equipment = ChargeEquipementSerializer(many=True)
+
+
+class TelemetryHistorySerializer(serializers.ModelSerializer):
+    telemetry_id = serializers.UUIDField(source="id", read_only=True)
+    sensor_id = serializers.UUIDField(source="capteur_id", read_only=True)
+    sensor_identifier = serializers.CharField(source="capteur.identifiant", read_only=True)
+    sensor_type = serializers.CharField(source="capteur.type", read_only=True)
+    source = serializers.CharField(source="capteur.mode", read_only=True)
+    timestamp = serializers.DateTimeField(source="date_mesure", read_only=True)
+    received_at = serializers.DateTimeField(source="date_reception", read_only=True)
+    value = serializers.DecimalField(
+        source="valeur",
+        max_digits=20,
+        decimal_places=6,
+        read_only=True,
+    )
+    unit = serializers.CharField(source="unite", read_only=True)
+
+    class Meta:
+        model = MesureCapteur
+        fields = (
+            "telemetry_id",
+            "sensor_id",
+            "sensor_identifier",
+            "sensor_type",
+            "source",
+            "timestamp",
+            "received_at",
+            "value",
+            "unit",
+        )
+
+
 class EquipementSerializer(OrganisationAccessibleSerializer):
     """Sérialiseur pour les équipements et leur état de monitoring courant."""
 
