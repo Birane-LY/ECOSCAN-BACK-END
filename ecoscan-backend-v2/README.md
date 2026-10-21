@@ -158,6 +158,9 @@ des identifiants fonctionnels.
 Les origines CORS locales des fronts `localhost:3000` et `localhost:3001` sont
 déclarées dans les paramètres. En mode debug, CORS est ouvert par le code :
 ne déployez jamais une configuration `DEBUG` en production.
+Sur Render, renseignez `CORS_ALLOWED_ORIGINS` avec les origines publiques
+autorisées, séparées par des virgules et sans chemin final. Le Blueprint inclut
+l’origine Vercel du front de production.
 
 ### Base de données
 
