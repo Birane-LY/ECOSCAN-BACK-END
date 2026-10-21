@@ -19,6 +19,10 @@ if [ "${PROVISION_DEMO_ACCOUNTS:-false}" = "true" ]; then
     python manage.py provisionner_comptes_demo
 fi
 
+if [ "${PROVISION_DEMO_READER:-false}" = "true" ]; then
+    python manage.py provisionner_comptes_demo --lecture-only
+fi
+
 exec gunicorn config.wsgi:application \
     --bind "0.0.0.0:${PORT:-8000}" \
     --workers "${WEB_CONCURRENCY:-1}" \

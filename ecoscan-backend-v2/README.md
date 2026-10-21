@@ -728,6 +728,11 @@ par la commande. Ils ne doivent être ni ajoutés au dépôt ni partagés dans u
 ticket. Sans cette étape, les comptes anonymisés de la base de démonstration
 ne sont pas des identifiants de connexion utilisables.
 
+Pour créer ou réinitialiser uniquement le compte de lecture sans modifier les
+autres comptes pilotes, définissez `PROVISION_DEMO_READER=true` et configurez
+`ECOSCAN_DEMO_LECTURE_PASSWORD` dans les secrets du service. Cette option lie
+le compte aux trois organisations pilotes existantes.
+
 ## Dépannage
 
 ### Django ne démarre pas

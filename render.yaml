@@ -18,6 +18,8 @@ services:
         value: /tmp/ecoscan-demo.sqlite3
       - key: PROVISION_DEMO_ACCOUNTS
         value: "false"
+      - key: PROVISION_DEMO_READER
+        value: "false"
       - key: AI_SERVICE_URL
         value: http://127.0.0.1:8001
       - key: AI_SERVICE_INTERNAL_TOKEN

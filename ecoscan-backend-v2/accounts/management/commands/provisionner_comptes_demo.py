@@ -38,10 +38,18 @@ COMPTES_DEMO = (
 class Command(BaseCommand):
     help = "Provisionne les comptes de démonstration depuis des secrets d'environnement."
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--lecture-only",
+            action="store_true",
+            help="Provisionne uniquement le compte de lecture sans modifier les autres comptes.",
+        )
+
     @transaction.atomic
     def handle(self, *args, **options):
+        comptes_a_provisionner = COMPTES_DEMO[3:] if options["lecture_only"] else COMPTES_DEMO
         passwords = {}
-        for email, _name, _role, variable in COMPTES_DEMO:
+        for email, _name, _role, variable in comptes_a_provisionner:
             password = os.environ.get(variable, "")
             if len(password) < 20:
                 raise CommandError(
@@ -49,7 +57,7 @@ class Command(BaseCommand):
                 )
             passwords[email] = password
 
-        if len(set(passwords.values())) != len(passwords):
+        if not options["lecture_only"] and len(set(passwords.values())) != len(passwords):
             raise CommandError("Each demo account must have a distinct password.")
 
         organisations_pilotes = []
@@ -75,7 +83,7 @@ class Command(BaseCommand):
                 "The pilot demo accounts must belong to three distinct organizations."
             )
 
-        for email, name, role, _variable in COMPTES_DEMO:
+        for email, name, role, _variable in comptes_a_provisionner:
             user, _created = Utilisateur.objects.get_or_create(
                 email=email,
                 defaults={
@@ -113,6 +121,8 @@ class Command(BaseCommand):
 
         self.stdout.write(
             self.style.SUCCESS(
-                "Provisioned four demo accounts across three demo organizations."
+                "Provisioned the demo reader across three demo organizations."
+                if options["lecture_only"]
+                else "Provisioned four demo accounts across three demo organizations."
             )
         )

@@ -43,6 +43,50 @@ class DemoAccountProvisioningTests(TestCase):
                 utilisateur=user,
             )
 
+    @patch.dict(
+        os.environ,
+        {"ECOSCAN_DEMO_LECTURE_PASSWORD": PASSWORD_ENV["ECOSCAN_DEMO_LECTURE_PASSWORD"]},
+        clear=True,
+    )
+    def test_provisions_only_reader_without_changing_pilot_passwords(self):
+        pilot_password_hashes = {
+            user.email: user.password
+            for user in Utilisateur.objects.filter(email__in=PILOT_EMAILS)
+        }
+
+        call_command("provisionner_comptes_demo", lecture_only=True)
+
+        reader = Utilisateur.objects.get(email="demo.lecture@demo.ecoscan.test")
+        self.assertEqual(reader.role, Utilisateur.Role.CONSULTANT)
+        self.assertTrue(reader.actif)
+        self.assertFalse(reader.is_staff)
+        self.assertFalse(reader.is_superuser)
+        self.assertTrue(
+            reader.check_password(PASSWORD_ENV["ECOSCAN_DEMO_LECTURE_PASSWORD"])
+        )
+        self.assertEqual(reader.password, reader.mot_de_passe_hash)
+        self.assertEqual(
+            UtilisateurOrganisation.objects.filter(utilisateur=reader).count(),
+            3,
+        )
+        self.assertTrue(PreferencesUtilisateur.objects.filter(utilisateur=reader).exists())
+        self.assertEqual(
+            {
+                user.email: user.password
+                for user in Utilisateur.objects.filter(email__in=PILOT_EMAILS)
+            },
+            pilot_password_hashes,
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_reader_only_requires_its_password_before_creating_account(self):
+        with self.assertRaises(CommandError):
+            call_command("provisionner_comptes_demo", lecture_only=True)
+
+        self.assertFalse(
+            Utilisateur.objects.filter(email="demo.lecture@demo.ecoscan.test").exists()
+        )
+
     @patch.dict(os.environ, PASSWORD_ENV, clear=True)
     def test_provisions_accounts_and_links_reader_to_all_demo_organizations(self):
         call_command("provisionner_comptes_demo")
