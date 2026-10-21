@@ -733,6 +733,10 @@ autres comptes pilotes, définissez `PROVISION_DEMO_READER=true` et configurez
 `ECOSCAN_DEMO_LECTURE_PASSWORD` dans les secrets du service. Cette option lie
 le compte aux trois organisations pilotes existantes.
 
+Pour utiliser PostgreSQL persistant sur Render, définissez
+`ECOSCAN_DEMO_SEEDED_SQLITE=false` et fournissez `DATABASE_URL` comme secret.
+Le Blueprint conserve cette variable sans publier sa valeur.
+
 ## Dépannage
 
 ### Django ne démarre pas

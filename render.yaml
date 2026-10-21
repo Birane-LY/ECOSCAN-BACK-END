@@ -13,13 +13,15 @@ services:
       - key: DJANGO_DEBUG
         value: "0"
       - key: ECOSCAN_DEMO_SEEDED_SQLITE
-        value: "true"
+        value: "false"
+      - key: DATABASE_URL
+        sync: false
       - key: SQLITE_DB_PATH
         value: /tmp/ecoscan-demo.sqlite3
       - key: PROVISION_DEMO_ACCOUNTS
         value: "false"
       - key: PROVISION_DEMO_READER
-        value: "false"
+        value: "true"
       - key: AI_SERVICE_URL
         value: http://127.0.0.1:8001
       - key: AI_SERVICE_INTERNAL_TOKEN
