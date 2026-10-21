@@ -271,6 +271,67 @@ docker compose logs --tail 100 energy-simulator
 docker compose logs --tail 100 energy-jobs
 ```
 
+### Déploiement du jeu de démonstration public
+
+Le dépôt peut contenir une copie SQLite de démonstration assainie. Elle conserve
+les données synthétiques de sites, équipements et télémétrie, remplace les
+hashes de mots de passe par des valeurs inutilisables, anonymise les autres
+comptes et retire les sessions, journaux d’audit et traces d’administration.
+Ne l’utilisez pas comme base de production client.
+
+Pour créer une copie depuis une base locale sans modifier la source :
+
+```powershell
+python scripts/export_public_demo_database.py `
+  --source db.sqlite3 `
+  --output demo-data.sqlite3
+```
+
+Le script refuse d’écraser un fichier de destination existant. Vérifiez les
+comptes et les données avant de publier l’export; ne publiez jamais le fichier
+`db.sqlite3` d’origine ni une sauvegarde SQLite brute.
+
+Pour démarrer une instance isolée dédiée à la démonstration, configurez d’abord
+les variables normales de `.env`, puis préparez le fichier privé des mots de
+passe à partir du modèle :
+
+```powershell
+Copy-Item demo-secrets.env.example demo-secrets.env
+# Renseignez les quatre valeurs depuis le gestionnaire de secrets; ne les committez pas.
+docker compose -f docker-compose.yml -f docker-compose.demo.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+```
+
+Cet environnement utilise le volume distinct `ecoscan-demo-sqlite-data` et y
+copie la base assainie uniquement si le volume ne contient pas encore de base.
+Il conserve les données d’un volume déjà initialisé. Le simulateur ne produit
+que des relevés simulés et ne commande aucun matériel. La base de démonstration
+comprend les organisations liées aux comptes pilote, multisite et anomalies.
+
+Le compte lecture `demo.lecture@demo.ecoscan.test` est créé et rattaché à ces
+trois organisations lors du provisionnement. Fournissez quatre mots de passe
+distincts d’au moins 20 caractères par les variables de `demo-secrets.env` :
+`ECOSCAN_DEMO_CONTROL_PASSWORD`, `ECOSCAN_DEMO_MULTISITE_PASSWORD`,
+`ECOSCAN_DEMO_ANOMALIES_PASSWORD` et `ECOSCAN_DEMO_LECTURE_PASSWORD`. Ne mettez
+pas ces valeurs dans Git, une image ou un journal. Après le démarrage, lancez :
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.demo.yml `
+  exec backend python manage.py provisionner_comptes_demo
+```
+
+La commande définit les quatre mots de passe à partir du fichier privé et ne
+les affiche pas. Elle refuse les variables absentes, trop courtes ou
+dupliquées, ainsi que les bases où les trois comptes pilote ne sont pas chacun
+rattachés à une organisation distincte. Les mots de passe déjà partagés dans
+une conversation doivent être changés et ne doivent pas être réutilisés.
+
+Important : `demo.lecture` utilise le rôle `CONSULTANT`, mais l’API actuelle
+n’impose pas une règle lecture seule uniforme à tous les endpoints de
+monitoring. Ne traitez pas ce compte comme un rôle de sécurité en lecture seule;
+il sert à la présentation du jeu de données et ne doit pas recevoir de données
+ou d’accès sensibles.
+
 Pour arrêter le projet sans supprimer les volumes de données :
 
 ```powershell

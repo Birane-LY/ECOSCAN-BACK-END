@@ -1,4 +1,5 @@
 .env
+demo-secrets.env
 n8n/.env.local
 .venv/
 __pycache__/

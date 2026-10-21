@@ -20,8 +20,8 @@ COPY . .
 
 RUN addgroup --system app \
     && adduser --system --ingroup app app \
-    && mkdir -p /app/media /app/gateway/data \
-    && chown -R app:app /app
+    && mkdir -p /app/media /app/gateway/data /data \
+    && chown -R app:app /app /data
 
 USER app
 EXPOSE 8000

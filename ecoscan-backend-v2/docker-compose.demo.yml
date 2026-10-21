@@ -1,0 +1,30 @@
+services:
+  backend:
+    env_file:
+      - ./.env
+      - ./demo-secrets.env
+    volumes:
+      - ./demo-data.sqlite3:/seed/demo-data.sqlite3:ro
+    command:
+      - sh
+      - -c
+      - >-
+        if [ ! -s /data/db.sqlite3 ]; then
+          cp /seed/demo-data.sqlite3 /data/db.sqlite3;
+        fi;
+        python manage.py migrate --noinput &&
+        python manage.py runserver 0.0.0.0:8000
+  energy-simulator:
+    command:
+      - python
+      - manage.py
+      - simuler_capteurs
+      - --interval
+      - "5"
+  energy-jobs:
+    profiles:
+      - demo-optional-jobs
+
+volumes:
+  ecoscan-sqlite-data:
+    name: ecoscan-demo-sqlite-data
