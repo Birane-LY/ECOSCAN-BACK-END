@@ -27,6 +27,6 @@ USER app
 EXPOSE 8000
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=10 --start-period=30s \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/admin/login/', timeout=3)"
+  CMD python -c "import os, urllib.request; urllib.request.urlopen(f\"http://127.0.0.1:{os.getenv('PORT', '8000')}/admin/login/\", timeout=3)"
 
-CMD ["sh", "-c", "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"]
+CMD ["sh", "/app/deploy/render-start.sh"]

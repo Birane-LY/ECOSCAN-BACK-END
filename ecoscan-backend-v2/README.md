@@ -702,6 +702,32 @@ N’utilisez pas un `.env.example` tel quel en production. Les valeurs
 `replace-with-*`, `change-me-*`, comptes `example.test` et URLs locales sont
 des exemples à remplacer ou à ne pas utiliser.
 
+### Prototype temporaire sur Render Free
+
+Le Blueprint à la racine du dépôt (`../render.yaml`) déploie l’API avec le jeu
+de données anonymisé `demo-data.sqlite3` déjà publié dans ce dépôt. Le profil
+`ECOSCAN_DEMO_SEEDED_SQLITE=true` copie cette base vers `/tmp` avant les
+migrations et le démarrage Gunicorn. Il est réservé à une démonstration
+temporaire : Render Free met en veille les services après inactivité et son
+système de fichiers est éphémère. Les changements faits dans l’application
+sont perdus au redémarrage; la base revient à l’instantané anonymisé du dépôt.
+N’y stockez aucune donnée réelle ni aucun document utilisateur.
+
+Les services Free ne reçoivent pas le trafic réseau privé Render. L’API Django
+et l’IA doivent donc être configurées avec leurs URL HTTPS publiques; les
+routes de service à service doivent rester protégées par des jetons forts
+distincts. L’IA ne doit jamais recevoir directement de requêtes du navigateur.
+Render réserve les offres gratuites aux prototypes, pas aux applications de
+production; vérifiez ses limites actuelles de veille, stockage, heures incluses
+et durée de vie des bases gratuites avant chaque déploiement.
+
+Le démarrage appelle `provisionner_comptes_demo` uniquement lorsque
+`PROVISION_DEMO_ACCOUNTS=true`. Dans ce cas, configurez dans les secrets du
+service les quatre mots de passe distincts de 20 caractères minimum attendus
+par la commande. Ils ne doivent être ni ajoutés au dépôt ni partagés dans un
+ticket. Sans cette étape, les comptes anonymisés de la base de démonstration
+ne sont pas des identifiants de connexion utilisables.
+
 ## Dépannage
 
 ### Django ne démarre pas

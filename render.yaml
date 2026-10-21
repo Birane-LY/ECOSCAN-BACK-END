@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: ecoscan-backend-api
+    runtime: docker
+    region: frankfurt
+    plan: free
+    rootDir: ./ecoscan-backend-v2
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /admin/login/
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_DEBUG
+        value: "0"
+      - key: ECOSCAN_DEMO_SEEDED_SQLITE
+        value: "true"
+      - key: SQLITE_DB_PATH
+        value: /tmp/ecoscan-demo.sqlite3
+      - key: PROVISION_DEMO_ACCOUNTS
+        value: "false"
+      - key: AI_SERVICE_URL
+        value: http://127.0.0.1:8001
+      - key: AI_SERVICE_INTERNAL_TOKEN
+        generateValue: true
+      - key: DJANGO_INTERNAL_TOKEN
+        generateValue: true
+      - key: CORS_ALLOWED_ORIGINS
+        value: ""

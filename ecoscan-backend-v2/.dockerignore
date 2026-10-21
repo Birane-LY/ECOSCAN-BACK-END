@@ -8,6 +8,7 @@ env
 __pycache__
 *.py[cod]
 *.sqlite3
+!demo-data.sqlite3
 .git
 .pytest_cache
 .coverage
