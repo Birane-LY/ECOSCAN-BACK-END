@@ -731,7 +731,9 @@ ne sont pas des identifiants de connexion utilisables.
 Pour créer ou réinitialiser uniquement le compte de lecture sans modifier les
 autres comptes pilotes, définissez `PROVISION_DEMO_READER=true` et configurez
 `ECOSCAN_DEMO_LECTURE_PASSWORD` dans les secrets du service. Cette option lie
-le compte aux trois organisations pilotes existantes.
+le compte aux trois organisations pilotes existantes. Remettez ensuite
+`PROVISION_DEMO_READER=false` pour ne pas réinitialiser son mot de passe à
+chaque redémarrage.
 
 Pour utiliser PostgreSQL persistant sur Render, définissez
 `ECOSCAN_DEMO_SEEDED_SQLITE=false` et fournissez `DATABASE_URL` comme secret.
