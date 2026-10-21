@@ -17,11 +17,10 @@ from analysis.services.anomaly import (
 
 from .models import Capteur, MesureCapteur
 from .notifications import notifier_anomalie_detectee
-from .services import convertir_mesure
+from .services import MINIMUM_RELEVES_JOUR, convertir_mesure
 
 
 JOURS_BASELINE = 4
-MINIMUM_RELEVES_JOUR = 4
 
 
 def code_metrique_site(site):
@@ -179,6 +178,7 @@ def analyser_anomalies_site(site, jour=None, maintenant=None):
             {
                 "sensor_id": str(capteur.id),
                 "equipment_id": str(capteur.equipement_id),
+                "mode": capteur.mode,
             }
             for capteur in capteurs
         ],
@@ -226,6 +226,9 @@ def analyser_anomalies_site(site, jour=None, maintenant=None):
     if anomalie.statut == Anomalie.Statut.RESOLVED:
         anomalie.statut = Anomalie.Statut.DETECTED
     anomalie.save(update_fields=(*champs, "statut"))
+    from analysis.services.orchestrator import planifier_suivi_anomalie
+
+    planifier_suivi_anomalie(anomalie)
     if statut_anomalie_precedent in (
         None,
         Anomalie.Statut.RESOLVED,

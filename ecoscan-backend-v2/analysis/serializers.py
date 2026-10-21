@@ -66,12 +66,16 @@ class ActionSerializer(serializers.ModelSerializer):
         model = Action
         fields = (
             "id", "recommandation", "titre", "description", "statut",
-            "responsable", "date_echeance", "date_realisation",
+            "responsable", "equipement", "date_echeance", "date_realisation",
             "economie_realisee_fcfa", "taux_realisation_impact", "date_mesure_impact",
+            "energie_reference_kwh", "energie_post_action_kwh",
+            "economie_energie_kwh", "capteur_impact", "date_mesure_energie",
         )
         read_only_fields = (
             "id", "statut", "date_realisation",
             "economie_realisee_fcfa", "taux_realisation_impact", "date_mesure_impact",
+            "energie_reference_kwh", "energie_post_action_kwh",
+            "economie_energie_kwh", "capteur_impact", "date_mesure_energie",
         )
 
     def validate_recommandation(self, value):
@@ -79,7 +83,27 @@ class ActionSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        """Vérifie que la date d'échéance de l'action est cohérente."""
+        attrs = super().validate(attrs)
+        recommandation = attrs.get("recommandation", getattr(self.instance, "recommandation", None))
+        equipement = attrs.get("equipement", getattr(self.instance, "equipement", None))
+        if recommandation and equipement:
+            if equipement.site.organisation_id != recommandation.objectif.organisation_id:
+                raise serializers.ValidationError(
+                    {"equipement": "L'équipement doit appartenir à l'organisation de la recommandation."}
+                )
+        if self.instance and self.instance.statut == Action.Statut.TERMINEE:
+            if (
+                "equipement" in attrs
+                and self.instance.equipement_id
+                and attrs["equipement"] != self.instance.equipement
+            ):
+                raise serializers.ValidationError(
+                    {"equipement": "L'équipement d'une action terminée ne peut plus être modifié."}
+                )
+            if "recommandation" in attrs and attrs["recommandation"] != self.instance.recommandation:
+                raise serializers.ValidationError(
+                    {"recommandation": "La recommandation d'une action terminée ne peut plus être modifiée."}
+                )
         date_echeance = attrs.get("date_echeance")
         if date_echeance and date_echeance < timezone.now():
             raise serializers.ValidationError(
@@ -208,15 +232,51 @@ class ObservationOperationnelleSerializer(serializers.ModelSerializer):
 
 class AnomalieSerializer(serializers.ModelSerializer):
     recommandations = RecommandationSerializer(many=True, read_only=True)
+    hypotheses = serializers.SerializerMethodField()
+    resume_donnees = serializers.SerializerMethodField()
 
     class Meta:
         model = Anomalie
         fields = (
             "id", "organisation", "resultat_metrique", "type", "severite",
             "valeur_observee", "valeur_attendue", "ecart_pourcentage", "statut", "date_detection",
-            "recommandations",
+            "recommandations", "hypotheses", "resume_donnees",
         )
         read_only_fields = fields
+
+    def get_hypotheses(self, obj):
+        return HypotheseSerializer(
+            obj.hypotheses.all(),
+            many=True,
+        ).data
+
+    def get_resume_donnees(self, obj):
+        resultat = obj.resultat_metrique
+        if resultat is None:
+            return None
+
+        modes = {
+            source.get("mode")
+            for source in resultat.sources
+            if isinstance(source, dict) and source.get("mode")
+        }
+        if modes == {"REAL"}:
+            provenance = "TELEMETRIE_REELLE"
+        elif modes == {"SIMULATED"}:
+            provenance = "TELEMETRIE_SIMULEE"
+        elif modes:
+            provenance = "TELEMETRIE_MIXTE"
+        elif resultat.code_metrique == "variation_woyofal_rituelle_vs_moyenne_recente":
+            provenance = "RELEVES_WOYOFAL_SAISIS"
+        else:
+            provenance = "ORIGINE_NON_PRECISEE"
+
+        return {
+            "provenance": provenance,
+            "completude": resultat.completude,
+            "statut_qualite": resultat.statut_qualite,
+            "limites": resultat.limites,
+        }
 
 
 class HypotheseSerializer(serializers.ModelSerializer):

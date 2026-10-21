@@ -88,15 +88,16 @@ def _memoire_de(anomalie_id):
 
 
 def synchroniser_memoire_recommandations(anomalie_id) -> None:
-    """Répercute les recommandations de l'anomalie dans sa mémoire : « action menée »
-    et impact attendu (somme des économies exprimées en FCFA)."""
+    """Ajoute les pistes proposées à la mémoire sans les présenter comme des actions menées."""
     memoire = _memoire_de(anomalie_id)
     if memoire is None:
         return
     recos = list(Recommandation.objects.filter(anomalie_id=anomalie_id).order_by("titre"))
     if not recos:
         return
-    memoire.action_texte = "\n".join(f"- {r.titre} : {r.description}" for r in recos)
+    memoire.action_texte = "Pistes proposées (décision humaine requise) :\n" + "\n".join(
+        f"- {r.titre} : {r.description}" for r in recos
+    )
     memoire.impact_attendu_fcfa = sum((r.economie_estimee for r in recos if _est_fcfa(r.unite)), Decimal("0")) or None
     memoire.save(update_fields=("action_texte", "impact_attendu_fcfa"))
     planifier_reindexation(memoire)

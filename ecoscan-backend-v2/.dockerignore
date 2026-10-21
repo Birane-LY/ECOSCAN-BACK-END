@@ -1,4 +1,7 @@
 .env
+gateway/.env
+gateway/equipment-entities.json
+gateway/data
 .venv
 env
 __pycache__

@@ -20,10 +20,6 @@ from analysis.services.recommandations import synchroniser_memoire_recommandatio
 
 logger = logging.getLogger(__name__)
 
-# Tarif moyen indicatif Senelec BT PME pour valoriser les kWh en FCFA
-TARIF_KWH_FCFA = Decimal("140")
-
-
 def _est_woyofal_rituel(anomalie):
     resultat = anomalie.resultat_metrique
     return bool(
@@ -32,10 +28,27 @@ def _est_woyofal_rituel(anomalie):
     )
 
 
+def _contexte_provenance(anomalie):
+    resultat = anomalie.resultat_metrique
+    if resultat and resultat.code_metrique == "variation_woyofal_rituelle_vs_moyenne_recente":
+        return "relevés Woyofal saisis manuellement"
+
+    modes = {
+        source.get("mode")
+        for source in (resultat.sources if resultat else [])
+        if isinstance(source, dict) and source.get("mode")
+    }
+    if modes == {"SIMULATED"}:
+        return "télémétrie simulée"
+    if modes == {"REAL"}:
+        return "télémétrie réelle"
+    if modes:
+        return "télémétrie mixte (réelle et simulée)"
+    return "provenance non précisée"
+
+
 def _obtenir_ou_creer_objectif(organisation, woyofal_rituel=False, anomalie=None):
-    """Retourne l'objectif FCFA s'il existe, sinon le premier objectif ACTIF.
-    Si aucun objectif n'est actif, crée automatiquement un objectif par défaut
-    en FCFA pour que l'IA puisse toujours lier sa recommandation sans blocage."""
+    """Retourne ou crée un objectif énergétique compatible avec l'anomalie."""
     from energy.models import Objectif
 
     if woyofal_rituel:
@@ -46,6 +59,8 @@ def _obtenir_ou_creer_objectif(organisation, woyofal_rituel=False, anomalie=None
         ).order_by("date_debut").first()
         if objectif:
             return objectif
+        if anomalie and anomalie.type != "consumption_spike":
+            return None
         reference = anomalie.valeur_attendue if anomalie else None
         if reference is None or reference <= 0:
             logger.warning(
@@ -72,56 +87,63 @@ def _obtenir_ou_creer_objectif(organisation, woyofal_rituel=False, anomalie=None
             statut=Objectif.Statut.ACTIF,
         )
 
-    objectif = (
-        Objectif.objects.filter(organisation=organisation, statut=Objectif.Statut.ACTIF, unite__in=["FCFA", "XOF"])
-        .order_by("date_debut")
-        .first()
-    )
+    objectif = Objectif.objects.filter(
+        organisation=organisation,
+        statut=Objectif.Statut.ACTIF,
+        unite__iexact="kWh",
+    ).order_by("date_debut").first()
     if objectif is not None:
         return objectif
 
-    objectif = (
-        Objectif.objects.filter(organisation=organisation, statut=Objectif.Statut.ACTIF)
-        .order_by("date_debut")
-        .first()
-    )
-    if objectif is not None:
-        return objectif
+    if anomalie and anomalie.type != "consumption_spike":
+        return None
+    reference = anomalie.valeur_attendue if anomalie else None
+    if reference is None or reference <= 0:
+        logger.warning(
+            "Objectif kWh non créé pour l'anomalie %s : référence absente ou nulle.",
+            getattr(anomalie, "id", None),
+        )
+        return None
 
-    # Aucun objectif ACTIF : créer l'objectif par défaut
     debut = timezone.now()
-    fin = debut + timedelta(days=365)
-    try:
-        objectif = Objectif.objects.create(
-            organisation=organisation,
-            nom="Réduire la facture énergétique",
-            description="Objectif par défaut : réduire les dépenses liées à l'électricité (Senelec).",
-            type="reduction_cout",
-            valeur_cible=Decimal("10"),
-            unite="FCFA",
-            date_debut=debut,
-            date_fin=fin,
-            statut=Objectif.Statut.ACTIF,
-        )
-        logger.info(
-            "Objectif automatique créé (%s) pour l'organisation %s.",
-            objectif.id,
-            organisation.id,
-        )
-        return objectif
-    except Exception:
-        logger.exception("Impossible de créer l'objectif automatique pour %s.", organisation.id)
-        # Fallback de secours : n'importe quel objectif existant
-        return Objectif.objects.filter(organisation=organisation).first()
+    objectif = Objectif.objects.create(
+        organisation=organisation,
+        nom="Réduire la consommation électrique",
+        description=(
+            "Objectif automatiquement proposé à partir de la consommation de référence "
+            "observée; la mesure conserve la provenance des données."
+        ),
+        type="REDUCTION_CONSOMMATION",
+        valeur_cible=max(
+            Decimal("0.001"),
+            (Decimal(reference) * Decimal("0.10")).quantize(Decimal("0.001")),
+        ),
+        unite="kWh",
+        date_debut=debut,
+        date_fin=debut + timedelta(days=365),
+        statut=Objectif.Statut.ACTIF,
+    )
+    logger.info(
+        "Objectif énergétique automatique créé (%s) pour l'organisation %s.",
+        objectif.id,
+        organisation.id,
+    )
+    return objectif
 
 
 def _economie_depuis_anomalie(anomalie: Anomalie) -> Decimal:
-    """Estimation conservatrice en FCFA : 50 % du volume d'écart valorisé à 140 FCFA/kWh."""
-    if anomalie.valeur_observee and anomalie.valeur_attendue:
-        ecart_kwh = abs(anomalie.valeur_observee - anomalie.valeur_attendue)
-        return (ecart_kwh * TARIF_KWH_FCFA * Decimal("0.5")).quantize(Decimal("0.01"))
-    # Valeur forfaitaire réaliste si les valeurs absolues manquent
-    return Decimal("25000.00")
+    """Écart énergétique à investiguer, sans le présenter comme une économie acquise."""
+    if (
+        anomalie.type != "consumption_spike"
+        or anomalie.valeur_observee is None
+        or anomalie.valeur_attendue is None
+    ):
+        return Decimal("0.00")
+    ecart_kwh = max(
+        Decimal("0"),
+        Decimal(anomalie.valeur_observee) - Decimal(anomalie.valeur_attendue),
+    )
+    return ecart_kwh.quantize(Decimal("0.01"))
 
 
 def _recommandation_woyofal(anomalie):
@@ -175,21 +197,24 @@ def generer_recommandation_auto(anomalie: Anomalie) -> Recommandation | None:
         return None
 
     sens = "hausse" if anomalie.type == "consumption_spike" else "baisse"
+    provenance = _contexte_provenance(anomalie)
     hypothese_texte = (
         anomalie.hypotheses.order_by("-date_creation").values_list("texte", flat=True).first()
         or "Variation inhabituelle de consommation constatée sur la facture."
     )
 
     question = (
-        f"Une anomalie de consommation a été détectée pour une PME au Sénégal : {sens} de {anomalie.ecart_pourcentage}% "
+        f"Une anomalie de consommation a été détectée via {provenance} : "
+        f"{sens} de {anomalie.ecart_pourcentage}% "
         f"(sévérité : {anomalie.severite}).\n"
         f"Diagnostic retenu : {hypothese_texte}\n\n"
         "Propose UNE recommandation d'action concrète, opérationnelle et immédiatement réalisable par le gérant ou technicien.\n"
+        "Ne déduis pas de montant financier ni d'économie garantie à partir de l'écart.\n"
+        "Si la télémétrie est simulée ou mixte, formule une piste à tester et ne la présente jamais comme un fait réel.\n"
         "Réponds STRICTEMENT sous ce format JSON (aucun texte avant ni après) :\n"
-        '{"titre": "...", "description": "...", "economie_estimee_fcfa": 35000}\n'
+        '{"titre": "...", "description": "..."}\n'
         "- titre : impératif, clair, max 80 caractères (ex: « Vérifier l'étalonnage et les index du compteur principal »)\n"
-        "- description : 2 phrases explicatives sur les actions précises à entreprendre sur site\n"
-        "- economie_estimee_fcfa : montant estimé en FCFA (nombre entier positif)"
+        "- description : 2 phrases explicatives sur les actions précises à entreprendre sur site"
     )
 
     if woyofal_rituel:
@@ -208,25 +233,29 @@ def generer_recommandation_auto(anomalie: Anomalie) -> Recommandation | None:
             data = json.loads(texte_brut[debut:fin])
             titre = str(data.get("titre") or "").strip()[:180] or None
             description = str(data.get("description") or "").strip() or None
-            val = data.get("economie_estimee_fcfa")
-            if val is not None:
-                economie = Decimal(str(val)).quantize(Decimal("0.01"))
         except (ValueError, KeyError, InvalidOperation, json.JSONDecodeError):
             logger.warning("Réponse IA non parseable en JSON pour recommandation auto, anomalie %s.", anomalie.id)
 
-    if not titre:
+    if not titre or not description:
         if anomalie.type == "consumption_drop":
-            titre = f"Contrôler le compteur et les équipements suite à la baisse de {abs(float(anomalie.ecart_pourcentage))}%"
-            description = (
+            titre = titre or f"Contrôler le compteur et les équipements suite à la baisse de {abs(float(anomalie.ecart_pourcentage))}%"
+            description = description or (
                 f"La consommation a chuté de {anomalie.ecart_pourcentage}%. "
                 "Vérifier le bon fonctionnement des compteurs divisionnaires et s'assurer qu'aucun équipement clé n'a été arrêté anormalement."
             )
         else:
-            titre = f"Traiter la hausse de consommation (+{anomalie.ecart_pourcentage}%)"
-            description = (
+            titre = titre or f"Traiter la hausse de consommation (+{anomalie.ecart_pourcentage}%)"
+            description = description or (
                 f"Une hausse de {anomalie.ecart_pourcentage}% a été constatée. "
                 "Identifier les appareils fonctionnant en continu (froid, climatisation, moteurs) et poser des consignes d'extinction."
             )
+
+    if provenance == "télémétrie simulée":
+        description += "\n\nProvenance : simulation de télémétrie, à confirmer sur le terrain."
+    elif provenance == "télémétrie mixte (réelle et simulée)":
+        description += "\n\nProvenance : télémétrie mixte; vérifier les capteurs simulés sur le terrain."
+    elif provenance == "relevés Woyofal saisis manuellement":
+        description += "\n\nProvenance : relevés rituels saisis manuellement."
 
     try:
         reco = Recommandation.objects.create(
@@ -236,7 +265,7 @@ def generer_recommandation_auto(anomalie: Anomalie) -> Recommandation | None:
             description=description,
             impact_estime=economie,
             economie_estimee=economie,
-            unite="kWh" if woyofal_rituel else "FCFA",
+            unite="kWh",
             priorite=(
                 Recommandation.Priorite.CRITIQUE
                 if anomalie.severite == Anomalie.Severite.INVESTIGATION_PRIORITAIRE

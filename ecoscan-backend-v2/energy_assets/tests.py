@@ -12,7 +12,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from analysis.models import Anomalie, Recommandation, ResultatMetrique
+from analysis.models import Anomalie, Hypothese, Recommandation, ResultatMetrique
 from billing.models import Abonnement, Plan
 from energy.models import Objectif
 from organizations.models import Organisation, Site, UtilisateurOrganisation
@@ -20,21 +20,28 @@ from organizations.models import Organisation, Site, UtilisateurOrganisation
 from .models import (
     ActionVirtuelle,
     Capteur,
+    CapteurPresence,
     CommandeEquipement,
+    DecisionAutonome,
     Equipement,
     EtatEquipement,
     MesureCapteur,
+    MesurePresence,
+    PilotageAutonome,
     ProfilFonctionnement,
     Zone,
 )
 from .anomalies import analyser_anomalies_site, code_metrique_site
+from .occupancy_anomalies import code_metrique_occupation_zone
 from analysis.services.anomaly import _classer_severite
 from .services import (
     confirmer_commande,
     demander_commande,
     echouer_commande,
     marquer_commande_envoyee,
+    synchroniser_etat_equipement,
 )
+from .autopilot import evaluer_pilotage_autonome
 from .simulation import (
     generer_mesure_simulee,
     generer_mesures_capteurs_simules,
@@ -92,6 +99,14 @@ class EnergyAssetApiTests(APITestCase):
             fuseau_horaire="Africa/Dakar",
         )
 
+    def create_power_sensor(self, equipment, mode=Capteur.Mode.SIMULATED):
+        return Capteur.objects.create(
+            equipement=equipment,
+            identifiant=f"AUTOPILOT-{equipment.id}-{mode}",
+            type="POWER",
+            mode=mode,
+        )
+
     def create_recommendation(self, organisation=None):
         maintenant = timezone.now()
         objectif = Objectif.objects.create(
@@ -123,6 +138,7 @@ class EnergyAssetApiTests(APITestCase):
             equipement=equipment,
             identifiant="ENERGY-SITE-001",
             type="ENERGY",
+            mode=Capteur.Mode.REAL,
         )
         with timezone.override("Africa/Dakar"):
             now = timezone.make_aware(datetime(2025, 5, 15, 12))
@@ -147,6 +163,14 @@ class EnergyAssetApiTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.data["today_energy_kwh"], "1.500000")
+        self.assertEqual(response.data["telemetry_mode"], "REAL")
+        self.assertEqual(
+            response.data["today_energy_since"],
+            timezone.make_aware(datetime(2025, 5, 15, 0)).isoformat().replace(
+                "+00:00",
+                "Z",
+            ),
+        )
         self.assertEqual(response.data["yesterday_energy_kwh"], "3.000000")
         self.assertEqual(response.data["month_energy_kwh"], "6.500000")
         self.assertEqual(
@@ -180,6 +204,46 @@ class EnergyAssetApiTests(APITestCase):
         self.assertEqual(
             response.data["energy_coverage"]["today"],
             {"complete_sensors": 0, "total_sensors": 1},
+        )
+
+    def test_simulated_energy_today_starts_at_first_reading_without_inventing_overnight_use(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Compteur simulé",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="5.000",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-ENERGY-START-001",
+            type="ENERGY",
+        )
+        with timezone.override("Africa/Dakar"):
+            now = timezone.make_aware(datetime(2025, 5, 15, 12))
+            first_reading_at = timezone.make_aware(datetime(2025, 5, 15, 10))
+            for value, measured_at in (
+                ("19.000000", timezone.make_aware(datetime(2025, 5, 14, 23))),
+                ("20.000000", first_reading_at),
+                ("21.500000", timezone.make_aware(datetime(2025, 5, 15, 11))),
+            ):
+                MesureCapteur.objects.create(
+                    capteur=sensor,
+                    valeur=value,
+                    unite="kWh",
+                    date_mesure=measured_at,
+                )
+
+            with patch("energy_assets.monitoring._maintenant", return_value=now):
+                response = self.client.get(
+                    f"/api/energy-assets/sites/{self.site.id}/monitoring/summary/"
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["today_energy_kwh"], "1.500000")
+        self.assertEqual(response.data["telemetry_mode"], "SIMULATED")
+        self.assertEqual(
+            response.data["today_energy_since"],
+            first_reading_at.isoformat().replace("+00:00", "Z"),
         )
 
     def test_create_equipment_initializes_state_and_returns_its_sensor(self):
@@ -326,6 +390,10 @@ class EnergyAssetApiTests(APITestCase):
         self.assertEqual(response.data["monitored_equipment_count"], 2)
         self.assertEqual(response.data["active_equipment_count"], 1)
         self.assertEqual(response.data["offline_equipment_count"], 1)
+        self.assertEqual(
+            {item["equipment_id"] for item in response.data["equipment"]},
+            {str(active_equipment.id), str(offline_equipment.id)},
+        )
         self.assertEqual(
             response.data["top_consumer"]["equipment_id"],
             str(active_equipment.id),
@@ -479,17 +547,90 @@ class EnergyAssetApiTests(APITestCase):
 
     def test_site_anomaly_list_is_scoped_to_accessible_organization(self):
         allowed_anomaly = self.create_site_anomaly(self.site)
+        allowed_anomaly.resultat_metrique.sources = [
+            {"sensor_id": "private-sensor-id", "mode": Capteur.Mode.SIMULATED}
+        ]
+        allowed_anomaly.resultat_metrique.save(update_fields=("sources",))
+        hypothesis = Hypothese.objects.create(
+            anomalie=allowed_anomaly,
+            texte="Vérifier les relevés simulés avant toute conclusion.",
+            preuves=["Écart mesuré sur les données du site."],
+        )
+        allowed_zone = Zone.objects.create(site=self.site, nom="Zone occupation")
+        occupancy_result = ResultatMetrique.objects.create(
+            organisation=self.organisation,
+            code_metrique=code_metrique_occupation_zone(allowed_zone),
+            version_metrique="1.0",
+            valeur="50.000000",
+            unite="%",
+            periode_debut=timezone.now() - timedelta(days=1),
+            periode_fin=timezone.now(),
+            baseline_type="puissance_de_veille",
+            baseline_valeur="0.100000",
+            baseline_nombre_observations=1,
+            completude="0.5000",
+            statut_qualite=ResultatMetrique.StatutQualite.ESTIME,
+        )
+        occupancy_anomaly = Anomalie.objects.create(
+            organisation=self.organisation,
+            resultat_metrique=occupancy_result,
+            type="ENERGY_USE_IN_UNOCCUPIED_ZONE",
+            severite=Anomalie.Severite.ALERTE,
+            valeur_observee="0.150000",
+            valeur_attendue="0.100000",
+            ecart_pourcentage="50.00",
+        )
         other_organisation = self.create_organisation("Organisation étrangère")
         other_site = self.create_site(other_organisation, "Site étranger")
         self.create_site_anomaly(other_site)
+        other_zone = Zone.objects.create(site=other_site, nom="Zone étrangère")
+        other_result = ResultatMetrique.objects.create(
+            organisation=other_organisation,
+            code_metrique=code_metrique_occupation_zone(other_zone),
+            version_metrique="1.0",
+            valeur="50.000000",
+            unite="%",
+            periode_debut=timezone.now() - timedelta(days=1),
+            periode_fin=timezone.now(),
+            baseline_type="puissance_de_veille",
+            baseline_valeur="0.100000",
+            baseline_nombre_observations=1,
+            completude="0.5000",
+            statut_qualite=ResultatMetrique.StatutQualite.ESTIME,
+        )
+        other_anomaly = Anomalie.objects.create(
+            organisation=other_organisation,
+            resultat_metrique=other_result,
+            type="ENERGY_USE_IN_UNOCCUPIED_ZONE",
+            severite=Anomalie.Severite.ALERTE,
+            valeur_observee="0.150000",
+            valeur_attendue="0.100000",
+            ecart_pourcentage="50.00",
+        )
 
         response = self.client.get(
             f"/api/energy-assets/sites/{self.site.id}/anomalies/"
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data["results"]), 1)
-        self.assertEqual(response.data["results"][0]["id"], str(allowed_anomaly.id))
+        ids = {item["id"] for item in response.data["results"]}
+        self.assertEqual(ids, {str(allowed_anomaly.id), str(occupancy_anomaly.id)})
+        self.assertNotIn(str(other_anomaly.id), ids)
+        anomaly_data = next(
+            item for item in response.data["results"]
+            if item["id"] == str(allowed_anomaly.id)
+        )
+        self.assertEqual(anomaly_data["hypotheses"][0]["id"], str(hypothesis.id))
+        self.assertEqual(
+            anomaly_data["resume_donnees"]["provenance"],
+            "TELEMETRIE_SIMULEE",
+        )
+        self.assertEqual(
+            anomaly_data["resume_donnees"]["statut_qualite"],
+            ResultatMetrique.StatutQualite.FIABLE,
+        )
+        self.assertNotIn("sources", anomaly_data["resume_donnees"])
+        self.assertNotIn("private-sensor-id", str(anomaly_data))
 
     @staticmethod
     def create_site_anomaly(site):
@@ -977,6 +1118,546 @@ class EnergyAssetApiTests(APITestCase):
         self.assertEqual(state.etat_souhaite, Equipement.Etat.ON)
         self.assertEqual(state.etat_rapporte, Equipement.Etat.UNKNOWN)
 
+    def test_simulated_autopilot_applies_power_cap_without_queueing_physical_command(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation simulée",
+            categorie="VENTILATION",
+            puissance_nominale_kw="1.000",
+            puissance_veille_kw="0.100",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(equipment)
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="1.000",
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            plafond_puissance_kw="0.500",
+        )
+        configuration.equipements_autorises.add(equipment)
+
+        decision = evaluer_pilotage_autonome(self.site.id, force=True)
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.APPLIED)
+        self.assertTrue(decision.simulation)
+        self.assertEqual(decision.equipement, equipment)
+        self.assertEqual(decision.action, Equipement.Etat.OFF)
+        self.assertEqual(decision.puissance_avant_kw, Decimal("1.000"))
+        self.assertEqual(decision.puissance_apres_kw, Decimal("0.100"))
+        equipment.etat.refresh_from_db()
+        self.assertEqual(equipment.etat.etat_rapporte, Equipement.Etat.OFF)
+        self.assertFalse(CommandeEquipement.objects.exists())
+
+    def test_simulated_autopilot_emergency_stop_blocks_actions(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation d'urgence",
+            categorie="VENTILATION",
+            puissance_nominale_kw="1.000",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(equipment)
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            arret_urgence=True,
+            plafond_puissance_kw="0.100",
+        )
+        configuration.equipements_autorises.add(equipment)
+
+        decision = evaluer_pilotage_autonome(self.site.id, force=True)
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.BLOCKED)
+        self.assertIn("urgence", decision.raison)
+        equipment.etat.refresh_from_db()
+        self.assertEqual(equipment.etat.etat_rapporte, Equipement.Etat.ON)
+        self.assertFalse(CommandeEquipement.objects.exists())
+
+    def test_simulated_autopilot_automatically_selects_climate_strategy(self):
+        air_conditioner = Equipement.objects.create(
+            site=self.site,
+            nom="Climatiseur simulé",
+            categorie="CLIMATISATION",
+            puissance_nominale_kw="1.500",
+            puissance_veille_kw="0.050",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(air_conditioner)
+        EtatEquipement.objects.create(
+            equipement=air_conditioner,
+            etat_souhaite=Equipement.Etat.OFF,
+            etat_rapporte=Equipement.Etat.OFF,
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            confort_actif=True,
+            temperature_min_c="23.00",
+            temperature_max_c="26.00",
+            temperature_simulee_c="30.00",
+            strategie_automatique=True,
+        )
+        configuration.equipements_autorises.add(air_conditioner)
+
+        decision = evaluer_pilotage_autonome(self.site.id, force=True)
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.APPLIED)
+        self.assertEqual(decision.strategie, DecisionAutonome.Strategie.AUTOMATIC)
+        self.assertEqual(decision.action, Equipement.Etat.ON)
+        air_conditioner.etat.refresh_from_db()
+        self.assertEqual(air_conditioner.etat.etat_rapporte, Equipement.Etat.ON)
+
+    def test_simulated_schedule_stops_equipment_outside_configured_hours(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation sur horaire",
+            categorie="VENTILATION",
+            puissance_nominale_kw="0.800",
+            criticite=Equipement.Criticite.MOYENNE,
+        )
+        self.create_power_sensor(equipment)
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            horaires_actifs=True,
+            heure_debut=time(9, 0),
+            heure_fin=time(10, 0),
+        )
+        configuration.equipements_autorises.add(equipment)
+        instant = timezone.make_aware(
+            datetime(2026, 10, 12, 12, 0),
+            timezone=timezone.get_fixed_timezone(0),
+        )
+
+        decision = evaluer_pilotage_autonome(
+            self.site.id,
+            force=True,
+            maintenant=instant,
+        )
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.APPLIED)
+        self.assertEqual(decision.strategie, DecisionAutonome.Strategie.SCHEDULE)
+        self.assertEqual(decision.action, Equipement.Etat.OFF)
+        equipment.etat.refresh_from_db()
+        self.assertEqual(equipment.etat.etat_rapporte, Equipement.Etat.OFF)
+
+    def test_simulated_schedule_starts_equipment_inside_hours_under_power_cap(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation sur horaire",
+            categorie="VENTILATION",
+            puissance_nominale_kw="0.800",
+            puissance_veille_kw="0.100",
+            criticite=Equipement.Criticite.MOYENNE,
+        )
+        self.create_power_sensor(equipment)
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.OFF,
+            etat_rapporte=Equipement.Etat.OFF,
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            horaires_actifs=True,
+            heure_debut=time(9, 0),
+            heure_fin=time(10, 0),
+            plafond_puissance_kw="1.000",
+        )
+        configuration.equipements_autorises.add(equipment)
+        instant = timezone.make_aware(
+            datetime(2026, 10, 12, 9, 30),
+            timezone=timezone.get_fixed_timezone(0),
+        )
+
+        decision = evaluer_pilotage_autonome(
+            self.site.id,
+            force=True,
+            maintenant=instant,
+        )
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.APPLIED)
+        self.assertEqual(decision.action, Equipement.Etat.ON)
+        self.assertEqual(decision.puissance_apres_kw, Decimal("0.800"))
+        equipment.etat.refresh_from_db()
+        self.assertEqual(equipment.etat.etat_rapporte, Equipement.Etat.ON)
+
+    def test_simulated_schedule_does_not_start_equipment_over_power_cap(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Ventilation sur horaire",
+            categorie="VENTILATION",
+            puissance_nominale_kw="0.800",
+            puissance_veille_kw="0.100",
+            criticite=Equipement.Criticite.MOYENNE,
+        )
+        self.create_power_sensor(equipment)
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.OFF,
+            etat_rapporte=Equipement.Etat.OFF,
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            horaires_actifs=True,
+            heure_debut=time(9, 0),
+            heure_fin=time(10, 0),
+            plafond_puissance_kw="0.500",
+        )
+        configuration.equipements_autorises.add(equipment)
+        instant = timezone.make_aware(
+            datetime(2026, 10, 12, 9, 30),
+            timezone=timezone.get_fixed_timezone(0),
+        )
+
+        decision = evaluer_pilotage_autonome(
+            self.site.id,
+            force=True,
+            maintenant=instant,
+        )
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.BLOCKED)
+        self.assertEqual(decision.strategie, DecisionAutonome.Strategie.SYSTEM)
+        equipment.etat.refresh_from_db()
+        self.assertEqual(equipment.etat.etat_rapporte, Equipement.Etat.OFF)
+
+    def test_autopilot_api_only_allows_noncritical_equipment_from_selected_site(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Pompe autorisée",
+            categorie="POMPE",
+            puissance_nominale_kw="1.000",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(equipment)
+        critical = Equipement.objects.create(
+            site=self.site,
+            nom="Équipement critique",
+            categorie="AUTRE",
+            puissance_nominale_kw="1.000",
+            criticite=Equipement.Criticite.CRITIQUE,
+        )
+
+        response = self.client.patch(
+            f"/api/energy-assets/sites/{self.site.id}/autonomie/",
+            {
+                "actif": True,
+                "plafond_puissance_kw": "0.500",
+                "equipements_autorises": [str(equipment.id), str(critical.id)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("equipements_autorises", response.data)
+        configuration = PilotageAutonome.objects.get(site=self.site)
+        self.assertFalse(configuration.actif)
+        self.assertFalse(configuration.equipements_autorises.exists())
+
+    def test_autopilot_api_configures_evaluates_and_stops_simulated_policy(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Éclairage simulé",
+            categorie="ECLAIRAGE",
+            puissance_nominale_kw="1.000",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(equipment)
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+        )
+        url = f"/api/energy-assets/sites/{self.site.id}/autonomie/"
+
+        initial = self.client.get(url)
+        self.assertEqual(initial.status_code, status.HTTP_200_OK)
+        self.assertEqual(initial.data["mode"], "SIMULATION")
+
+        update = self.client.patch(
+            url,
+            {
+                "actif": True,
+                "plafond_puissance_kw": "0.500",
+                "equipements_autorises": [str(equipment.id)],
+            },
+            format="json",
+        )
+        self.assertEqual(update.status_code, status.HTTP_200_OK, update.data)
+
+        evaluation = self.client.post(url, {}, format="json")
+        self.assertEqual(evaluation.status_code, status.HTTP_200_OK)
+        self.assertEqual(evaluation.data["decision"]["statut"], "APPLIED")
+        equipment.etat.refresh_from_db()
+        self.assertEqual(equipment.etat.etat_rapporte, Equipement.Etat.OFF)
+
+        stop = self.client.patch(
+            url,
+            {"arret_urgence": True},
+            format="json",
+        )
+        self.assertEqual(stop.status_code, status.HTTP_200_OK, stop.data)
+        self.assertTrue(stop.data["configuration"]["arret_urgence"])
+        self.assertFalse(stop.data["configuration"]["actif"])
+
+    def test_autopilot_rejects_equipment_with_any_active_real_sensor(self):
+        equipment = Equipement.objects.create(
+            site=self.site,
+            nom="Équipement avec capteur réel",
+            categorie="POMPE",
+            puissance_nominale_kw="1.000",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(equipment)
+        self.create_power_sensor(equipment, Capteur.Mode.REAL)
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            plafond_puissance_kw="0.500",
+        )
+        configuration.equipements_autorises.add(equipment)
+
+        decision = evaluer_pilotage_autonome(self.site.id, force=True)
+        response = self.client.get(
+            f"/api/energy-assets/sites/{self.site.id}/autonomie/"
+        )
+        rejected_update = self.client.patch(
+            f"/api/energy-assets/sites/{self.site.id}/autonomie/",
+            {"equipements_autorises": [str(equipment.id)]},
+            format="json",
+        )
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.BLOCKED)
+        self.assertEqual(decision.action, "")
+        equipment.etat.refresh_from_db()
+        self.assertEqual(equipment.etat.etat_rapporte, Equipement.Etat.ON)
+        self.assertFalse(
+            next(
+                item
+                for item in response.data["equipements"]
+                if item["id"] == str(equipment.id)
+            )["autorisation_possible"]
+        )
+        self.assertEqual(
+            rejected_update.status_code,
+            status.HTTP_400_BAD_REQUEST,
+            rejected_update.data,
+        )
+        self.assertIn("equipements_autorises", rejected_update.data)
+
+    def test_occupancy_api_ingests_presence_and_reports_unoccupied_power_read_only(self):
+        zone = Zone.objects.create(site=self.site, nom="Atelier")
+        equipment = Equipement.objects.create(
+            site=self.site,
+            zone=zone,
+            nom="Éclairage atelier",
+            categorie="ECLAIRAGE",
+            puissance_nominale_kw="1.000",
+            puissance_veille_kw="0.100",
+        )
+        power_sensor = self.create_power_sensor(equipment)
+        now = timezone.now()
+        MesureCapteur.objects.create(
+            capteur=power_sensor,
+            valeur="800.000000",
+            unite="W",
+            date_mesure=now,
+        )
+
+        sensor_response = self.client.post(
+            "/api/energy-assets/capteurs-presence/",
+            {
+                "zone": str(zone.id),
+                "identifiant": "PRESENCE-ATELIER-001",
+                "mode": CapteurPresence.Mode.SIMULATED,
+            },
+            format="json",
+        )
+        self.assertEqual(
+            sensor_response.status_code,
+            status.HTTP_201_CREATED,
+            sensor_response.data,
+        )
+        measurement_response = self.client.post(
+            "/api/energy-assets/mesures-presence/",
+            {
+                "capteur": sensor_response.data["id"],
+                "occupee": False,
+                "date_mesure": now.isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(
+            measurement_response.status_code,
+            status.HTTP_201_CREATED,
+            measurement_response.data,
+        )
+
+        response = self.client.get(
+            f"/api/energy-assets/sites/{self.site.id}/occupancy-diagnostics/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["mode"], "READ_ONLY_DIAGNOSTIC")
+        self.assertEqual(
+            response.data["unoccupied_power_kw"],
+            Decimal("0.800000"),
+        )
+        self.assertEqual(
+            response.data["avoidable_power_kw"],
+            Decimal("0.700000"),
+        )
+        self.assertEqual(response.data["zones"][0]["occupancy_state"], "UNOCCUPIED")
+        self.assertEqual(
+            response.data["zones"][0]["equipment"][0]["power_source"],
+            Capteur.Mode.SIMULATED,
+        )
+        self.assertEqual(
+            response.data["zones"][0]["equipment"][0]["avoidable_power_kw"],
+            Decimal("0.700000"),
+        )
+        self.assertFalse(CommandeEquipement.objects.exists())
+        self.assertFalse(DecisionAutonome.objects.exists())
+
+    def test_simulated_autopilot_only_stops_noncritical_equipment_in_fresh_empty_zone(self):
+        zone = Zone.objects.create(site=self.site, nom="Bureau")
+        equipment = Equipement.objects.create(
+            site=self.site,
+            zone=zone,
+            nom="Éclairage bureau",
+            categorie="ECLAIRAGE",
+            puissance_nominale_kw="1.000",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(equipment)
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+        )
+        presence = CapteurPresence.objects.create(
+            zone=zone,
+            identifiant="PRESENCE-BUREAU-001",
+            mode=CapteurPresence.Mode.SIMULATED,
+        )
+        MesurePresence.objects.create(
+            capteur=presence,
+            occupee=False,
+            date_mesure=timezone.now(),
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            occupation_active=True,
+        )
+        configuration.equipements_autorises.add(equipment)
+        configuration.zones_autorisees.add(zone)
+
+        decision = evaluer_pilotage_autonome(self.site.id, force=True)
+
+        self.assertEqual(decision.statut, DecisionAutonome.Statut.APPLIED)
+        self.assertEqual(
+            decision.strategie,
+            DecisionAutonome.Strategie.UNOCCUPIED_ZONE,
+        )
+        self.assertEqual(decision.action, Equipement.Etat.OFF)
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.OFF)
+        self.assertFalse(CommandeEquipement.objects.exists())
+
+    def test_autopilot_never_acts_on_real_or_stale_presence_data(self):
+        zone = Zone.objects.create(site=self.site, nom="Salle serveur")
+        equipment = Equipement.objects.create(
+            site=self.site,
+            zone=zone,
+            nom="Éclairage salle serveur",
+            categorie="ECLAIRAGE",
+            puissance_nominale_kw="1.000",
+            criticite=Equipement.Criticite.BASSE,
+        )
+        self.create_power_sensor(equipment)
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.ON,
+            etat_rapporte=Equipement.Etat.ON,
+        )
+        presence = CapteurPresence.objects.create(
+            zone=zone,
+            identifiant="PRESENCE-SALLE-001",
+            mode=CapteurPresence.Mode.REAL,
+        )
+        MesurePresence.objects.create(
+            capteur=presence,
+            occupee=False,
+            date_mesure=timezone.now(),
+        )
+        configuration = PilotageAutonome.objects.create(
+            site=self.site,
+            actif=True,
+            occupation_active=True,
+        )
+        configuration.equipements_autorises.add(equipment)
+        configuration.zones_autorisees.add(zone)
+
+        real_sensor_decision = evaluer_pilotage_autonome(self.site.id, force=True)
+
+        self.assertEqual(real_sensor_decision.statut, DecisionAutonome.Statut.NO_ACTION)
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+
+        presence.mode = CapteurPresence.Mode.SIMULATED
+        presence.save(update_fields=("mode",))
+        MesurePresence.objects.filter(capteur=presence).update(
+            date_mesure=timezone.now() - timedelta(minutes=10)
+        )
+        stale_sensor_decision = evaluer_pilotage_autonome(self.site.id, force=True)
+
+        self.assertEqual(
+            stale_sensor_decision.statut,
+            DecisionAutonome.Statut.NO_ACTION,
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+
+        MesurePresence.objects.create(
+            capteur=presence,
+            occupee=True,
+            date_mesure=timezone.now(),
+        )
+        occupied_sensor_decision = evaluer_pilotage_autonome(
+            self.site.id,
+            force=True,
+        )
+
+        self.assertEqual(
+            occupied_sensor_decision.statut,
+            DecisionAutonome.Statut.NO_ACTION,
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
+        self.assertFalse(CommandeEquipement.objects.exists())
+
     def test_command_list_and_creation_are_organization_scoped(self):
         allowed_equipment = Equipement.objects.create(
             site=self.site,
@@ -1412,21 +2093,22 @@ class EnergyAssetAnomalyDetectionTests(TestCase):
         maintenant = self.creer_releves_journaliers(ecart_jour_cible=36)
         self.creer_admin_organisation()
 
-        with patch(
-            "energy_assets.notifications._post_event",
-            return_value=False,
-        ) as post_event:
-            with self.captureOnCommitCallbacks(execute=True):
-                resultat = analyser_anomalies_site(
-                    self.site,
-                    jour=self.date_analysee,
-                    maintenant=maintenant,
-                )
-                repetition = analyser_anomalies_site(
-                    self.site,
-                    jour=self.date_analysee,
-                    maintenant=maintenant,
-                )
+        with patch("analysis.services.taches.lancer_en_arriere_plan") as schedule:
+            with patch(
+                "energy_assets.notifications._post_event",
+                return_value=False,
+            ) as post_event:
+                with self.captureOnCommitCallbacks(execute=True):
+                    resultat = analyser_anomalies_site(
+                        self.site,
+                        jour=self.date_analysee,
+                        maintenant=maintenant,
+                    )
+                    repetition = analyser_anomalies_site(
+                        self.site,
+                        jour=self.date_analysee,
+                        maintenant=maintenant,
+                    )
 
         self.assertEqual(resultat["status"], "anomaly_detected")
         self.assertEqual(repetition["status"], "anomaly_detected")
@@ -1446,33 +2128,35 @@ class EnergyAssetAnomalyDetectionTests(TestCase):
             payload["url_api_anomalies"],
             f"https://api.ecoscan.test/api/energy-assets/sites/{self.site.id}/anomalies/",
         )
+        self.assertEqual(schedule.call_count, 2)
 
     def test_resolved_anomaly_notifies_again_when_redetected(self):
         maintenant = self.creer_releves_journaliers(ecart_jour_cible=36)
         self.creer_admin_organisation()
 
-        with patch(
-            "energy_assets.notifications._post_event",
-            return_value=True,
-        ) as post_event:
-            with self.captureOnCommitCallbacks(execute=True):
-                anomalie_initiale = analyser_anomalies_site(
-                    self.site,
-                    jour=self.date_analysee,
-                    maintenant=maintenant,
-                )
-                self.modifier_consommation_jour_analyse(32)
-                resultat_normal = analyser_anomalies_site(
-                    self.site,
-                    jour=self.date_analysee,
-                    maintenant=maintenant,
-                )
-                self.modifier_consommation_jour_analyse(36)
-                anomalie_reactivee = analyser_anomalies_site(
-                    self.site,
-                    jour=self.date_analysee,
-                    maintenant=maintenant,
-                )
+        with patch("analysis.services.taches.lancer_en_arriere_plan") as schedule:
+            with patch(
+                "energy_assets.notifications._post_event",
+                return_value=True,
+            ) as post_event:
+                with self.captureOnCommitCallbacks(execute=True):
+                    anomalie_initiale = analyser_anomalies_site(
+                        self.site,
+                        jour=self.date_analysee,
+                        maintenant=maintenant,
+                    )
+                    self.modifier_consommation_jour_analyse(32)
+                    resultat_normal = analyser_anomalies_site(
+                        self.site,
+                        jour=self.date_analysee,
+                        maintenant=maintenant,
+                    )
+                    self.modifier_consommation_jour_analyse(36)
+                    anomalie_reactivee = analyser_anomalies_site(
+                        self.site,
+                        jour=self.date_analysee,
+                        maintenant=maintenant,
+                    )
 
         self.assertEqual(anomalie_initiale["status"], "anomaly_detected")
         self.assertEqual(resultat_normal["status"], "normal")
@@ -1482,6 +2166,7 @@ class EnergyAssetAnomalyDetectionTests(TestCase):
             Anomalie.Statut.DETECTED,
         )
         self.assertEqual(post_event.call_count, 2)
+        self.assertEqual(schedule.call_count, 2)
 
     def test_anomaly_severity_matches_existing_percentage_thresholds(self):
         self.assertEqual(
@@ -1677,7 +2362,9 @@ class EnergyAssetModelTests(TestCase):
 
         measurement = generer_mesure_simulee(sensor.id, maintenant=now)
 
-        self.assertEqual(measurement.valeur, Decimal(equipment.puissance_nominale_kw))
+        puissance_nominale = Decimal(equipment.puissance_nominale_kw)
+        self.assertGreaterEqual(measurement.valeur, puissance_nominale * Decimal("0.92"))
+        self.assertLessEqual(measurement.valeur, puissance_nominale * Decimal("1.08"))
         self.assertEqual(measurement.unite, "kW")
         self.assertEqual(measurement.date_mesure, now)
         self.assertIsNone(
@@ -1696,13 +2383,45 @@ class EnergyAssetModelTests(TestCase):
         self.assertEqual(state.etat_rapporte, Equipement.Etat.ON)
         self.assertEqual(
             state.puissance_actuelle_kw,
-            Decimal(equipment.puissance_nominale_kw),
+            prochaine_mesure.valeur.quantize(Decimal("0.001")),
         )
         self.assertEqual(sensor.derniere_communication, now + timedelta(seconds=15))
 
+    def test_simulated_power_changes_smoothly_over_time(self):
+        equipment = self.create_equipment()
+        state = EtatEquipement.objects.create(equipement=equipment)
+        start = timezone.now()
+        powers = [
+            generer_mesure_simulee(
+                Capteur.objects.create(
+                    equipement=equipment,
+                    identifiant=f"SIM-POWER-VARIATION-{index}",
+                    type="POWER",
+                    frequence_secondes=1,
+                ).id,
+                maintenant=start + timedelta(seconds=index * 30),
+            ).valeur
+            for index in range(3)
+        ]
+
+        self.assertLess(min(powers), max(powers))
+        self.assertTrue(
+            all(
+                Decimal(equipment.puissance_nominale_kw) * Decimal("0.92")
+                <= power
+                <= Decimal(equipment.puissance_nominale_kw) * Decimal("1.08")
+                for power in powers
+            )
+        )
+        state.refresh_from_db()
+        self.assertEqual(
+            state.puissance_actuelle_kw,
+            powers[-1].quantize(Decimal("0.001")),
+        )
+
     def test_simulated_power_sensor_uses_standby_power_when_requested_off(self):
         equipment = self.create_equipment(puissance_veille_kw="0.125")
-        EtatEquipement.objects.create(
+        state = EtatEquipement.objects.create(
             equipement=equipment,
             etat_souhaite=Equipement.Etat.OFF,
         )
@@ -1716,6 +2435,39 @@ class EnergyAssetModelTests(TestCase):
 
         self.assertEqual(measurement.valeur, Decimal("0.125"))
         self.assertEqual(measurement.unite, "kW")
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.OFF)
+        self.assertEqual(state.puissance_actuelle_kw, Decimal("0.125"))
+
+    def test_real_power_sensor_does_not_infer_reported_equipment_state(self):
+        equipment = self.create_equipment(puissance_veille_kw="0.125")
+        state = EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_souhaite=Equipement.Etat.OFF,
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="REAL-POWER-STANDBY-001",
+            type="POWER",
+            mode=Capteur.Mode.REAL,
+        )
+        measurement = MesureCapteur.objects.create(
+            capteur=sensor,
+            valeur=Decimal("0.125000"),
+            unite="kW",
+            date_mesure=timezone.now(),
+        )
+
+        synchroniser_etat_equipement(measurement)
+
+        state.refresh_from_db()
+        self.assertEqual(state.etat_rapporte, Equipement.Etat.UNKNOWN)
+        self.assertEqual(state.puissance_actuelle_kw, Decimal("0.125"))
+        self.assertIsNone(state.date_etat_rapporte)
+        self.assertEqual(
+            state.statut_synchronisation,
+            EtatEquipement.StatutSynchronisation.UNKNOWN,
+        )
 
     def test_simulated_energy_sensor_integrates_power_since_previous_reading(self):
         equipment = self.create_equipment(puissance_nominale_kw="1.500")
@@ -1736,10 +2488,14 @@ class EnergyAssetModelTests(TestCase):
             date_mesure=start,
         )
 
-        measurement = generer_mesure_simulee(
-            sensor.id,
-            maintenant=start + timedelta(seconds=15),
-        )
+        with patch(
+            "energy_assets.simulation._puissance_simulee_kw",
+            return_value=Decimal("1.500"),
+        ):
+            measurement = generer_mesure_simulee(
+                sensor.id,
+                maintenant=start + timedelta(seconds=15),
+            )
 
         self.assertEqual(measurement.valeur, Decimal("3.006250"))
         self.assertEqual(measurement.unite, "kWh")
@@ -1777,6 +2533,100 @@ class EnergyAssetModelTests(TestCase):
 
         self.assertIn("Mesures simulées générées : 1", output.getvalue())
         self.assertEqual(MesureCapteur.objects.count(), 1)
+
+    def test_simulator_management_command_can_limit_measurements_to_an_organization(self):
+        equipment = self.create_equipment()
+        Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-POWER-ORG-001",
+            type="POWER",
+        )
+        other_organisation = Organisation.objects.create(
+            nom="Autre organisation",
+            secteur="Commerce",
+            localisation="Dakar",
+        )
+        other_site = Site.objects.create(
+            organisation=other_organisation,
+            nom="Autre site",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        other_equipment = Equipement.objects.create(
+            site=other_site,
+            nom="Équipement extérieur",
+            categorie="MACHINE",
+            puissance_nominale_kw="1.000",
+        )
+        Capteur.objects.create(
+            equipement=other_equipment,
+            identifiant="SIM-POWER-ORG-002",
+            type="POWER",
+        )
+        output = StringIO()
+
+        call_command(
+            "simuler_capteurs",
+            "--once",
+            "--organisation-id",
+            str(self.organisation.id),
+            stdout=output,
+        )
+
+        self.assertIn("Mesures simulées générées : 1", output.getvalue())
+        self.assertEqual(
+            MesureCapteur.objects.get().capteur.identifiant,
+            "SIM-POWER-ORG-001",
+        )
+
+    def test_simulator_management_command_can_target_multiple_organizations(self):
+        equipment = self.create_equipment()
+        Capteur.objects.create(
+            equipement=equipment,
+            identifiant="SIM-POWER-ORG-MULTI-001",
+            type="POWER",
+        )
+        other_organisation = Organisation.objects.create(
+            nom="Autre organisation",
+            secteur="Commerce",
+            localisation="Dakar",
+        )
+        other_site = Site.objects.create(
+            organisation=other_organisation,
+            nom="Autre site",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        other_equipment = Equipement.objects.create(
+            site=other_site,
+            nom="Équipement extérieur",
+            categorie="MACHINE",
+            puissance_nominale_kw="1.000",
+        )
+        Capteur.objects.create(
+            equipement=other_equipment,
+            identifiant="SIM-POWER-ORG-MULTI-002",
+            type="POWER",
+        )
+        output = StringIO()
+
+        call_command(
+            "simuler_capteurs",
+            "--once",
+            "--organisation-id",
+            str(self.organisation.id),
+            "--organisation-id",
+            str(other_organisation.id),
+            stdout=output,
+        )
+
+        self.assertIn("Mesures simulées générées : 2", output.getvalue())
+        self.assertCountEqual(
+            MesureCapteur.objects.values_list("capteur__identifiant", flat=True),
+            ["SIM-POWER-ORG-MULTI-001", "SIM-POWER-ORG-MULTI-002"],
+        )
 
     def test_simulator_rejects_non_positive_frequency_and_loop_interval(self):
         sensor = Capteur.objects.create(
@@ -1840,6 +2690,7 @@ class InternalEquipmentCommandApiTests(APITestCase):
             equipement=self.equipement,
             action=action,
         )
+
 
     def test_internal_command_endpoints_require_the_shared_service_token(self):
         for headers in (
@@ -2016,3 +2867,107 @@ class InternalEquipmentCommandApiTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+
+class PublicDemoApiTests(APITestCase):
+    def setUp(self):
+        organisation = Organisation.objects.create(
+            nom="Demo synthétique multisite",
+            secteur="Services",
+            localisation="Dakar",
+            statut=Organisation.Statut.ACTIVE,
+            details_demande={"ecoscan_demo_scenario": "multisite"},
+        )
+        site = Site.objects.create(
+            organisation=organisation,
+            nom="Site synthétique",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        zone = Zone.objects.create(site=site, nom="Bureaux")
+        equipment = Equipement.objects.create(
+            site=site,
+            zone=zone,
+            nom="Climatisation synthétique",
+            categorie="CLIMATISATION",
+            puissance_nominale_kw="4.000",
+            etat_operationnel=Equipement.Etat.ON,
+        )
+        EtatEquipement.objects.create(
+            equipement=equipment,
+            etat_rapporte=Equipement.Etat.ON,
+            puissance_actuelle_kw="2.500",
+            statut_synchronisation=EtatEquipement.StatutSynchronisation.SYNCHRONIZED,
+        )
+        now = timezone.now()
+        for sensor_type, unit, value in (
+            ("POWER", "kW", "2.500"),
+            ("ENERGY", "kWh", "100.000"),
+        ):
+            sensor = Capteur.objects.create(
+                equipement=equipment,
+                identifiant=f"PUBLIC-DEMO-{sensor_type}",
+                type=sensor_type,
+                mode=Capteur.Mode.SIMULATED,
+                frequence_secondes=15,
+                derniere_communication=now,
+            )
+            MesureCapteur.objects.create(
+                capteur=sensor,
+                valeur=value,
+                unite=unit,
+                date_mesure=now - timedelta(minutes=1),
+            )
+            MesureCapteur.objects.create(
+                capteur=sensor,
+                valeur=value if sensor_type == "POWER" else "101.000",
+                unite=unit,
+                date_mesure=now,
+            )
+
+    def test_public_demo_returns_only_read_only_synthetic_site_data(self):
+        response = self.client.get("/api/energy-assets/demo/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["read_only"])
+        self.assertEqual(response.data["data_mode"], "SIMULATED")
+        self.assertEqual(len(response.data["scenarios"]), 1)
+        site = response.data["scenarios"][0]["sites"][0]
+        self.assertEqual(site["summary"]["telemetry_mode"], "SIMULATED")
+        self.assertEqual(site["summary"]["current_power_kw"], Decimal("2.500"))
+        self.assertEqual(site["equipment"][0]["name"], "Climatisation synthétique")
+        self.assertEqual(site["sensors"][0]["mode"], Capteur.Mode.SIMULATED)
+        self.assertNotIn("email", str(response.data).lower())
+
+
+class DemoScenarioSimulatorSelectionTests(TestCase):
+    def test_demo_scenario_flag_targets_only_marked_demo_organisations(self):
+        demo = Organisation.objects.create(
+            nom="Organisation simulation",
+            secteur="Services",
+            localisation="Dakar",
+            statut=Organisation.Statut.ACTIVE,
+            details_demande={"ecoscan_demo_scenario": "hotel"},
+        )
+        Organisation.objects.create(
+            nom="Organisation client",
+            secteur="Services",
+            localisation="Dakar",
+            statut=Organisation.Statut.ACTIVE,
+        )
+
+        with (
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_capteurs_simules",
+                return_value=0,
+            ) as energy,
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_presence_simulees",
+                return_value=0,
+            ) as presence,
+        ):
+            call_command("simuler_capteurs", "--once", "--demo-scenarios")
+
+        energy.assert_called_once_with(organisation_id=demo.id)
+        presence.assert_called_once_with(organisation_id=demo.id)

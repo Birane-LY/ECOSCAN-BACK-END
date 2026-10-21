@@ -183,6 +183,8 @@ class CompteurSerializer(serializers.ModelSerializer):
             "statut_synchronisation",
             "derniere_synchronisation",
             "puissance_souscrite_kva",
+            "categorie_tarifaire",
+            "mode_paiement",
         )
         read_only_fields = ("id",)
 

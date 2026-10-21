@@ -23,7 +23,7 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 N8N_WEBHOOK_BASE_URL = getattr(settings, "N8N_WEBHOOK_BASE_URL", "")
-N8N_WEBHOOK_TOKEN = getattr(settings, "N8N_WEBHOOK_TOKEN", "change-me-n8n-token")
+N8N_WEBHOOK_TOKEN = getattr(settings, "N8N_WEBHOOK_TOKEN", "")
 N8N_WEBHOOK_TIMEOUT = getattr(settings, "N8N_WEBHOOK_TIMEOUT", 10.0)
 
 
@@ -32,6 +32,12 @@ def _post_event(chemin_webhook: str, payload: dict) -> bool:
     if not N8N_WEBHOOK_BASE_URL:
         logger.warning(
             "N8N_WEBHOOK_BASE_URL non configurée — événement '%s' non envoyé.",
+            chemin_webhook,
+        )
+        return False
+    if not N8N_WEBHOOK_TOKEN or N8N_WEBHOOK_TOKEN == "change-me-n8n-token" or N8N_WEBHOOK_TOKEN.startswith("replace-with-"):
+        logger.warning(
+            "N8N_WEBHOOK_TOKEN non configuré — événement '%s' non envoyé.",
             chemin_webhook,
         )
         return False

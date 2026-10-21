@@ -1,0 +1,26 @@
+services:
+  energy-jobs:
+    restart: unless-stopped
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: host.docker.internal
+      SQLITE_DB_PATH: /data/db.sqlite3
+      ECOSCAN_TACHES_HEURE: "${ECOSCAN_TACHES_HEURE:-02:15}"
+    command:
+      [
+        "python",
+        "manage.py",
+        "executer_taches_energetiques_planifiees",
+      ]
+    volumes:
+      - ecoscan-sqlite-data:/data
+
+volumes:
+  ecoscan-sqlite-data:

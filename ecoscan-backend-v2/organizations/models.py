@@ -110,6 +110,16 @@ class Activite(models.Model):
 class Compteur(models.Model):
     """Représente un équipement de mesure ou un compteur énergétique lié à un site."""
 
+    class CategorieTarifaire(models.TextChoices):
+        DPP = "DPP", "Domestique petite puissance"
+        DMP = "DMP", "Domestique moyenne puissance"
+        PPP = "PPP", "Professionnel petite puissance"
+        PMP = "PMP", "Professionnel moyenne puissance"
+
+    class ModePaiement(models.TextChoices):
+        PREPAYE = "PREPAYE", "Prépaiement (Woyofal)"
+        POSTPAYE = "POSTPAYE", "Postpaiement (facture)"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="compteurs")
     activites = models.ManyToManyField(Activite, related_name="compteurs", blank=True)
@@ -122,6 +132,20 @@ class Compteur(models.Model):
     puissance_souscrite_kva = models.DecimalField(
         max_digits=8, decimal_places=2, null=True, blank=True,
         help_text="Puissance souscrite contractuelle (kVA), telle que déclarée sur la facture ou le contrat Senelec.",
+    )
+    categorie_tarifaire = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        choices=CategorieTarifaire.choices,
+        help_text="Catégorie tarifaire vérifiée du compteur, requise pour toute prévision de tranche.",
+    )
+    mode_paiement = models.CharField(
+        max_length=10,
+        blank=True,
+        default="",
+        choices=(("", "Non configuré"), *ModePaiement.choices),
+        help_text="Mode de paiement vérifié sur le contrat ou le compteur SENELEC.",
     )
 
     def __str__(self):

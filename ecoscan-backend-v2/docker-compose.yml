@@ -1,0 +1,109 @@
+services:
+  backend:
+    container_name: ecoscan-backend-v2
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      SQLITE_DB_PATH: /data/db.sqlite3
+      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-127.0.0.1,localhost},${ECOSCAN_LAN_IP:-127.0.0.1},backend"
+      AI_SERVICE_URL: http://ai-service:8001
+      N8N_WEBHOOK_BASE_URL: "${N8N_WEBHOOK_BASE_URL:-http://ecoscan-n8n:5678/webhook}"
+      N8N_RELANCE_WEBHOOK_URL: "${N8N_RELANCE_WEBHOOK_URL:-http://ecoscan-n8n:5678/webhook/ecoscan-relance}"
+    ports:
+      - "8000:8000"
+    depends_on:
+      ai-service:
+        condition: service_healthy
+    volumes:
+      - ecoscan-sqlite-data:/data
+      - ./media:/app/media
+      - ./fichiers-sources:/app/fichiers-sources
+      - ./livrables:/app/livrables
+    networks:
+      - default
+      - ecoscan-automation
+  ai-service:
+    build:
+      context: ../../ECOSCAN IA
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ../../ECOSCAN IA/.env
+    environment:
+      DJANGO_API_URL: http://backend:8000
+      TEXT_MODEL_CHAIN: "groq:openai/gpt-oss-120b,groq:qwen/qwen3.8-27b,openai:gpt-4.1-mini"
+      OPENAI_API_BASE: "https://api.openai.com/v1"
+      RAG_STORE_PATH: /app/data/rag_store.json
+    volumes:
+      - ecoscan-ai-data:/app/data
+  energy-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: host.docker.internal
+      SQLITE_DB_PATH: /data/db.sqlite3
+    command:
+      [
+        "python",
+        "manage.py",
+        "simuler_capteurs",
+        "--interval",
+        "5",
+        "--organisation-id",
+        "dbc37f4b-563c-4920-a2e4-d5793b529be5",
+        "--organisation-id",
+        "e360dd7e-8fd0-4259-81f3-3fd5f81acd52",
+        "--demo-scenarios",
+      ]
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ecoscan-sqlite-data:/data
+  energy-jobs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: host.docker.internal
+      SQLITE_DB_PATH: /data/db.sqlite3
+      ECOSCAN_TACHES_HEURE: "${ECOSCAN_TACHES_HEURE:-02:15}"
+    command:
+      [
+        "python",
+        "manage.py",
+        "executer_taches_energetiques_planifiees",
+      ]
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ecoscan-sqlite-data:/data
+
+volumes:
+  ecoscan-sqlite-data:
+  ecoscan-ai-data:
+
+networks:
+  ecoscan-automation:
+    external: true
+    name: ecoscan-automation

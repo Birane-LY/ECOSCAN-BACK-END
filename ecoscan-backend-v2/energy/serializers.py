@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.utils import timezone
+from pathlib import PurePath
 
 from .models import (
     DonneeEnergetique,
@@ -18,6 +19,48 @@ from .models import (
     ReleveRituelEnergetique,
     RechargeRituelWoyofal,
 )
+
+TAILLE_MAX_FICHIER_SOURCE_OCTETS = 25 * 1024 * 1024
+SIGNATURES_FICHIER_SOURCE = {
+    ".pdf": lambda contenu: contenu.startswith(b"%PDF-"),
+    ".png": lambda contenu: contenu.startswith(b"\x89PNG\r\n\x1a\n"),
+    ".jpg": lambda contenu: contenu.startswith(b"\xff\xd8\xff"),
+    ".jpeg": lambda contenu: contenu.startswith(b"\xff\xd8\xff"),
+    ".webp": lambda contenu: (
+        len(contenu) >= 12
+        and contenu[:4] == b"RIFF"
+        and contenu[8:12] == b"WEBP"
+    ),
+}
+EXTENSIONS_TEXTE_FICHIER_SOURCE = {".txt", ".csv"}
+EXTENSIONS_FICHIER_SOURCE = (
+    set(SIGNATURES_FICHIER_SOURCE) | EXTENSIONS_TEXTE_FICHIER_SOURCE
+)
+
+
+def valider_fichier_source(fichier):
+    extension = PurePath(fichier.name).suffix.lower()
+    if extension not in EXTENSIONS_FICHIER_SOURCE:
+        raise serializers.ValidationError(
+            "Format non pris en charge. Utilisez un PDF, une image JPG/PNG/WebP, TXT ou CSV."
+        )
+    if fichier.size <= 0 or fichier.size > TAILLE_MAX_FICHIER_SOURCE_OCTETS:
+        raise serializers.ValidationError(
+            "Le fichier doit contenir au moins un octet et ne pas dépasser 25 Mo."
+        )
+
+    contenu = fichier.read()
+    fichier.seek(0)
+    signature_valide = SIGNATURES_FICHIER_SOURCE.get(extension)
+    if signature_valide and not signature_valide(contenu[:12]):
+        raise serializers.ValidationError(
+            "Le contenu du fichier ne correspond pas à son extension."
+        )
+    if extension in EXTENSIONS_TEXTE_FICHIER_SOURCE and b"\x00" in contenu[:4096]:
+        raise serializers.ValidationError(
+            "Un fichier texte ne peut pas contenir de données binaires."
+        )
+    return fichier
 
 
 class FichierSourceSerializer(serializers.ModelSerializer):
@@ -39,7 +82,6 @@ class FichierSourceSerializer(serializers.ModelSerializer):
         )
         read_only_fields = (
             "id",
-            "organisation",
             "nom",
             "mime_type",
             "taille_octets",
@@ -47,6 +89,12 @@ class FichierSourceSerializer(serializers.ModelSerializer):
             "date_depot",
             "depose_par",
         )
+        extra_kwargs = {
+            "organisation": {"required": False},
+        }
+
+    def validate_fichier(self, fichier):
+        return valider_fichier_source(fichier)
 
 
 class SourceDonneeSerializer(serializers.ModelSerializer):

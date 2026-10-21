@@ -422,8 +422,17 @@ class IndicateurObjectif(models.Model):
         return self.nom
 
 class BaremeTarifaire(models.Model):
+    class ModePaiement(models.TextChoices):
+        PREPAYE = "PREPAYE", "Prépaiement (Woyofal)"
+        POSTPAYE = "POSTPAYE", "Postpaiement (facture)"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    categorie = models.CharField(max_length=50, default="DOMESTIQUE_PETITE_PUISSANCE")
+    categorie = models.CharField(max_length=50)
+    mode_paiement = models.CharField(
+        max_length=10,
+        choices=ModePaiement.choices,
+        default=ModePaiement.POSTPAYE,
+    )
     nom_tranche = models.CharField(max_length=80)
     ordre = models.PositiveIntegerField()
     kwh_min = models.DecimalField(max_digits=10, decimal_places=2)
@@ -433,7 +442,7 @@ class BaremeTarifaire(models.Model):
     date_fin_vigueur = models.DateField(null=True, blank=True)
 
     class Meta:
-        ordering = ("categorie", "ordre")
+        ordering = ("categorie", "mode_paiement", "ordre")
 
 
 class AchatWoyofal(models.Model):

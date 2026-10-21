@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", BASE_DIR / "db.sqlite3")
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
 DEBUG = os.getenv('DJANGO_DEBUG', '0') in ('1', 'True', 'true')
@@ -94,7 +95,7 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': SQLITE_DB_PATH,
         'OPTIONS': {
             # Évite l'erreur 'database is locked' lors des tâches de fond
             'timeout': 30,
@@ -133,9 +134,10 @@ if DEBUG:
 
     configuration_sqlite = {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": SQLITE_DB_PATH,
         "OPTIONS": {
             "timeout": 60,
+            "init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
         },
     }
 
@@ -214,8 +216,6 @@ SIMPLE_JWT = {
 }
 
 
-WOYOFAL_PRELEVEMENTS_PCT = os.getenv("WOYOFAL_PRELEVEMENTS_PCT", "0")
-
 PAYDUNYA_MASTER_KEY = os.getenv("PAYDUNYA_MASTER_KEY", "")
 PAYDUNYA_PRIVATE_KEY = os.getenv("PAYDUNYA_PRIVATE_KEY", "")
 PAYDUNYA_PUBLIC_KEY = os.getenv("PAYDUNYA_PUBLIC_KEY", "")
@@ -227,6 +227,9 @@ AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://localhost:8001")
 AI_SERVICE_INTERNAL_TOKEN = os.getenv("AI_SERVICE_INTERNAL_TOKEN", "")
 AI_SERVICE_TIMEOUT = float(os.getenv("AI_SERVICE_TIMEOUT", "90"))
 N8N_INGESTION_TOKEN = os.getenv("N8N_INGESTION_TOKEN", "")
+N8N_WEBHOOK_BASE_URL = os.getenv("N8N_WEBHOOK_BASE_URL", "")
+N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
+N8N_WEBHOOK_TIMEOUT = float(os.getenv("N8N_WEBHOOK_TIMEOUT", "10.0"))
 N8N_SHARED_SECRET = os.getenv("N8N_SHARED_SECRET", "")
 N8N_RELANCE_WEBHOOK_URL = os.getenv("N8N_RELANCE_WEBHOOK_URL", "")
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")

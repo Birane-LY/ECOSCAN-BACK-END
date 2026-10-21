@@ -5,16 +5,17 @@ Sorti de views.py pour être réutilisable (import d'une facture, recalcul de
 rattrapage, commande de gestion) sans import circulaire.
 
 Gestion de la première facture :
-  Lorsqu'il n'y a pas de facture précédente, la consommation est comparée au
-  seuil Senelec Tranche 3 (500 kWh proratés sur 60 jours). Si la PME dépasse
-  ce seuil, un résultat de variation symbolique est créé pour déclencher
-  l'analyse anomalie/hypothèse/recommandation.
+  Une première facture n'est comparée à un seuil tarifaire que si son compteur
+  porte une catégorie explicitement configurée et qu'un barème correspondant
+  est actif. Aucune catégorie ni valeur domestique n'est supposée.
 """
 
 import logging
 from decimal import Decimal
 
 from analysis.models import ResultatMetrique
+from django.utils import timezone
+from energy.services.prediction_tranches import bareme_actuel
 from .anomaly import detecter_anomalie
 from .context import obtenir_contexte
 from .hypothesis import generer_hypothese
@@ -25,43 +26,53 @@ logger = logging.getLogger(__name__)
 
 ECART_MAX_JOURS = 75
 
-# Seuil Senelec Tranche 3 pour 60 jours (tarif PMP / PPP)
-# Au-delà de 500 kWh/60j la PME paye le tarif le plus cher.
-_SEUIL_T3_60J = Decimal("500")
-
-
 def _analyser_premiere_facture(resultat_actuel: ResultatMetrique):
-    """Sur la 1ʳᵉ facture d'une organisation, compare la consommation au seuil
-    Senelec Tranche 3 (proraté selon le nombre de jours réel) plutôt qu'à une
-    facture précédente. Retourne un ResultatMetrique de variation symbolique si
-    la consommation est en Tranche 3, None sinon."""
-    if resultat_actuel.valeur is None:
+    """Compare une première facture au seuil haut du barème déclaré, s'il existe."""
+    compteur = resultat_actuel.compteur
+    if resultat_actuel.valeur is None or compteur is None:
         return None
 
-    conso = resultat_actuel.valeur
+    categorie = getattr(compteur, "categorie_tarifaire", "")
+    mode_paiement = getattr(compteur, "mode_paiement", "")
+    if mode_paiement != "POSTPAYE":
+        return None
+    date_barreme = timezone.localdate(resultat_actuel.periode_fin)
+    tranches = bareme_actuel(
+        categorie,
+        mode_paiement,
+        a_la_date=date_barreme,
+    )
+    if len(tranches) < 2 or tranches[-1].kwh_min <= 0:
+        return None
 
-    # Prorata sur le nombre de jours réel si disponible
-    nb_jours = None
-    try:
-        if resultat_actuel.periode_debut and resultat_actuel.periode_fin:
-            nb_jours = (resultat_actuel.periode_fin - resultat_actuel.periode_debut).days
-    except Exception:
-        pass
-    seuil = _SEUIL_T3_60J * Decimal(str(nb_jours or 60)) / Decimal("60")
+    nb_jours = max(
+        1,
+        (resultat_actuel.periode_fin.date() - resultat_actuel.periode_debut.date()).days + 1,
+    )
+    if nb_jours != 30:
+        logger.info(
+            "Première facture org %s : seuil tarifaire ignoré pour une période de %s jours; "
+            "la règle de proratisation n'est pas confirmée.",
+            resultat_actuel.organisation_id,
+            nb_jours,
+        )
+        return None
+    seuil = tranches[-1].kwh_min
+    conso = resultat_actuel.valeur
 
     if conso <= seuil:
         logger.debug(
-            "Première facture org %s : consommation %s kWh ≤ seuil T3 %s kWh → pas d'anomalie.",
+            "Première facture org %s : consommation %s kWh ≤ seuil tarifaire %s kWh → pas d'anomalie.",
             resultat_actuel.organisation_id,
             conso,
             seuil,
         )
         return None
 
-    # Dépassement T3 : on exprime l'écart en % par rapport au seuil T3
+    # Le tarif et la catégorie proviennent du barème explicitement affecté au compteur.
     depassement_pct = ((conso - seuil) / seuil * 100).quantize(Decimal("0.01"))
     logger.info(
-        "Première facture org %s : conso %s kWh → dépassement T3 de %s %%.",
+        "Première facture org %s : conso %s kWh → dépassement du seuil tarifaire de %s %%.",
         resultat_actuel.organisation_id,
         conso,
         depassement_pct,
@@ -78,7 +89,7 @@ def _analyser_premiere_facture(resultat_actuel: ResultatMetrique):
         defaults={
             "valeur": depassement_pct,
             "unite": definition.unite,
-            "baseline_type": "seuil_tranche3_senelec",
+            "baseline_type": "seuil_tranche_configure",
             "baseline_valeur": seuil,
             "baseline_nombre_observations": 0,
             "completude": Decimal("0.70"),
@@ -86,8 +97,8 @@ def _analyser_premiere_facture(resultat_actuel: ResultatMetrique):
             "confiance": Decimal("0.70"),
             "sources": list(definition.sources_requises),
             "limites": [
-                f"Première facture : comparaison au seuil Senelec Tranche 3 "
-                f"({seuil} kWh/{nb_jours or 60} j), aucune facture précédente disponible."
+                f"Première facture : comparaison au seuil du barème postpayé {categorie} "
+                f"({seuil} kWh sur une période de 30 jours), aucune facture précédente disponible."
             ],
         },
     )
@@ -99,7 +110,8 @@ def calculer_variation_facture(resultat_actuel: ResultatMetrique):
     compteur, de la même organisation).
 
     Si aucune facture précédente n'existe (premier import), délègue à
-    _analyser_premiere_facture() qui compare au seuil Senelec T3.
+    _analyser_premiere_facture(), qui ne compare qu'à un barème explicitement
+    affecté au compteur.
     Retourne None si la consommation est jugée acceptable."""
     precedent = (
         ResultatMetrique.objects.filter(

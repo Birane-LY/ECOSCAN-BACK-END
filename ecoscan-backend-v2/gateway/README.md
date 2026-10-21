@@ -25,10 +25,31 @@ les API internes de Django sur Internet :
   doivent communiquer par HTTPS ou sur un réseau privé/VPN de confiance. Ne
   publiez jamais les routes `/api/internal/` sur Internet.
 
-Depuis ce dossier, copiez `.env.example` vers `.env` et configurez les URL et
-secrets. Copiez `equipment-entities.example.json` vers
-`equipment-entities.json`, puis remplacez l'exemple par un mapping des UUID
-d'équipements EcoScan vers leurs entités actionneurs Home Assistant :
+### Home Assistant local de développement
+
+Le fichier `docker-compose.home-assistant.yml` lance une instance Home
+Assistant locale pour le développement. Sa configuration est persistée dans
+`home-assistant/config/` et l'interface est disponible sur
+`http://localhost:8123`. Cette instance est distincte de toute installation
+Home Assistant existante et ne découvre pas les équipements connectés à un
+autre hôte.
+
+Depuis PowerShell, à la racine `ecoscan-backend-v2` :
+
+```powershell
+docker compose --file .\docker-compose.home-assistant.yml up -d
+```
+
+Terminez l'assistant de configuration dans le navigateur, puis créez un jeton
+d'accès longue durée depuis votre profil Home Assistant. Renseignez ce jeton
+dans `gateway/.env` (`HOME_ASSISTANT_TOKEN`) avant de lancer la passerelle. Le
+jeton n'est pas inclus dans le dépôt.
+
+Depuis `ecoscan-backend-v2`, copiez `gateway/.env.example` vers `gateway/.env`
+et configurez les URL et secrets. Copiez
+`gateway/equipment-entities.example.json` vers
+`gateway/equipment-entities.json`, puis remplacez l'exemple par un mapping des
+UUID d'équipements EcoScan vers leurs entités actionneurs Home Assistant :
 
 ```json
 {
@@ -42,13 +63,42 @@ courant : une preuve physique nécessite un retour d'état câblé sur le relais
 le contacteur. Les capteurs de puissance restent nécessaires pour confirmer la
 consommation électrique réelle.
 
-Après avoir copié et renseigné `.env` et le mapping, chargez les variables et
-lancez l'agent depuis ce dossier :
+Le profil de démonstration « Atelier et fournil — Dakar » utilise cinq
+`input_boolean` Home Assistant associés aux équipements EcoScan dans le fichier
+d'exemple. Ces interrupteurs sont virtuels : ils valident le parcours ON/OFF,
+mais ne commandent aucun appareil physique.
+
+### Exécution dans Docker Desktop sous Windows
+
+Le fichier `docker-compose.gateway.yml` démarre la passerelle comme un service
+long terme sans publier de port. Il utilise les noms de service
+`http://backend:8000` et `http://home-assistant:8123` sur le réseau Compose
+partagé. Démarrez le backend, Home Assistant et la passerelle dans le même
+projet Compose. Si le backend ou Home Assistant se trouve sur un autre hôte ou
+réseau, adaptez `DJANGO_BASE_URL` et `HOME_ASSISTANT_URL` à des adresses
+joignables depuis la passerelle. Configurez le même jeton interne que Django,
+un jeton Home Assistant à privilèges limités et le mapping avant le démarrage.
+
+Depuis PowerShell, à la racine `ecoscan-backend-v2` :
 
 ```powershell
-Copy-Item .env.example .env
-Copy-Item equipment-entities.example.json equipment-entities.json
-# Renseigner les valeurs réelles dans les deux fichiers avant de continuer.
+Copy-Item .\gateway\.env.example .\gateway\.env
+Copy-Item .\gateway\equipment-entities.example.json .\gateway\equipment-entities.json
+# Configurer les vrais secrets et mappings avant de démarrer la passerelle.
+docker compose --file .\docker-compose.gateway.yml config --quiet
+docker compose --file .\docker-compose.gateway.yml up --build -d
+docker compose --file .\docker-compose.gateway.yml logs --follow home-assistant-gateway
+```
+
+Arrêtez le service avec
+`docker compose --file .\docker-compose.gateway.yml down`. La file d'accusés de
+réception en attente est conservée dans le volume Docker `gateway_outbox`.
+N'utilisez pas le mapping d'exemple pour piloter du matériel.
+
+Pour un lancement Python natif, depuis le dossier `ecoscan-backend-v2\gateway`
+après avoir renseigné `.env` et `equipment-entities.json` :
+
+```powershell
 $envFile = Get-Content .env | Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' }
 foreach ($line in $envFile) {
     $parts = $line -split '=', 2

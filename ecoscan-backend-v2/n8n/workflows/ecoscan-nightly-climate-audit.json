@@ -1,0 +1,106 @@
+{
+"name": "EcoScan - Audit nocturne des états de climatisation (lecture seule)",
+"nodes": [
+  {
+    "parameters": {
+      "rule": {
+        "interval": [
+          {
+            "field": "cronExpression",
+            "expression": "45 22 * * *"
+          }
+        ]
+      }
+    },
+    "id": "nightly-schedule",
+    "name": "Audit quotidien à 22 h 45",
+    "type": "n8n-nodes-base.scheduleTrigger",
+    "typeVersion": 1.2,
+    "position": [0, 0]
+  },
+  {
+    "parameters": {
+      "jsCode": "const raw = String($env.ECOSCAN_CLIMATE_ENTITY_IDS ?? '');\nconst entityIds = [...new Set(raw.split(',').map((value) => value.trim()).filter(Boolean))];\nif (entityIds.length === 0) throw new Error('Configure ECOSCAN_CLIMATE_ENTITY_IDS avec une liste explicite d’entités climate.* ou input_boolean.ecoscan_demo_climatisation_* autorisées.');\nconst isClimate = (id) => /^climate\\.[a-z0-9_]+$/.test(id);\nconst isDemoClimate = (id) => /^input_boolean\\.ecoscan_demo_climatisation_[a-z0-9_]+$/.test(id);\nif (entityIds.some((id) => !isClimate(id) && !isDemoClimate(id))) throw new Error('La liste contient un identifiant qui n’est ni une entité climate valide ni un input_boolean de démonstration de climatisation.');\nif (entityIds.some(isClimate) && entityIds.some(isDemoClimate)) throw new Error('Ne mélange pas les entités climate réelles et les input_boolean de démonstration dans la même liste.');\nif (!$env.HOME_ASSISTANT_URL || !$env.HOME_ASSISTANT_TOKEN) throw new Error('HOME_ASSISTANT_URL et HOME_ASSISTANT_TOKEN doivent être configurés.');\nreturn entityIds.map((entity_id) => ({ json: { entity_id } }));"
+    },
+    "id": "allowlist",
+    "name": "Valider la liste autorisée",
+    "type": "n8n-nodes-base.code",
+    "typeVersion": 2,
+    "position": [240, 0]
+  },
+  {
+    "parameters": {
+      "url": "={{ $env.HOME_ASSISTANT_URL.replace(/\\/$/, '') + '/api/states/' + encodeURIComponent($json.entity_id) }}",
+      "sendHeaders": true,
+      "headerParameters": {
+        "parameters": [
+          {
+            "name": "Authorization",
+            "value": "={{ 'Bearer ' + $env.HOME_ASSISTANT_TOKEN }}"
+          }
+        ]
+      },
+      "options": {
+        "response": {
+          "response": {
+            "responseFormat": "json"
+          }
+        },
+        "timeout": 10000
+      }
+    },
+    "id": "read-ha-state",
+    "name": "Lire uniquement l’état Home Assistant",
+    "type": "n8n-nodes-base.httpRequest",
+    "typeVersion": 4.2,
+    "position": [500, 0]
+  },
+  {
+    "parameters": {
+      "jsCode": "const states = $input.all().map((item) => item.json);\nif (states.length === 0) throw new Error('Aucune entité de climatisation n’a été lue.');\nconst isDemo = states.some((item) => String(item.entity_id ?? '').startsWith('input_boolean.ecoscan_demo_climatisation_'));\nconst active = states.filter((item) => !['off', 'unavailable', 'unknown'].includes(String(item.state).toLowerCase()));\nconst lines = active.length\n  ? active.map((item) => `- ${isDemo ? '[SIMULATION] ' : ''}${item.entity_id}: état ${item.state}; dernière mise à jour ${item.last_changed ?? 'inconnue'}`)\n  : [`Aucune entité autorisée n’est signalée en marche${isDemo ? ' dans la simulation' : ''}.`];\nconst text = [\n  isDemo\n    ? 'Audit EcoScan — états de simulation Home Assistant (input_boolean), pas une mesure de l’état réel des climatiseurs.'\n    : 'Audit EcoScan des climatiseurs — rapport consultatif, aucune commande envoyée.',\n  `Vérification UTC : ${new Date().toISOString()}`,\n  `Entités vérifiées : ${states.length}`,\n  `États autres que arrêt / indisponible : ${active.length}`,\n  '',\n  ...lines,\n  '',\n  isDemo\n    ? 'Ces interrupteurs sont des données de démonstration et ne prouvent pas l’état des équipements physiques. Aucune commande n’a été envoyée.'\n    : 'Si un équipement est encore en marche après la fermeture, vérifiez l’occupation, les exceptions et le confort avant toute action. Cet audit ne coupe aucun équipement.'\n].join('\\n');\nconst subject = isDemo\n  ? `[EcoScan] Audit de simulation : ${active.length} état(s) actif(s)`\n  : `[EcoScan] Audit nocturne : ${active.length} climatisation(s) à vérifier`;\nreturn [{ json: { subject, text } }];"
+    },
+    "id": "summarize-states",
+    "name": "Préparer le rapport consultatif",
+    "type": "n8n-nodes-base.code",
+    "typeVersion": 2,
+    "position": [760, 0]
+  },
+  {
+    "parameters": {
+      "fromEmail": "={{ $env.ECOSCAN_NOTIFICATION_FROM_EMAIL }}",
+      "toEmail": "={{ $env.ECOSCAN_ENERGY_REPORT_TO_EMAIL }}",
+      "subject": "={{ $json.subject }}",
+      "emailFormat": "text",
+      "text": "={{ $json.text }}",
+      "options": {}
+    },
+    "id": "send-report",
+    "name": "Envoyer le rapport de fermeture",
+    "type": "n8n-nodes-base.emailSend",
+    "typeVersion": 2.1,
+    "position": [1020, 0]
+  }
+],
+"connections": {
+  "Audit quotidien à 22 h 45": {
+    "main": [[{ "node": "Valider la liste autorisée", "type": "main", "index": 0 }]]
+  },
+  "Valider la liste autorisée": {
+    "main": [[{ "node": "Lire uniquement l’état Home Assistant", "type": "main", "index": 0 }]]
+  },
+  "Lire uniquement l’état Home Assistant": {
+    "main": [[{ "node": "Préparer le rapport consultatif", "type": "main", "index": 0 }]]
+  },
+  "Préparer le rapport consultatif": {
+    "main": [[{ "node": "Envoyer le rapport de fermeture", "type": "main", "index": 0 }]]
+  }
+},
+"active": false,
+"settings": {
+  "executionOrder": "v1"
+},
+"meta": {
+  "templateCredsSetupCompleted": false
+},
+"tags": []
+}

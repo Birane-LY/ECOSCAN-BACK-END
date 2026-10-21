@@ -26,6 +26,33 @@ logger = logging.getLogger(__name__)
 LIMITE = 10
 
 
+def _monitoring_sites(organisation):
+    from energy_assets.monitoring import obtenir_indicateurs_site
+
+    sites = []
+    for site in organisation.sites.order_by("nom")[:LIMITE]:
+        summary, _ = obtenir_indicateurs_site(site)
+        sites.append({
+            "site": summary["site_name"],
+            "mode_donnees": summary["telemetry_mode"],
+            "puissance_actuelle_kw": summary["current_power_kw"],
+            "energie_aujourdhui_kwh": summary["today_energy_kwh"],
+            "derniere_mesure": summary["latest_measurement_at"],
+            "equipements": [
+                {
+                    "nom": item["name"],
+                    "zone": item["zone_name"],
+                    "etat_rapporte": item["reported_state"],
+                    "en_ligne": item["is_online"],
+                    "puissance_actuelle_kw": item["power_kw"],
+                    "mode_telemetrie": item["telemetry_mode"],
+                }
+                for item in summary["equipment"][:30]
+            ],
+        })
+    return sites
+
+
 def _section(avertissements: list, nom: str, fabrique):
     """Une section défaillante (champ renommé, table vide...) ne doit pas priver
     l'IA de toutes les autres : on la remplace par [] et on le signale."""
@@ -66,6 +93,11 @@ class AIContextView(APIView):
         data["metriques_recentes"] = _section(av, "metriques", lambda: list(
             ResultatMetrique.objects.filter(organisation=organisation).order_by("-periode_fin")[:LIMITE]
             .values("code_metrique", "valeur", "unite", "periode_fin", "statut_qualite")))
+        data["monitoring_sites"] = _section(
+            av,
+            "monitoring_sites",
+            lambda: _monitoring_sites(organisation),
+        )
         data["anomalies"] = _section(av, "anomalies", lambda: list(
             Anomalie.objects.filter(organisation=organisation).order_by("-date_detection")[:LIMITE]
             .values("type", "severite", "ecart_pourcentage", "valeur_observee", "valeur_attendue", "statut", "date_detection")))
@@ -88,9 +120,38 @@ class AIContextView(APIView):
         data["memoires_strategiques"] = _section(av, "memoires", lambda: list(
             MemoireStrategique.objects.filter(organisation=organisation).order_by("-date_creation")[:LIMITE]
             .values("titre", "statut", "signal_initial", "hypothese_texte", "impact_attendu_fcfa", "impact_mesure_fcfa")))
-        data["releves_recents"] = _section(av, "releves", lambda: list(
-            DonneeEnergetique.objects.filter(compteur__site__organisation=organisation)
-            .order_by("-periode_fin")[:15].values("valeur", "unite", "creneau", "date_releve", "periode_fin", "statut_validation")))
+        def _releves_recents():
+            resultat = []
+            compteurs = (
+                Compteur.objects.filter(site__organisation=organisation)
+                .select_related("site")
+                .order_by("site__nom", "reference")[:10]
+            )
+            for compteur in compteurs:
+                releves = (
+                    DonneeEnergetique.objects.filter(compteur=compteur)
+                    .order_by("-periode_fin")[:5]
+                    .values(
+                        "valeur",
+                        "unite",
+                        "creneau",
+                        "date_releve",
+                        "periode_fin",
+                        "statut_validation",
+                    )
+                )
+                resultat.extend(
+                    {
+                        **releve,
+                        "compteur_id": str(compteur.id),
+                        "compteur": compteur.reference,
+                        "site": compteur.site.nom,
+                    }
+                    for releve in releves
+                )
+            return resultat
+
+        data["releves_recents"] = _section(av, "releves", _releves_recents)
         data["releves_solde"] = _section(av, "releves_solde", lambda: list(
             ReleveSolde.objects.filter(compteur__site__organisation=organisation)
             .order_by("-date_releve")[:LIMITE].values("kwh_restants", "date_releve")))

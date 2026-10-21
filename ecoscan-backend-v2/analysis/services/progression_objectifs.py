@@ -3,8 +3,8 @@ Progression MESURÉE des objectifs de réduction de consommation.
 
 `Objectif.progression_actuelle` reste la progression DÉCLARÉE : elle avance des
 économies estimées des recommandations décidées (voir
-Recommandation.marquer_comme_decidee) — jamais déduite des mesures, volontairement.
-Ce module calcule à côté, sans rien écraser, ce que les données réelles montrent :
+Recommandation.marquer_comme_decidee). Ce module calcule à côté, sans écraser
+cette valeur, ce que les données réelles montrent :
 
     réduction mesurée = consommation de référence - consommation sur la période
 
@@ -18,6 +18,9 @@ FCFA n'est pas mesurée : aucun tarif n'est supposé.
   par période de facturation (durées de 30 à 60 jours : non normalisé).
 - Compteurs Woyofal : moyenne journalière sur les 28 jours avant le début, contre
   la moyenne journalière depuis le début, × nombre de jours écoulés.
+- Actions liées : comparaison des index ENERGY sur sept jours complets avant et
+  après leur réalisation. Les mesures simulées sont exposées comme scénario,
+  distinctes d'une économie réelle.
 
 Le résultat est toujours accompagné de sa source, de sa fiabilité et, quand la
 mesure est impossible, de la RAISON — jamais d'un 0 trompeur.
@@ -80,9 +83,10 @@ def _convertir(reduction_kwh, reference, unite):
             return None, "Référence nulle : pourcentage incalculable."
         return reduction_kwh / reference * 100, None
     if unite_n in ("fcfa", "xof", "cfa", "f cfa"):
-        # Équivalent financier moyen Senelec Basse Tension pro (~140 FCFA/kWh HT)
-        tarif_kwh = 140.0
-        return reduction_kwh * tarif_kwh, None
+        return None, (
+            "Aucun tarif vérifié et applicable à ce compteur n'est configuré : "
+            "la progression financière ne peut pas être estimée."
+        )
     if unite_n.startswith("kg") or unite_n.startswith("t"):
         facteur = facteur_kg_par_kwh()
         if facteur is None:
@@ -246,6 +250,71 @@ def _via_woyofal_rituel(objectif, debut, fin):
     }, None
 
 
+def _via_actions_telemetrie(objectif, debut, fin):
+    """Agrège les économies d'actions issues de mesures ENERGY réelles."""
+    unite = (objectif.unite or "").strip().lower().replace(" ", "")
+    if unite not in ("kwh", "%"):
+        return None, None
+
+    from analysis.models import Action
+    from analysis.services.telemetry_impact import calculer_impact_telemetrie_action
+
+    actions = list(
+        Action.objects.filter(
+            recommandation__objectif=objectif,
+            statut=Action.Statut.TERMINEE,
+            date_realisation__gte=debut,
+            date_realisation__lt=fin,
+        ).select_related("equipement__site")
+    )
+    if not actions:
+        return None, None
+
+    mesures = [
+        calculer_impact_telemetrie_action(action, inclure_simules=True)
+        for action in actions
+    ]
+    incompletes = [mesure for mesure in mesures if mesure["statut"] != "mesure"]
+    if incompletes:
+        raisons = sorted({mesure["raison"] for mesure in incompletes})
+        return None, (
+            f"Impact télémétrique incomplet pour {len(incompletes)} action(s) sur {len(actions)} : "
+            + " ".join(raisons)
+        )
+
+    reference = sum((mesure["reference_kwh"] for mesure in mesures), Decimal("0"))
+    reel = sum((mesure["consommation_kwh"] for mesure in mesures), Decimal("0"))
+    valeur, raison = _convertir(reference - reel, reference, objectif.unite)
+    if valeur is None:
+        return None, raison
+    provenances = {mesure.get("provenance") for mesure in mesures}
+    utilise_simulation = "SIMULATED" in provenances
+    if utilise_simulation and "REAL" in provenances:
+        source = "capteurs_energy_actions_mixed"
+        fiabilite = "mixte (inclut une simulation)"
+        provenance_detail = "Index ENERGY réels et simulés"
+    elif utilise_simulation:
+        source = "capteurs_energy_actions_simulated"
+        fiabilite = "simulation"
+        provenance_detail = "Index ENERGY simulés (scénario, pas une économie réelle)"
+    else:
+        source = "capteurs_energy_actions"
+        fiabilite = "élevée"
+        provenance_detail = "Index ENERGY réels"
+    return {
+        "mesuree": round(valeur, 2),
+        "source": source,
+        "reference": round(float(reference), 2),
+        "reel": round(float(reel), 2),
+        "fiabilite": fiabilite,
+        "detail": (
+            f"{provenance_detail} : {round(float(reference), 2)} kWh sur les sept jours "
+            f"de référence, {round(float(reel), 2)} kWh sur les sept jours après "
+            f"réalisation, pour {len(actions)} action(s)."
+        ),
+    }, None
+
+
 def calculer_progression_mesuree(objectif) -> dict:
     base = {
         "objectif_id": str(objectif.id),
@@ -269,32 +338,32 @@ def calculer_progression_mesuree(objectif) -> dict:
         return {**base, "raison": "L'objectif n'a pas encore commencé."}
     fin = date_fin_dt or (debut + timedelta(days=365))
 
+    mesure, raison = _via_actions_telemetrie(objectif, debut, fin)
+    if mesure:
+        return {**base, **mesure}
+
     from energy.models import ReleveSolde
     from organizations.models import Compteur
 
     ids = ReleveSolde.objects.filter(compteur__site__organisation=objectif.organisation).values_list("compteur_id", flat=True).distinct()
     compteurs = list(Compteur.objects.filter(id__in=list(ids)))
 
-    # Un objectif de coût exprimé en % est mesuré sur la consommation : c'est une
-    # approximation (tarif supposé constant), dite clairement dans le détail.
-    approximation = ""
-    if getattr(objectif, "type", "") == "REDUCTION_COUT" and (objectif.unite or "").strip() == "%":
-        approximation = " Réduction de consommation utilisée comme approximation de la réduction de facture (tarif supposé constant)."
-
     raisons = []
+    if raison:
+        raisons.append(raison)
     if compteurs:
         mesure, raison = _via_woyofal(objectif, debut, fin, compteurs)
         if mesure:
-            return {**base, **mesure, "detail": (mesure.get("detail") or "") + approximation}
+            return {**base, **mesure}
         raisons.append(raison)
     mesure, raison = _via_woyofal_rituel(objectif, debut, fin)
     if mesure:
-        return {**base, **mesure, "detail": (mesure.get("detail") or "") + approximation}
+        return {**base, **mesure}
     if raison:
         raisons.append(raison)
     mesure, raison = _via_factures(objectif, debut, fin)
     if mesure:
-        return {**base, **mesure, "detail": (mesure.get("detail") or "") + approximation}
+        return {**base, **mesure}
     raisons.append(raison)
     return {**base, "raison": " ".join(r for r in raisons if r)}
 

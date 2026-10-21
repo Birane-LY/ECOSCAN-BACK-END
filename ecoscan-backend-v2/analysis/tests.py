@@ -12,10 +12,56 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from accounts.models import Utilisateur
-from organizations.models import Organisation, UtilisateurOrganisation
+from billing.testing import grant_test_trial
+from organizations.models import Organisation, Site, UtilisateurOrganisation
 
 from .models import Anomalie, Livrable, MemoireStrategique, OpportuniteFinancement, ResultatMetrique
+from .internal_views import _monitoring_sites
 from .services.report_service import _chemin_logo, _contenu_memoire, generer_pdf_livrable
+
+
+class AssistantMonitoringContextTests(TestCase):
+	def test_monitoring_context_includes_site_energy_and_equipment_state(self):
+		organisation = Organisation.objects.create(
+			nom="Organisation monitoring",
+			secteur="Énergie",
+			localisation="Dakar",
+			statut=Organisation.Statut.ACTIVE,
+		)
+		Site.objects.create(
+			organisation=organisation,
+			nom="Site monitoring",
+			adresse="",
+			pays="Sénégal",
+			fuseau_horaire="Africa/Dakar",
+		)
+		summary = {
+			"site_name": "Site monitoring",
+			"telemetry_mode": "SIMULATED",
+			"current_power_kw": Decimal("2.500"),
+			"today_energy_kwh": Decimal("24.900"),
+			"latest_measurement_at": "2026-10-21T02:25:00Z",
+			"equipment": [{
+				"name": "Climatisation centrale",
+				"zone_name": "Bureaux",
+				"reported_state": "ON",
+				"is_online": True,
+				"power_kw": Decimal("0.350"),
+				"telemetry_mode": "SIMULATED",
+			}],
+		}
+
+		with patch(
+			"energy_assets.monitoring.obtenir_indicateurs_site",
+			return_value=(summary, []),
+		):
+			context = _monitoring_sites(organisation)
+
+		self.assertEqual(context[0]["mode_donnees"], "SIMULATED")
+		self.assertEqual(context[0]["energie_aujourdhui_kwh"], Decimal("24.900"))
+		self.assertEqual(context[0]["equipements"][0]["nom"], "Climatisation centrale")
+		self.assertEqual(context[0]["equipements"][0]["etat_rapporte"], "ON")
+		self.assertTrue(context[0]["equipements"][0]["en_ligne"])
 
 
 class InternalAIClientTokenTests(TestCase):
@@ -51,6 +97,69 @@ class InternalAIClientTokenTests(TestCase):
 
 		self.assertIn("_error", result)
 		post_multipart.assert_not_called()
+
+
+class AssistantOrganizationScopeTests(TestCase):
+	def setUp(self):
+		self.user = Utilisateur.objects.create_user(
+			email="assistant-scope@example.com",
+			password="test-password",
+			nom="Assistant Scope",
+		)
+		self.organisations = []
+		for name in ("Organisation assistant A", "Organisation assistant B"):
+			organisation = Organisation.objects.create(
+				nom=name,
+				secteur="Énergie",
+				localisation="Dakar",
+				statut=Organisation.Statut.ACTIVE,
+			)
+			UtilisateurOrganisation.objects.create(
+				organisation=organisation,
+				utilisateur=self.user,
+			)
+			grant_test_trial(organisation)
+			self.organisations.append(organisation)
+		self.client = APIClient()
+		self.client.force_authenticate(user=self.user)
+		self.url = "/api/analyses/assistant/interroger/"
+
+	@patch("analysis.views.interroger_assistant", return_value={"answer": "Analyse ciblée", "sources": []})
+	def test_assistant_uses_the_selected_accessible_organisation(self, interroger):
+		organisation = self.organisations[1]
+
+		response = self.client.post(
+			self.url,
+			{
+				"question": "Analyse le site sélectionné.",
+				"organisation_id": str(organisation.id),
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		self.assertEqual(interroger.call_args.args[1], organisation.id)
+
+	@patch("analysis.views.interroger_assistant")
+	def test_assistant_rejects_an_organisation_outside_the_user_scope(self, interroger):
+		organisation = Organisation.objects.create(
+			nom="Organisation hors périmètre",
+			secteur="Énergie",
+			localisation="Dakar",
+			statut=Organisation.Statut.ACTIVE,
+		)
+
+		response = self.client.post(
+			self.url,
+			{
+				"question": "Analyse le site sélectionné.",
+				"organisation_id": str(organisation.id),
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+		interroger.assert_not_called()
 
 
 @override_settings(N8N_INGESTION_TOKEN="test-ingestion-token")
@@ -114,6 +223,21 @@ class OpportuniteFinancementPublicationTests(TestCase):
 			role=Utilisateur.Role.UTILISATEUR_ORGANISATION,
 			actif=True,
 		)
+		self.organisation = Organisation.objects.create(
+			nom="Organisation subventions test",
+			secteur="Énergie",
+			localisation="Dakar",
+			statut=Organisation.Statut.ACTIVE,
+		)
+		UtilisateurOrganisation.objects.create(
+			organisation=self.organisation,
+			utilisateur=self.admin,
+		)
+		UtilisateurOrganisation.objects.create(
+			organisation=self.organisation,
+			utilisateur=self.member,
+		)
+		grant_test_trial(self.organisation)
 
 	def _results(self, response):
 		return response.data.get("results", response.data) if isinstance(response.data, dict) else response.data
@@ -187,6 +311,50 @@ class ReportGenerationTests(TestCase):
 		self.assertTrue(Path(_chemin_logo()).is_file())
 		self.assertIsNone(livrable.fiche_projet)
 
+	@patch(
+		"analysis.services.report_service.interroger_assistant",
+		return_value={"answer": "Les données disponibles sont limitées; vérifiez les relevés."},
+	)
+	def test_ai_synthesis_is_included_and_marked_as_generated(self, interroger_assistant):
+		organisation = Organisation.objects.create(
+			nom="EcoScan IA Test",
+			secteur="Énergie",
+			localisation="Dakar",
+		)
+		livrable = Livrable.objects.create(
+			organisation=organisation,
+			nom="Synthèse IA",
+			type="COMPTABLE",
+		)
+
+		pdf = generer_pdf_livrable(livrable, inclure_synthese_ia=True)
+
+		self.assertTrue(pdf.read().startswith(b"%PDF-"))
+		self.assertEqual(livrable.synthese_ia_statut, "GENEREE")
+		interroger_assistant.assert_called_once()
+
+	@patch(
+		"analysis.services.report_service.interroger_assistant",
+		return_value={"_error": "service indisponible"},
+	)
+	def test_report_is_still_generated_when_ai_is_unavailable(self, interroger_assistant):
+		organisation = Organisation.objects.create(
+			nom="EcoScan IA indisponible",
+			secteur="Énergie",
+			localisation="Dakar",
+		)
+		livrable = Livrable.objects.create(
+			organisation=organisation,
+			nom="Rapport sans IA",
+			type="COMPTABLE",
+		)
+
+		pdf = generer_pdf_livrable(livrable, inclure_synthese_ia=True)
+
+		self.assertTrue(pdf.read().startswith(b"%PDF-"))
+		self.assertEqual(livrable.synthese_ia_statut, "INDISPONIBLE")
+		interroger_assistant.assert_called_once()
+
 
 class LivrableDownloadTests(TestCase):
 	def setUp(self):
@@ -199,11 +367,13 @@ class LivrableDownloadTests(TestCase):
 			nom="EcoScan Test",
 			secteur="Énergie",
 			localisation="Dakar",
+			statut=Organisation.Statut.ACTIVE,
 		)
 		UtilisateurOrganisation.objects.create(
 			organisation=self.organisation,
 			utilisateur=self.user,
 		)
+		grant_test_trial(self.organisation)
 		self.livrable = Livrable.objects.create(
 			organisation=self.organisation,
 			nom="EcoScan_Memoire_Test",
@@ -211,6 +381,23 @@ class LivrableDownloadTests(TestCase):
 		)
 		self.client = APIClient()
 		self.client.force_authenticate(user=self.user)
+
+	def test_report_action_forwards_the_opt_in_ai_summary_and_returns_its_status(self):
+		def generer(livrable, inclure_synthese_ia=False):
+			livrable.synthese_ia_statut = "GENEREE" if inclure_synthese_ia else "NON_DEMANDEE"
+			return ContentFile(b"%PDF-test", name="rapport.pdf")
+
+		with TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
+			with patch("analysis.views.generer_pdf_livrable", side_effect=generer) as pdf_generator:
+				response = self.client.post(
+					f"/api/analyses/livrables/{self.livrable.id}/generer/",
+					{"inclure_synthese_ia": True},
+					format="json",
+				)
+
+		self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+		self.assertEqual(response.data["synthese_ia_statut"], "GENEREE")
+		self.assertTrue(pdf_generator.call_args.kwargs["inclure_synthese_ia"])
 
 	def test_download_serves_pdf_to_an_organisation_member(self):
 		with TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
@@ -298,3 +485,52 @@ class WoyofalRecommendationTests(TestCase):
 		self.assertEqual(recommandation.objectif.unite, "kWh")
 		self.assertEqual(recommandation.objectif.valeur_cible, Decimal("10.000000"))
 		self.assertEqual(recommandation.statut, Recommandation.Statut.PROPOSEE)
+
+	def test_simulated_anomaly_never_uses_ai_financial_estimate(self):
+		from analysis.models import Recommandation
+		from analysis.services.auto_recommandation import generer_recommandation_auto
+
+		organisation = Organisation.objects.create(
+			nom="EcoScan simulation",
+			secteur="Commerce",
+			localisation="Dakar",
+		)
+		now = timezone.now()
+		resultat = ResultatMetrique.objects.create(
+			organisation=organisation,
+			code_metrique="variation_telemetrie_test",
+			version_metrique="1.0",
+			valeur=Decimal("20"),
+			unite="%",
+			periode_debut=now - timedelta(days=1),
+			periode_fin=now,
+			completude=Decimal("1"),
+			statut_qualite=ResultatMetrique.StatutQualite.FIABLE,
+			sources=[{"sensor_id": "sensor-test", "mode": "SIMULATED"}],
+		)
+		anomalie = Anomalie.objects.create(
+			organisation=organisation,
+			resultat_metrique=resultat,
+			type="consumption_spike",
+			severite=Anomalie.Severite.ALERTE,
+			valeur_observee=Decimal("120"),
+			valeur_attendue=Decimal("100"),
+			ecart_pourcentage=Decimal("20"),
+		)
+
+		with patch(
+			"analysis.services.auto_recommandation.demander_hypothese",
+			return_value={
+				"answer": (
+					'{"titre":"Vérifier les équipements","description":"Contrôler le site.",'
+					'"economie_estimee_fcfa":999999}'
+				)
+			},
+		), patch("analysis.services.auto_recommandation.synchroniser_memoire_recommandations"):
+			recommandation = generer_recommandation_auto(anomalie)
+
+		self.assertEqual(recommandation.unite, "kWh")
+		self.assertEqual(recommandation.economie_estimee, Decimal("20.00"))
+		self.assertEqual(recommandation.objectif.unite, "kWh")
+		self.assertIn("télémétrie simulée", recommandation.description)
+		self.assertNotEqual(recommandation.economie_estimee, Decimal("999999"))

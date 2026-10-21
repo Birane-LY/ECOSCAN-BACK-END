@@ -67,9 +67,6 @@ class ParseurMetierService:
 
         # 6. Montant net à payer
         champs["montant_net_paye"] = self._extraire_montant_total(texte)
-        champs["index"] = champs.get("nouveau_index")
-        champs["montant"] = champs["montant_net_paye"]
-        champs["date"] = champs.get("date_facture")
 
         # 7. Métriques de gestion dérivées pour la PME
         if champs.get("consommation_kwh") and champs.get("nombre_jours"):
@@ -107,6 +104,10 @@ class ParseurMetierService:
 
         if montant is not None and montant <= 0:
             erreurs.append({"code": "MONTANT_INVALIDE", "message": "Le montant total doit être supérieur à 0 FCFA."})
+        if nouveau_index is not None and ancien_index is None:
+            warnings.append({"code": "ANCIEN_INDEX_MANQUANT", "message": "L'ancien index n'a pas été détecté; le nouvel index seul ne permet pas de calculer la consommation."})
+        if consommation is None and (ancien_index is not None or nouveau_index is not None):
+            warnings.append({"code": "CONSOMMATION_MANQUANTE", "message": "La consommation en kWh n'a pas été détectée et ne peut pas être déduite sans les deux index."})
         if nouveau_index is None and consommation is None:
             erreurs.append({"code": "METRIQUE_MANQUANTE", "message": "Aucun index ni volume de consommation (kWh) n'a pu être extrait."})
         elif nouveau_index is None:
@@ -124,7 +125,11 @@ class ParseurMetierService:
         conso = ParseurMetierService._extraire_nombre(texte, rf"consommation\s*(?:\(kwh\))?\s*[:.]?\s*({_NOMBRE_GROUPE})")
 
         if ai is not None and ni is not None:
-            return {"ancien_index": ai, "nouveau_index": ni, "consommation_kwh": conso or (ni - ai)}
+            return {
+                "ancien_index": ai,
+                "nouveau_index": ni,
+                "consommation_kwh": conso if conso is not None else ni - ai,
+            }
 
         # Repli sur le tableau multi-lignes Tesseract
         lignes = texte.splitlines()

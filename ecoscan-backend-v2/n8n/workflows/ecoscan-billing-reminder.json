@@ -1,0 +1,180 @@
+{
+  "name": "EcoScan - Relances de facturation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ecoscan-relance",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "billing-webhook",
+      "name": "Recevoir une relance Django",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [0, 0],
+      "webhookId": "cfdba765-d3fb-4ce2-af22-f12e8452f052"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst headers = input.headers ?? {};\nconst received = Object.entries(headers).find(([name]) => name.toLowerCase() === 'x-ecoscan-secret')?.[1];\nconst expected = $env.N8N_SHARED_SECRET;\nif (!expected || expected.startsWith('replace-with-') || !received || received !== expected) throw new Error('Unauthorized billing reminder webhook request');\nconst payload = input.body ?? input;\nconst id = String(payload.relance_id ?? '');\nif (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error('Invalid reminder identifier');\nconst backend = String($env.BACKEND_BASE_URL ?? '').replace(/\\/$/, '');\nif (!/^https?:\\/\\//i.test(backend)) throw new Error('BACKEND_BASE_URL must be configured');\nconst callback_url = `${backend}/api/paiements/relances/${id}/callback/`;\nconst recipients = payload.organisation?.emails_admin;\nconst canalEmail = String(payload.canal ?? '').toUpperCase() === 'EMAIL';\nconst validRecipients = Array.isArray(recipients) && recipients.length > 0 && recipients.every((email) => typeof email === 'string' && /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email));\nconst facture = payload.facture ?? {};\nconst should_send = canalEmail && validRecipients && Boolean(payload.organisation?.nom && facture.numero && facture.montant_total && facture.date_echeance);\nconst detail = !canalEmail ? `Canal ${payload.canal ?? 'inconnu'} non pris en charge par ce workflow (e-mail uniquement).` : !validRecipients ? 'Aucune adresse e-mail administrateur valide.' : !should_send ? 'Données de facturation incomplètes.' : '';\nconst text = [\n  `Bonjour,`,\n  '',\n  `Une facture EcoScan ${facture.numero ?? ''} de ${facture.montant_total ?? ''} ${facture.devise ?? ''} pour ${payload.organisation?.nom ?? ''} nécessite votre attention.`,\n  `Échéance : ${facture.date_echeance ?? ''}`,\n  `Niveau de relance : ${payload.niveau ?? ''}`,\n  '',\n  'Connectez-vous à EcoScan pour consulter la facture et régulariser votre abonnement.',\n  '',\n  'L’équipe EcoScan'\n].join('\\n');\nreturn [{ json: { relance_id: id, callback_url, recipients: validRecipients ? recipients : [], should_send, detail, subject: `[EcoScan] Rappel de paiement — facture ${facture.numero ?? ''}`, text } }];"
+      },
+      "id": "validate-reminder",
+      "name": "Authentifier et valider la relance",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "valid-email",
+              "leftValue": "={{ $json.should_send }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "route-channel",
+      "name": "Canal e-mail valide ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [520, 0]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.ECOSCAN_NOTIFICATION_FROM_EMAIL }}",
+        "toEmail": "={{ $json.recipients.join(',') }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {}
+      },
+      "id": "send-reminder",
+      "name": "Envoyer la relance par e-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [780, -120],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Authentifier et valider la relance').first().json.callback_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-EcoScan-Secret",
+              "value": "={{ $env.N8N_SHARED_SECRET }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { succes: true, detail: 'Relance e-mail acceptée par le nœud SMTP n8n.' } }}",
+        "options": {}
+      },
+      "id": "success-callback",
+      "name": "Confirmer l’envoi à Django",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1040, -200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Authentifier et valider la relance').first().json.callback_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-EcoScan-Secret",
+              "value": "={{ $env.N8N_SHARED_SECRET }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { succes: false, detail: $('Authentifier et valider la relance').first().json.detail || 'Le nœud SMTP a signalé un échec.' } }}",
+        "options": {}
+      },
+      "id": "failure-callback",
+      "name": "Signaler l’échec à Django",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1040, 80]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, relance_id: $('Authentifier et valider la relance').first().json.relance_id }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "webhook-response",
+      "name": "Accuser réception à Django",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1300, -40]
+    }
+  ],
+  "connections": {
+    "Recevoir une relance Django": {
+      "main": [[{ "node": "Authentifier et valider la relance", "type": "main", "index": 0 }]]
+    },
+    "Authentifier et valider la relance": {
+      "main": [[{ "node": "Canal e-mail valide ?", "type": "main", "index": 0 }]]
+    },
+    "Canal e-mail valide ?": {
+      "main": [
+        [{ "node": "Envoyer la relance par e-mail", "type": "main", "index": 0 }],
+        [{ "node": "Signaler l’échec à Django", "type": "main", "index": 0 }]
+      ]
+    },
+    "Envoyer la relance par e-mail": {
+      "main": [
+        [{ "node": "Confirmer l’envoi à Django", "type": "main", "index": 0 }],
+        [{ "node": "Signaler l’échec à Django", "type": "main", "index": 0 }]
+      ]
+    },
+    "Confirmer l’envoi à Django": {
+      "main": [[{ "node": "Accuser réception à Django", "type": "main", "index": 0 }]]
+    },
+    "Signaler l’échec à Django": {
+      "main": [[{ "node": "Accuser réception à Django", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

@@ -22,8 +22,35 @@ MOTS_CLES_NON_ENERGETIQUES = {
     "carte nationale d'identité", "certificat médical", "relevé bancaire", "bon de commande", "attestation de travail",
 }
 
+INDICES_SENEGAL = (
+    "sénégal",
+    "senegal",
+    "dakar",
+    "thiès",
+    "thies",
+    "saint-louis",
+    "kaolack",
+    "ziguinchor",
+    "fcfa",
+    "xof",
+)
+EMETTEURS_SENEGAL = ("senelec",)
+INDICES_DOCUMENT = (
+    "n° facture",
+    "facture n°",
+    "numero facture",
+    "ancien index",
+    "nouvel index",
+    "nouveau index",
+    "montant total",
+    "total facture",
+    "periode du",
+    "période du",
+    "compte de contrat",
+    "n° partenaire",
+)
+
 SEUIL_REJET_PERTINENCE = 0.40
-SEUIL_ACCEPTATION_PERTINENCE = 0.65
 
 
 class ClassificateurService:
@@ -61,28 +88,85 @@ class ClassificateurService:
                 "type": "DOCUMENT_NON_ENERGETIQUE", "relevance_score": 0.0,
                 "decision": "reject", "emetteur": "AUTRE_FOURNISSEUR",
                 "signals": pertinence["signaux"], "negative_signals": signaux_negatifs,
+                "pays_detecte": None,
+                "authenticite": {
+                    "statut": "REJETE",
+                    "motif": "Le document contient des signaux non énergétiques.",
+                    "verification_officielle_disponible": False,
+                },
             }
 
-        is_senelec = "senelec" in texte_norm or "woyofal" in texte_norm
-        has_facture = "facture" in texte_norm or "total facture" in texte_norm
-        has_index = "index" in texte_norm or "kwh" in texte_norm
+        emetteur = next(
+            (nom.upper() for nom in EMETTEURS_SENEGAL if nom in texte_norm),
+            None,
+        )
+        est_ticket_woyofal = "woyofal" in texte_norm and bool(
+            re.search(r"\b(?:recharge|ticket|token|jeton)\b", texte_norm)
+        )
+        indices_senegal = [indice for indice in INDICES_SENEGAL if indice in texte_norm]
+        indices_document = [
+            indice for indice in INDICES_DOCUMENT if indice in texte_norm
+        ]
         score = pertinence["score"]
 
-        if is_senelec and (has_facture or has_index):
-            type_doc = "FACTURE_SENELEC"
-            decision = "accept_extraction"
-        elif score >= SEUIL_ACCEPTATION_PERTINENCE:
-            type_doc = "FACTURE_ENERGIE"
-            decision = "accept_extraction"
-        elif score >= SEUIL_REJET_PERTINENCE:
-            type_doc = "DOCUMENT_ENERGETIQUE_A_REVOIR"
-            decision = "human_review"
-        else:
-            type_doc = "DOCUMENT_NON_ENERGETIQUE"
-            decision = "reject"
+        if est_ticket_woyofal:
+            return {
+                "type": "TICKET_RECHARGE_WOYOFAL",
+                "relevance_score": score,
+                "decision": "reject",
+                "emetteur": emetteur or "NON_VERIFIE",
+                "signals": pertinence["signaux"],
+                "negative_signals": [],
+                "pays_detecte": "SENEGAL" if indices_senegal or emetteur else None,
+                "motif_rejet": (
+                    "Ticket de recharge Woyofal détecté. Ce document n'est pas une facture "
+                    "de consommation : saisissez séparément le montant payé et les kWh "
+                    "crédités indiqués sur le ticket; ils ne représentent pas la consommation."
+                ),
+                "authenticite": {
+                    "statut": "NON_VERIFIEE",
+                    "motif": (
+                        "Le ticket doit être vérifié séparément avant saisie; son montant "
+                        "ne permet pas de déduire les kWh crédités."
+                    ),
+                    "verification_officielle_disponible": False,
+                },
+            }
 
+        if score < SEUIL_REJET_PERTINENCE:
+            return {
+                "type": "DOCUMENT_NON_ENERGETIQUE",
+                "relevance_score": score,
+                "decision": "reject",
+                "emetteur": emetteur or "AUTRE_FOURNISSEUR",
+                "signals": pertinence["signaux"],
+                "negative_signals": [],
+                "pays_detecte": "SENEGAL" if indices_senegal or emetteur else None,
+                "authenticite": {
+                    "statut": "REJETE",
+                    "motif": "Les indices énergétiques sont insuffisants.",
+                    "verification_officielle_disponible": False,
+                },
+            }
+
+        # OCR and issuer keywords identify a candidate, but the import pipeline
+        # must run its independent quality and consistency checks before publication.
         return {
-            "type": type_doc, "relevance_score": score, "decision": decision,
-            "emetteur": "SENELEC" if is_senelec else "AUTRE_FOURNISSEUR",
-            "signals": pertinence["signaux"], "negative_signals": [],
+            "type": "FACTURE_SENELEC" if emetteur else "DOCUMENT_ENERGETIQUE_A_REVOIR",
+            "relevance_score": score,
+            "decision": "candidate",
+            "emetteur": emetteur or "NON_VERIFIE",
+            "signals": pertinence["signaux"],
+            "negative_signals": [],
+            "pays_detecte": "SENEGAL" if indices_senegal or emetteur else None,
+            "indices_pays": indices_senegal,
+            "indices_document": indices_document,
+            "authenticite": {
+                "statut": "NON_VERIFIEE",
+                "motif": (
+                    "Le contenu semble énergétique, mais aucune source officielle "
+                    "ne permet de vérifier automatiquement l'émetteur ou l'origine."
+                ),
+                "verification_officielle_disponible": False,
+            },
         }

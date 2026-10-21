@@ -1,9 +1,8 @@
 """
 Orchestrateur de l'analyse — relie les services pour une organisation et un jour.
 
-Ne crée JAMAIS automatiquement une Recommandation ou une Action : la chaîne
-s'arrête à la génération d'hypothèse ; la suite est un geste humain
-(AnomalieViewSet.creer_recommandation).
+Génère un diagnostic et une recommandation PROPOSÉE après détection. L'adoption
+de la recommandation et la création d'une action restent des décisions humaines.
 
 Deux voies de mesure selon le type de compteur :
 - compteur à index relevé : variation vs baseline « même jour de la semaine » ;
@@ -24,9 +23,42 @@ from analysis.services import woyofal
 from analysis.services.anomaly import detecter_anomalie
 from analysis.services.context import obtenir_contexte
 from analysis.services.hypothesis import generer_hypothese
+from analysis.services.auto_recommandation import generer_recommandation_auto
 from .metrics_service import MetricsService
 
 logger = logging.getLogger(__name__)
+
+
+def traiter_suivi_anomalie(anomalie_id):
+    """Crée le diagnostic et la piste d'action idempotents après une détection."""
+    anomalie = (
+        Anomalie.objects.select_related("organisation", "resultat_metrique")
+        .filter(id=anomalie_id)
+        .first()
+    )
+    if anomalie is None:
+        logger.warning("Suivi automatique ignoré : anomalie %s introuvable.", anomalie_id)
+        return None, None
+
+    hypothese = (
+        anomalie.hypotheses.order_by("-date_creation").first()
+        or generer_hypothese(anomalie, obtenir_contexte(anomalie))
+    )
+    recommandation = generer_recommandation_auto(anomalie)
+    return hypothese, recommandation
+
+
+def planifier_suivi_anomalie(anomalie):
+    """Planifie le suivi seulement si le diagnostic ou la recommandation manque."""
+    if anomalie.statut == Anomalie.Statut.RESOLVED:
+        return False
+    if anomalie.hypotheses.exists() and anomalie.recommandations.exists():
+        return False
+
+    from analysis.services.taches import lancer_en_arriere_plan
+
+    lancer_en_arriere_plan(traiter_suivi_anomalie, str(anomalie.id))
+    return True
 
 
 def _en_datetime(date_jour) -> datetime:
@@ -43,7 +75,7 @@ def _conclure(resultat_persiste, variation: dict) -> dict:
     if anomalie is None:
         return {"statut": "normal", "variation": variation, "anomalie": None, "hypothese": None}
 
-    hypothese = generer_hypothese(anomalie, obtenir_contexte(anomalie))
+    hypothese, recommandation = traiter_suivi_anomalie(anomalie.id)
     return {
         "statut": "anomalie_detectee",
         "variation": variation,
@@ -53,14 +85,25 @@ def _conclure(resultat_persiste, variation: dict) -> dict:
             "severite": anomalie.severite,
             "ecart_pourcentage": float(anomalie.ecart_pourcentage),
         },
-        # None si le service IA est indisponible : l'anomalie reste détectée et
-        # l'hypothèse sera générée au prochain passage (regenerer_hypotheses_manquantes).
+        # None si l'IA est indisponible : l'anomalie reste détectée et sera réessayée.
         "hypothese": (
             {"id": str(hypothese.id), "texte": hypothese.texte, "statut": hypothese.statut,
              "requires_human_confirmation": True}
             if hypothese is not None else None
         ),
-        "next_step": "confirm_hypothesis" if hypothese is not None else "retry_hypothesis_generation",
+        "recommandation": (
+            {
+                "id": str(recommandation.id),
+                "statut": recommandation.statut,
+                "requires_human_decision": True,
+            }
+            if recommandation is not None else None
+        ),
+        "next_step": (
+            "review_recommendation"
+            if recommandation is not None
+            else "retry_diagnostic_and_recommendation"
+        ),
     }
 
 

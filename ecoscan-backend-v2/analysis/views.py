@@ -2,7 +2,7 @@ import logging
 import re
 import secrets
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
@@ -78,6 +78,67 @@ VALEUR_MAX = Decimal('999999999999')  # Sécurité sur max_digits=18, decimal_pl
 FOUR_DECIMALS = Decimal('0.0001')
 
 
+def _document_revu_pour_publication(import_instance):
+    rapport = import_instance.rapport_analyse or {}
+    if not isinstance(rapport, dict):
+        return False
+    controle = rapport.get("controle_document", {})
+    validation = rapport.get("validation", {})
+    if not isinstance(controle, dict) or not isinstance(validation, dict):
+        return False
+    controle_humain = (
+        import_instance.statut == ImportDonnees.Statut.TERMINE
+        and import_instance.type_donnees != "TICKET_RECHARGE_WOYOFAL"
+        and controle.get("statut") == "REVUE_HUMAINE_ACQUITTEE"
+        and controle.get("origine_senegalaise_confirmee") is True
+        and controle.get("authenticite_confirmee") is True
+        and isinstance(controle.get("emetteur_confirme"), str)
+        and controle.get("emetteur_confirme") == "SENELEC"
+        and validation.get("valide") is True
+    )
+    controles_automatiques = controle.get("controles_automatiques", {})
+    classification = rapport.get("classification", {})
+    donnees = import_instance.donnees_extraites or {}
+    if not isinstance(controles_automatiques, dict) or not isinstance(classification, dict):
+        return controle_humain
+    try:
+        score_qualite = Decimal(str(import_instance.score_qualite or 0))
+        score_lisibilite = Decimal(str(import_instance.score_lisibilite or 0))
+        consommation = Decimal(str(donnees.get("consommation_kwh")))
+        montant = Decimal(str(donnees.get("montant_net_paye")))
+        pertinence = Decimal(str(classification.get("relevance_score") or 0))
+        debut, fin = _extraire_periode_facture(donnees)
+    except (InvalidOperation, TypeError, ValueError):
+        return controle_humain
+
+    controle_automatique = (
+        import_instance.statut == ImportDonnees.Statut.TERMINE
+        and import_instance.type_donnees == "FACTURE_SENELEC"
+        and controle.get("statut") == "VERIFICATION_AUTOMATIQUE_PASSEE"
+        and controle.get("publication_automatique") is True
+        and controle.get("verification_officielle") is False
+        and controle.get("authenticite") == "NON_VERIFIEE"
+        and controles_automatiques.get("valide") is True
+        and not controles_automatiques.get("raisons")
+        and validation.get("valide") is True
+        and not validation.get("warnings")
+        and classification.get("type") == "FACTURE_SENELEC"
+        and classification.get("emetteur") == "SENELEC"
+        and score_qualite.is_finite()
+        and score_qualite >= Decimal("90")
+        and score_lisibilite.is_finite()
+        and score_lisibilite >= Decimal("0.90")
+        and pertinence.is_finite()
+        and pertinence >= Decimal("0.75")
+        and consommation.is_finite()
+        and consommation > 0
+        and montant.is_finite()
+        and montant > 0
+        and debut <= fin
+    )
+    return controle_humain or controle_automatique
+
+
 def _nettoyer_et_convertir_decimal(valeur_brute):
     """
     Nettoie et extrait un nombre valide à partir d'une donnée brute OCR ou texte.
@@ -110,6 +171,33 @@ def _nettoyer_et_convertir_decimal(valeur_brute):
         return None
 
 
+def _extraire_periode_facture(champs):
+    formats = ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d")
+    dates = []
+    for cle in ("periode_debut", "periode_fin"):
+        brut = champs.get(cle)
+        if not isinstance(brut, str) or not brut.strip():
+            raise ValueError(
+                "La période de facturation complète (date de début et date de fin) est requise."
+            )
+        valeur = None
+        for format_date in formats:
+            try:
+                valeur = datetime.strptime(brut.strip(), format_date).date()
+                break
+            except ValueError:
+                continue
+        if valeur is None:
+            raise ValueError(f"La date « {cle} » de la facture est invalide.")
+        dates.append(valeur)
+
+    if dates[0] > dates[1]:
+        raise ValueError("La date de début de la facture doit précéder ou égaler sa date de fin.")
+    debut = timezone.make_aware(datetime.combine(dates[0], time.min))
+    fin = timezone.make_aware(datetime.combine(dates[1], time.max))
+    return debut, fin
+
+
 def _publier_resultat_depuis_import(import_instance):
     """Convertit une extraction d'import 'energy' validée en ResultatMetrique.
 
@@ -120,9 +208,14 @@ def _publier_resultat_depuis_import(import_instance):
     Returns:
         tuple[ResultatMetrique, bool]: le résultat et un booléen « vient d'être créé ».
     """
+    if not _document_revu_pour_publication(import_instance):
+        raise ValueError(
+            "Le document doit avoir été examiné par un administrateur avant publication."
+        )
+
     definition = obtenir_definition("consommation_facture_periodique")
     champs = import_instance.donnees_extraites or {}
-    
+
     # 1. Tester par ordre de précision les différentes clés du dictionnaire OCR
     candidats_consommation = [
         champs.get("consommation_kwh"),
@@ -138,16 +231,7 @@ def _publier_resultat_depuis_import(import_instance):
             if valeur_decimal is not None:
                 break
 
-    periode_fin = None
-    date_facture_str = champs.get("date_facture")
-    if date_facture_str:
-        try:
-            periode_fin = timezone.make_aware(datetime.strptime(date_facture_str, "%d/%m/%Y"))
-        except (ValueError, TypeError):
-            periode_fin = None
-    if periode_fin is None:
-        periode_fin = import_instance.date_traitement or timezone.now()
-    periode_debut = periode_fin - timedelta(days=30)
+    periode_debut, periode_fin = _extraire_periode_facture(champs)
 
     limites = list(definition.limites)
 
@@ -298,7 +382,11 @@ class RecommandationViewSet(AnalyseScopedViewSet):
 class ActionViewSet(AnalyseScopedViewSet):
     """Suivi opérationnel des actions techniques."""
 
-    queryset = Action.objects.select_related("recommandation__objectif__organisation", "responsable").order_by("date_echeance")
+    queryset = Action.objects.select_related(
+        "recommandation__objectif__organisation",
+        "responsable",
+        "equipement__site",
+    ).order_by("date_echeance")
     serializer_class = ActionSerializer
     organisation_lookup = "recommandation__objectif__organisation"
 
@@ -419,7 +507,10 @@ class LivrableViewSet(AnalyseScopedViewSet):
         livrable = self.get_object()
 
         try:
-            pdf_file = generer_pdf_livrable(livrable)
+            pdf_file = generer_pdf_livrable(
+                livrable,
+                inclure_synthese_ia=request.data.get("inclure_synthese_ia") is True,
+            )
         except Exception as exc:
             logger.exception("Échec de la génération du PDF pour le livrable %s.", livrable.id)
             return Response(
@@ -441,7 +532,9 @@ class LivrableViewSet(AnalyseScopedViewSet):
             organisation=organisation,
             request=request,
         )
-        return Response(self.get_serializer(livrable).data, status=status.HTTP_200_OK)
+        response_data = self.get_serializer(livrable).data
+        response_data["synthese_ia_statut"] = livrable.synthese_ia_statut
+        return Response(response_data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"])
     def telecharger(self, request, pk=None):
@@ -525,22 +618,21 @@ def integrer_extraction_energy(request):
     if not appartient:
         return Response({"error": "Import hors de votre organisation."}, status=status.HTTP_403_FORBIDDEN)
 
-    if import_instance.statut not in (ImportDonnees.Statut.TERMINE, ImportDonnees.Statut.REVUE_REQUISE):
+    if not _document_revu_pour_publication(import_instance):
         return Response(
             {
                 "error": (
-                    f"Import non publiable : statut actuel '{import_instance.statut}', "
-                    f"'{ImportDonnees.Statut.TERMINE}' ou '{ImportDonnees.Statut.REVUE_REQUISE}' requis."
+                    "Import non publiable : une revue humaine par un administrateur "
+                    "est requise avant l'intégration."
                 )
             },
             status=status.HTTP_409_CONFLICT,
         )
 
-    if import_instance.statut == ImportDonnees.Statut.REVUE_REQUISE:
-        import_instance.statut = ImportDonnees.Statut.TERMINE
-        import_instance.save(update_fields=("statut",))
-
-    resultat, created = _publier_resultat_depuis_import(import_instance)
+    try:
+        resultat, created = _publier_resultat_depuis_import(import_instance)
+    except ValueError as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
     enregistrer_evenement(
         action="INTEGRER_EXTRACTION_ENERGY",
@@ -602,7 +694,11 @@ class ObservationOperationnelleViewSet(AnalyseScopedQuerySetMixin, viewsets.Mode
 class AnomalieViewSet(AnalyseScopedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
     """Lecture seule des dérives et anomalies détectées."""
 
-    queryset = Anomalie.objects.select_related("organisation", "resultat_metrique").order_by("-date_detection")
+    queryset = (
+        Anomalie.objects.select_related("organisation", "resultat_metrique")
+        .prefetch_related("hypotheses", "recommandations")
+        .order_by("-date_detection")
+    )
     serializer_class = AnomalieSerializer
     organisation_lookup = "organisation"
 
@@ -881,7 +977,18 @@ class AssistantQueryView(APIView):
         if getattr(request.user, "role", None) == "SUPER_ADMIN":
             return Response({"error": "L'assistant n'est pas disponible pour ce rôle."}, status=status.HTTP_403_FORBIDDEN)
 
-        organisation = BillingAccessService().organisations_avec_acces(request.user).first()
+        organisations_accessibles = BillingAccessService().organisations_avec_acces(request.user)
+        organisation_id = request.data.get("organisation_id")
+        if organisation_id:
+            try:
+                organisation_id = uuid.UUID(str(organisation_id))
+            except (TypeError, ValueError, AttributeError):
+                return Response({"error": "L’organisation sélectionnée est inaccessible."}, status=status.HTTP_404_NOT_FOUND)
+            organisation = organisations_accessibles.filter(pk=organisation_id).first()
+            if organisation is None:
+                return Response({"error": "L’organisation sélectionnée est inaccessible."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            organisation = organisations_accessibles.first()
         if organisation is None:
             return Response({"error": "Aucune organisation associée à ce compte."}, status=status.HTTP_409_CONFLICT)
 

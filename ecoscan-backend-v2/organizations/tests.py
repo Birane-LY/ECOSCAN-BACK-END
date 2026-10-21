@@ -2,6 +2,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
+from billing.testing import grant_test_trial
 from .models import Organisation, UtilisateurOrganisation, Site, FicheProjet, Compteur, Activite
 
 Utilisateur = get_user_model()
@@ -28,6 +29,8 @@ class OrganisationModuleTests(APITestCase):
         self.org_b = Organisation.objects.create(
             nom="Organisation B", secteur="BTP", localisation="Thiès", statut="ACTIVE"
         )
+        grant_test_trial(self.org_a)
+        grant_test_trial(self.org_b)
 
         # Liaison pour le super_admin et les admins d'organisation
         UtilisateurOrganisation.objects.create(organisation=self.org_a, utilisateur=self.super_admin)

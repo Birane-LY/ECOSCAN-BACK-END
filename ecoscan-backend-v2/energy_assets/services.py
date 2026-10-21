@@ -13,6 +13,8 @@ from .models import (
     MesureCapteur,
 )
 
+MINIMUM_RELEVES_JOUR = 4
+
 
 def _actualiser_statut_synchronisation(etat):
     """Met à jour la synchronisation selon les états souhaité et rapporté."""
@@ -87,20 +89,26 @@ def synchroniser_etat_equipement(mesure):
 
     fields_to_update = []
     if type_mesure == "POWER":
-        etat.date_etat_rapporte = mesure.date_mesure
         etat.puissance_actuelle_kw = valeur_standard
-        etat.etat_rapporte = (
-            Equipement.Etat.ON if valeur_standard > 0 else Equipement.Etat.OFF
-        )
-        _actualiser_statut_synchronisation(etat)
-        fields_to_update.extend(
-            (
-                "date_etat_rapporte",
-                "puissance_actuelle_kw",
-                "etat_rapporte",
-                "statut_synchronisation",
+        fields_to_update.append("puissance_actuelle_kw")
+        if mesure.capteur.mode == Capteur.Mode.SIMULATED:
+            etat.date_etat_rapporte = mesure.date_mesure
+            if etat.etat_souhaite == Equipement.Etat.OFF:
+                etat.etat_rapporte = Equipement.Etat.OFF
+            else:
+                etat.etat_rapporte = (
+                    Equipement.Etat.ON
+                    if valeur_standard > 0
+                    else Equipement.Etat.OFF
+                )
+            _actualiser_statut_synchronisation(etat)
+            fields_to_update.extend(
+                (
+                    "date_etat_rapporte",
+                    "etat_rapporte",
+                    "statut_synchronisation",
+                )
             )
-        )
     else:
         etat.energie_cumulee_kwh = valeur_standard
         fields_to_update.append("energie_cumulee_kwh")

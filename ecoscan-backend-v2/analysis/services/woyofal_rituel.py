@@ -8,8 +8,7 @@ from django.utils import timezone
 
 from analysis.models import Anomalie, ResultatMetrique
 from analysis.services.anomaly import detecter_anomalie
-from analysis.services.context import obtenir_contexte
-from analysis.services.hypothesis import generer_hypothese
+from analysis.services.orchestrator import traiter_suivi_anomalie
 from analysis.services.registry import obtenir_definition
 from organizations.models import Organisation
 from energy.models import (
@@ -109,7 +108,13 @@ def _persister(organisation, definition, debut, fin, valeur, baseline=None):
             "completude": Decimal("1"),
             "statut_qualite": ResultatMetrique.StatutQualite.FIABLE,
             "confiance": Decimal("1"),
-            "sources": list(definition.sources_requises),
+            "sources": [
+                {
+                    "type": source,
+                    "provenance": "SAISIE_MANUELLE",
+                }
+                for source in definition.sources_requises
+            ],
             "limites": list(definition.limites),
         },
     )
@@ -192,9 +197,7 @@ def analyser_woyofal_rituel(organisation_id, jour_iso: str) -> dict:
             "anomalie": None,
         }
 
-    hypothese = anomalie.hypotheses.order_by("-date_creation").first()
-    if hypothese is None:
-        hypothese = generer_hypothese(anomalie, obtenir_contexte(anomalie))
+    hypothese, recommandation = traiter_suivi_anomalie(anomalie.id)
     return {
         "statut": "anomalie_detectee",
         "consommation_kwh": float(observation["valeur"]),
@@ -203,4 +206,5 @@ def analyser_woyofal_rituel(organisation_id, jour_iso: str) -> dict:
         "jours_reference": len(references),
         "anomalie": str(anomalie.id),
         "hypothese": str(hypothese.id) if hypothese else None,
+        "recommandation": str(recommandation.id) if recommandation else None,
     }

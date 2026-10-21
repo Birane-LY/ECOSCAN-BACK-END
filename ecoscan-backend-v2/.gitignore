@@ -1,4 +1,5 @@
 .env
+n8n/.env.local
 .venv/
 __pycache__/
 *.pyc
@@ -11,3 +12,4 @@ fichiers-sources/
 gateway/.env
 gateway/equipment-entities.json
 gateway/data/
+home-assistant/config/

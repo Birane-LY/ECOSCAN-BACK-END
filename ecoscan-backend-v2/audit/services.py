@@ -8,12 +8,33 @@ avec le risque que la moitié du code s'en dispense "pour plus tard". En pratiqu
 tout le projet (energy, analysis, organizations...).
 """
 
+import json
 import logging
+from datetime import date, datetime
 from typing import Any, Optional
 
 from .models import JournalAudit
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(value):
+    """Normalise les détails d'audit pour qu'ils restent sérialisables JSON."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
 
 
 def extraire_adresse_ip(request) -> Optional[str]:
@@ -54,6 +75,7 @@ def enregistrer_evenement(
     déduction automatique qui se tromperait sur un cas limite).
     """
     try:
+        details_norm = _json_safe(details or {})
         return JournalAudit.objects.create(
             utilisateur=utilisateur,
             organisation=organisation,
@@ -61,7 +83,7 @@ def enregistrer_evenement(
             ressource=ressource,
             identifiant_ressource=str(identifiant_ressource) if identifiant_ressource else "",
             resultat=resultat,
-            details=details or {},
+            details=details_norm,
             adresse_ip=extraire_adresse_ip(request),
         )
     except Exception:

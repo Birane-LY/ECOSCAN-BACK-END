@@ -51,12 +51,15 @@ class EstMembreDeLOrganisation(permissions.BasePermission):
     """
 
     def has_permission(self, request, view):
-        return (
+        if not (
             request.user
             and request.user.is_authenticated
             and request.user.actif
-            and BillingAccessService().organisations_avec_acces(request.user).exists()
-        )
+        ):
+            return False
+        if getattr(request.user, "role", None) == "SUPER_ADMIN":
+            return True
+        return BillingAccessService().organisations_avec_acces(request.user).exists()
 
     def has_object_permission(self, request, view, obj):
         # Détermination dynamique de l'organisation selon l'objet ciblé

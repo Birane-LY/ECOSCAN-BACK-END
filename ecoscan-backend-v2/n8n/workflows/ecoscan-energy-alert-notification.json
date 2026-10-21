@@ -1,0 +1,78 @@
+{
+  "name": "EcoScan - Notifications énergétiques",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "alerte-energetique",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "energy-alert-webhook",
+      "name": "Recevoir une alerte énergétique",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [0, 0],
+      "webhookId": "27f85766-fb92-468a-a42a-f0ebecb6508a"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst headers = input.headers ?? {};\nconst token = Object.entries(headers).find(([name]) => name.toLowerCase() === 'x-n8n-webhook-token')?.[1];\nconst expected = $env.N8N_WEBHOOK_TOKEN;\nif (!expected || !token || token !== expected) {\n  throw new Error('Unauthorized energy alert webhook request');\n}\n\nconst payload = input.body ?? input;\nconst alert = payload.alerte;\nconst organization = payload.organisation;\nconst recipients = organization?.emails_admin;\nif (!alert?.id || !alert?.titre || !alert?.message || !organization?.nom || !Array.isArray(recipients) || recipients.length === 0) {\n  throw new Error('Invalid energy alert notification payload');\n}\nif (recipients.some((email) => typeof email !== 'string' || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))) {\n  throw new Error('Invalid administrator email address in energy alert payload');\n}\n\nconst subject = `[EcoScan] ${alert.titre} - ${organization.nom}`;\nconst text = [\n  alert.message,\n  '',\n  `Niveau : ${alert.severite ?? 'INFORMATION'}`,\n  `Type : ${alert.type ?? 'ALERTE_ENERGETIQUE'}`,\n  `Organisation : ${organization.nom}`,\n  `Référence : ${alert.id}`,\n  '',\n  `Contexte : ${JSON.stringify(alert.contexte ?? {})}`\n].join('\\n');\nreturn [{ json: { recipients, subject, text } }];"
+      },
+      "id": "validate-and-format-energy-alert",
+      "name": "Vérifier et préparer l'alerte",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.ECOSCAN_NOTIFICATION_FROM_EMAIL }}",
+        "toEmail": "={{ $json.recipients.join(',') }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {}
+      },
+      "id": "send-energy-alert-email",
+      "name": "Envoyer l'alerte par e-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [500, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"ok\":true,\"event\":\"alerte-energetique\",\"notification\":\"sent\"}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "energy-alert-webhook-response",
+      "name": "Confirmer l'envoi",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [760, 0]
+    }
+  ],
+  "connections": {
+    "Recevoir une alerte énergétique": {
+      "main": [[{"node": "Vérifier et préparer l'alerte", "type": "main", "index": 0}]]
+    },
+    "Vérifier et préparer l'alerte": {
+      "main": [[{"node": "Envoyer l'alerte par e-mail", "type": "main", "index": 0}]]
+    },
+    "Envoyer l'alerte par e-mail": {
+      "main": [[{"node": "Confirmer l'envoi", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "074358a7-47f6-47a1-98c4-03cc8be94ca2",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

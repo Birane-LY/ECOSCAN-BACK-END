@@ -1,5 +1,7 @@
+from datetime import timedelta
 from decimal import Decimal
 
+from django.utils import timezone
 from rest_framework import serializers
 
 from analysis.models import Recommandation
@@ -9,13 +11,17 @@ from organizations.models import Organisation, Site
 from .models import (
     ActionVirtuelle,
     Capteur,
+    CapteurPresence,
     CommandeEquipement,
     Equipement,
     EtatEquipement,
     MesureCapteur,
+    MesurePresence,
+    PilotageAutonome,
     ProfilFonctionnement,
     Zone,
 )
+from .autopilot import equipement_pilotable_en_simulation
 from .services import convertir_mesure, demander_commande
 from .virtual_actions import simuler_action_virtuelle
 
@@ -113,6 +119,80 @@ class MesureCapteurSerializer(OrganisationAccessibleSerializer):
             except ValueError as exc:
                 raise serializers.ValidationError(str(exc)) from exc
         return attrs
+
+
+class CapteurPresenceSerializer(OrganisationAccessibleSerializer):
+    class Meta:
+        model = CapteurPresence
+        fields = (
+            "id",
+            "zone",
+            "identifiant",
+            "mode",
+            "occupation_simulee",
+            "frequence_secondes",
+            "statut",
+            "derniere_communication",
+            "date_creation",
+        )
+        read_only_fields = ("id", "derniere_communication", "date_creation")
+
+    def validate_zone(self, value):
+        if not value.active:
+            raise serializers.ValidationError(
+                "Un capteur de présence doit être rattaché à une zone active."
+            )
+        return value
+
+    def validate(self, attrs):
+        zone = attrs.get("zone", self.instance.zone if self.instance else None)
+        mode = attrs.get("mode", self.instance.mode if self.instance else None)
+        occupation_simulee = attrs.get(
+            "occupation_simulee",
+            self.instance.occupation_simulee if self.instance else None,
+        )
+        if zone:
+            self._valider_site_accessible(zone.site)
+        if mode == CapteurPresence.Mode.REAL and occupation_simulee is not None:
+            raise serializers.ValidationError(
+                {
+                    "occupation_simulee": (
+                        "Un capteur réel ne peut pas avoir d'état simulé configuré."
+                    )
+                }
+            )
+        return attrs
+
+
+class MesurePresenceSerializer(OrganisationAccessibleSerializer):
+    class Meta:
+        model = MesurePresence
+        fields = (
+            "id",
+            "capteur",
+            "occupee",
+            "date_mesure",
+            "date_reception",
+        )
+        read_only_fields = ("id", "date_reception")
+
+    def validate_capteur(self, value):
+        if not self._organisations_accessibles().filter(
+            pk=value.zone.site.organisation_id
+        ).exists():
+            raise serializers.ValidationError(
+                "Vous n'avez pas accès à l'organisation de cette zone."
+            )
+        if value.statut != CapteurPresence.Statut.ACTIVE:
+            raise serializers.ValidationError("Ce capteur de présence est inactif.")
+        return value
+
+    def validate_date_mesure(self, value):
+        if value > timezone.now() + timedelta(minutes=5):
+            raise serializers.ValidationError(
+                "La date de mesure ne peut pas être dans le futur."
+            )
+        return value
 
 
 class CommandeEquipementSerializer(OrganisationAccessibleSerializer):
@@ -273,6 +353,165 @@ class ProfilFonctionnementSerializer(OrganisationAccessibleSerializer):
         return attrs
 
 
+class PilotageAutonomeSerializer(serializers.ModelSerializer):
+    equipements_autorises = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=Equipement.objects.all(),
+        required=False,
+    )
+    zones_autorisees = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=Zone.objects.all(),
+        required=False,
+    )
+
+    class Meta:
+        model = PilotageAutonome
+        fields = (
+            "site",
+            "actif",
+            "arret_urgence",
+            "plafond_puissance_kw",
+            "horaires_actifs",
+            "heure_debut",
+            "heure_fin",
+            "confort_actif",
+            "temperature_min_c",
+            "temperature_max_c",
+            "temperature_simulee_c",
+            "strategie_automatique",
+            "occupation_active",
+            "equipements_autorises",
+            "zones_autorisees",
+            "derniere_evaluation",
+            "date_maj",
+        )
+        read_only_fields = ("site", "derniere_evaluation", "date_maj")
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        instance = self.instance
+        value = lambda field, default=None: attrs.get(
+            field,
+            getattr(instance, field, default) if instance else default,
+        )
+        site = self.context["site"]
+        equipements = attrs.get(
+            "equipements_autorises",
+            list(instance.equipements_autorises.all()) if instance else [],
+        )
+        zones = attrs.get(
+            "zones_autorisees",
+            list(instance.zones_autorisees.all()) if instance else [],
+        )
+        invalid_equipments = [
+            equipement
+            for equipement in equipements
+            if equipement.site_id != site.id
+            or not equipement.monitoring_active
+            or not equipement_pilotable_en_simulation(equipement)
+            or equipement.criticite
+            in (Equipement.Criticite.HAUTE, Equipement.Criticite.CRITIQUE)
+        ]
+        if invalid_equipments:
+            raise serializers.ValidationError(
+                {
+                    "equipements_autorises": (
+                        "Seuls les équipements surveillés, du site sélectionné et "
+                        "de criticité basse ou moyenne avec des capteurs exclusivement "
+                        "simulés peuvent être autorisés."
+                    )
+                }
+            )
+
+        invalid_zones = [
+            zone for zone in zones if zone.site_id != site.id or not zone.active
+        ]
+        if invalid_zones:
+            raise serializers.ValidationError(
+                {
+                    "zones_autorisees": (
+                        "Seules les zones actives du site sélectionné peuvent être "
+                        "autorisées."
+                    )
+                }
+            )
+
+        if value("occupation_active") and not zones:
+            raise serializers.ValidationError(
+                {
+                    "zones_autorisees": (
+                        "Autorisez au moins une zone pour activer la stratégie "
+                        "d'occupation."
+                    )
+                }
+            )
+
+        heure_debut = value("heure_debut")
+        heure_fin = value("heure_fin")
+        if value("horaires_actifs") and (
+            heure_debut is None or heure_fin is None or heure_debut == heure_fin
+        ):
+            raise serializers.ValidationError(
+                {"heure_fin": "Configurez deux heures différentes pour la plage horaire."}
+            )
+
+        plafond = value("plafond_puissance_kw")
+        if plafond is not None and plafond <= 0:
+            raise serializers.ValidationError(
+                {"plafond_puissance_kw": "Le plafond doit être supérieur à zéro."}
+            )
+
+        temperature_min = value("temperature_min_c")
+        temperature_max = value("temperature_max_c")
+        temperature_simulee = value("temperature_simulee_c")
+        if value("confort_actif"):
+            if (
+                temperature_min is None
+                or temperature_max is None
+                or temperature_simulee is None
+            ):
+                raise serializers.ValidationError(
+                    "Renseignez les deux limites de confort et la température simulée."
+                )
+            if temperature_min >= temperature_max:
+                raise serializers.ValidationError(
+                    {"temperature_max_c": "La limite maximale doit dépasser la minimale."}
+                )
+            if not any(
+                "CLIMAT" in equipement.categorie.upper()
+                for equipement in equipements
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "confort_actif": (
+                            "Autorisez un climatiseur non critique pour utiliser "
+                            "la stratégie de confort."
+                        )
+                    }
+                )
+
+        if value("actif") and not value("arret_urgence"):
+            if not equipements:
+                raise serializers.ValidationError(
+                    {
+                        "equipements_autorises": (
+                            "Autorisez au moins un équipement non critique."
+                        )
+                    }
+                )
+            if (
+                plafond is None
+                and not value("horaires_actifs")
+                and not value("confort_actif")
+                and not value("occupation_active")
+            ):
+                raise serializers.ValidationError(
+                    "Configurez au moins une stratégie avant d'activer l'autonomie."
+                )
+        return attrs
+
+
 class EtatEquipementSerializer(serializers.ModelSerializer):
     """Expose en lecture seule l'état courant d'un équipement."""
 
@@ -301,6 +540,9 @@ class ChargeEquipementSerializer(serializers.Serializer):
     power_kw = serializers.DecimalField(max_digits=12, decimal_places=3)
     reported_state = serializers.ChoiceField(choices=Equipement.Etat.choices)
     is_online = serializers.BooleanField()
+    telemetry_mode = serializers.ChoiceField(
+        choices=("NONE", "REAL", "SIMULATED", "MIXED")
+    )
 
 
 class ConsommateurPrincipalSerializer(ChargeEquipementSerializer):
@@ -310,12 +552,17 @@ class ConsommateurPrincipalSerializer(ChargeEquipementSerializer):
 class MonitoringSummarySerializer(serializers.Serializer):
     site_id = serializers.UUIDField()
     site_name = serializers.CharField()
+    telemetry_mode = serializers.ChoiceField(
+        choices=("NONE", "REAL", "SIMULATED", "MIXED")
+    )
     current_power_kw = serializers.DecimalField(max_digits=16, decimal_places=3)
+    equipment = ChargeEquipementSerializer(many=True)
     today_energy_kwh = serializers.DecimalField(
         max_digits=20,
         decimal_places=6,
         allow_null=True,
     )
+    today_energy_since = serializers.DateTimeField(allow_null=True)
     yesterday_energy_kwh = serializers.DecimalField(
         max_digits=20,
         decimal_places=6,

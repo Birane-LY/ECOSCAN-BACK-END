@@ -2,87 +2,96 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional
 
-from django.conf import settings
 from django.db import models
-from django.db.models import Sum
 from django.utils import timezone
 
-from energy.models import AchatWoyofal, BaremeTarifaire
-
-CATEGORIE_DEFAUT = "DOMESTIQUE_PETITE_PUISSANCE"
+from energy.models import BaremeTarifaire
 
 
-def bareme_actuel(categorie: str = CATEGORIE_DEFAUT, a_la_date: Optional[date] = None):
-    a_la_date = a_la_date or date.today()
+def bareme_actuel(
+    categorie: Optional[str],
+    mode_paiement: Optional[str],
+    a_la_date: Optional[date] = None,
+):
+    if not categorie or mode_paiement not in BaremeTarifaire.ModePaiement.values:
+        return []
+    a_la_date = a_la_date or timezone.localdate()
     return list(
-        BaremeTarifaire.objects.filter(categorie=categorie, date_entree_vigueur__lte=a_la_date)
+        BaremeTarifaire.objects.filter(
+            categorie=categorie,
+            mode_paiement=mode_paiement,
+            date_entree_vigueur__lte=a_la_date,
+        )
         .filter(models.Q(date_fin_vigueur__isnull=True) | models.Q(date_fin_vigueur__gte=a_la_date))
         .order_by("ordre")
     )
 
 
-def cumul_kwh_mois(compteur) -> Decimal:
-    debut = timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    total = AchatWoyofal.objects.filter(compteur=compteur, date_achat__gte=debut) \
-        .aggregate(t=Sum("kwh_credites"))["t"]
-    return total or Decimal("0")
-
-
-def _montant_net(montant: Decimal) -> Decimal:
-    pct = Decimal(str(getattr(settings, "WOYOFAL_PRELEVEMENTS_PCT", "0")))
-    return montant * (Decimal("1") - pct / Decimal("100"))
-
-
 def etat_tranche(compteur) -> dict:
-    bareme = bareme_actuel()
-    cumul = cumul_kwh_mois(compteur)
+    categorie = getattr(compteur, "categorie_tarifaire", "")
+    mode_paiement = getattr(compteur, "mode_paiement", "")
+    bareme = bareme_actuel(categorie, mode_paiement)
     if not bareme:
-        return {"erreur": "Aucun barème configuré.", "cumul_kwh": float(cumul)}
-    for p in bareme:
-        if p.kwh_max is None or cumul < p.kwh_max:
-            return {
-                "cumul_kwh": float(cumul),
-                "tranche": p.nom_tranche,
-                "prix_fcfa_par_kwh": float(p.prix_fcfa_par_kwh),
-                "kwh_restants_dans_tranche": float(p.kwh_max - cumul) if p.kwh_max else None,
-                "prochain_prix": next((float(q.prix_fcfa_par_kwh) for q in bareme if q.ordre > p.ordre), None),
+        return {
+            "erreur": (
+                "Catégorie tarifaire et mode de paiement vérifiés requis."
+                if not categorie or not mode_paiement
+                else f"Aucun barème actif pour {categorie} en mode {mode_paiement}."
+            ),
+            "categorie_tarifaire": categorie or None,
+            "mode_paiement": mode_paiement or None,
+        }
+    return {
+        "erreur": (
+            "La période de référence et les règles de remise à zéro des tranches "
+            "ne sont pas confirmées; aucun seuil courant n'est calculé."
+        ),
+        "categorie_tarifaire": categorie,
+        "mode_paiement": mode_paiement,
+        "bareme": [
+            {
+                "tranche": palier.nom_tranche,
+                "kwh_min": float(palier.kwh_min),
+                "kwh_max": float(palier.kwh_max) if palier.kwh_max is not None else None,
+                "prix_fcfa_par_kwh": float(palier.prix_fcfa_par_kwh),
             }
-
-    return {"erreur": "Cumul supérieur à toutes les tranches configurées.", "cumul_kwh": float(cumul)}
+            for palier in bareme
+        ],
+    }
 
 
 def predire_kwh(compteur, montant_fcfa: Decimal) -> dict:
-    bareme = bareme_actuel()
+    categorie = getattr(compteur, "categorie_tarifaire", "")
+    mode_paiement = getattr(compteur, "mode_paiement", "")
+    if mode_paiement != BaremeTarifaire.ModePaiement.PREPAYE:
+        return {
+            "kwh_estimes": None,
+            "detail_paliers": [],
+            "categorie_tarifaire": categorie or None,
+            "mode_paiement": mode_paiement or None,
+            "erreur": "La prédiction d'un achat est réservée à un compteur configuré en prépaiement.",
+        }
+    bareme = bareme_actuel(categorie, mode_paiement)
     if not bareme:
-        return {"kwh_estimes": None, "detail_paliers": [], "erreur": "Aucun barème configuré."}
-
-    cumul_avant = cumul_kwh_mois(compteur)
-    reste = _montant_net(Decimal(str(montant_fcfa)))
-    cumul = cumul_avant
-    total, detail = Decimal("0"), []
-
-    for p in bareme:
-        if reste <= 0:
-            break
-        if p.kwh_max is not None and cumul >= p.kwh_max:
-            continue
-        dispo = (p.kwh_max - cumul) if p.kwh_max is not None else None
-        cout_max = dispo * p.prix_fcfa_par_kwh if dispo is not None else None
-        if cout_max is not None and reste >= cout_max:
-            kwh, cout = dispo, cout_max
-        else:
-            kwh, cout = reste / p.prix_fcfa_par_kwh, reste
-        detail.append({"tranche": p.nom_tranche, "kwh": float(round(kwh, 3)),
-                       "prix_fcfa_par_kwh": float(p.prix_fcfa_par_kwh), "cout_fcfa": float(round(cout, 2))})
-        total += kwh
-        cumul += kwh
-        reste -= cout
-
-    reco = None
-    if len(detail) > 1:
-        reco = (f"Cet achat franchit {len(detail) - 1} seuil(s) : une partie sera facturée à "
-                f"{detail[-1]['prix_fcfa_par_kwh']} FCFA/kWh au lieu de {detail[0]['prix_fcfa_par_kwh']}.")
-
-    return {"cumul_mensuel_avant_kwh": float(cumul_avant), "kwh_estimes": float(round(total, 3)),
-            "detail_paliers": detail, "recommandation": reco,
-            "prelevements_pct": float(getattr(settings, "WOYOFAL_PRELEVEMENTS_PCT", 0))}
+        return {
+            "kwh_estimes": None,
+            "detail_paliers": [],
+            "categorie_tarifaire": categorie or None,
+            "mode_paiement": mode_paiement or None,
+            "erreur": (
+                "Catégorie tarifaire et mode de paiement vérifiés requis."
+                if not categorie or not mode_paiement
+                else f"Aucun barème actif pour {categorie} en mode {mode_paiement}."
+            ),
+        }
+    return {
+        "kwh_estimes": None,
+        "detail_paliers": [],
+        "categorie_tarifaire": categorie,
+        "mode_paiement": mode_paiement,
+        "erreur": (
+            "Le montant payé ne permet pas de déduire les kWh crédités sans les "
+            "retenues applicables au ticket. Utilisez les kWh affichés sur le ticket "
+            "Woyofal; les achats ne représentent pas la consommation."
+        ),
+    }

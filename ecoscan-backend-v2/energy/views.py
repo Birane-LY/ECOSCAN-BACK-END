@@ -14,7 +14,7 @@ from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.parsers import MultiPartParser
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 
 from organizations.models import Organisation, UtilisateurOrganisation, Compteur
 
@@ -51,6 +51,7 @@ from .serializers import (
     PointSuiviEnergetiqueSerializer,
     ReleveRituelEnergetiqueSerializer,
     RechargeRituelWoyofalSerializer,
+    valider_fichier_source,
 )
 from .services.hashing import calculer_hash_fichier
 from .services.services import OCRService
@@ -63,6 +64,66 @@ from billing.permissions import EstAbonnementActif
 from billing.services import BillingAccessService
 
 logger = logging.getLogger(__name__)
+
+SEUIL_CONFIANCE_PUBLICATION_AUTOMATIQUE = Decimal("90")
+SEUIL_LISIBILITE_PUBLICATION_AUTOMATIQUE = Decimal("0.90")
+SEUIL_PERTINENCE_PUBLICATION_AUTOMATIQUE = Decimal("0.75")
+
+
+def _verifier_automatiquement_facture(classification, validation, champs, score_qualite, score_lisibilite):
+    """Autorise la publication uniquement si contrôles métier et extraction sont concluants."""
+    raisons = []
+    score_qualite = Decimal(str(score_qualite or 0))
+    score_lisibilite = Decimal(str(score_lisibilite or 0))
+    pertinence = Decimal(str(classification.get("relevance_score") or 0))
+
+    if classification.get("type") != "FACTURE_SENELEC" or classification.get("emetteur") != "SENELEC":
+        raisons.append("Émetteur SENELEC non reconnu avec une confiance suffisante.")
+    if not validation.get("valide"):
+        raisons.extend(item.get("message", "Champ énergétique incohérent.") for item in validation.get("erreurs", []))
+    if validation.get("warnings"):
+        raisons.extend(item.get("message", "Champ énergétique à confirmer.") for item in validation["warnings"])
+    if score_qualite < SEUIL_CONFIANCE_PUBLICATION_AUTOMATIQUE:
+        raisons.append("La confiance globale de l’extraction est inférieure à 90 %.")
+    if score_lisibilite < SEUIL_LISIBILITE_PUBLICATION_AUTOMATIQUE:
+        raisons.append("La lisibilité OCR est inférieure à 90 %.")
+    if pertinence < SEUIL_PERTINENCE_PUBLICATION_AUTOMATIQUE:
+        raisons.append("Les indices énergétiques sont insuffisants.")
+
+    try:
+        consommation = Decimal(str(champs.get("consommation_kwh")))
+    except (InvalidOperation, TypeError, ValueError):
+        consommation = Decimal("0")
+    if not consommation.is_finite() or consommation <= 0:
+        raisons.append("La consommation en kWh est absente ou invalide.")
+
+    try:
+        montant = Decimal(str(champs.get("montant_net_paye")))
+    except (InvalidOperation, TypeError, ValueError):
+        montant = Decimal("0")
+    if not montant.is_finite() or montant <= 0:
+        raisons.append("Le montant total de la facture est absent ou invalide.")
+    elif montant > Decimal("999999999999"):
+        raisons.append("Le montant total dépasse la plage autorisée.")
+
+    periode_normalisee = None
+    try:
+        from analysis.views import _extraire_periode_facture
+
+        debut, fin = _extraire_periode_facture(champs)
+        periode_normalisee = {
+            "periode_debut": debut.date().isoformat(),
+            "periode_fin": fin.date().isoformat(),
+        }
+    except ValueError as exc:
+        raisons.append(str(exc))
+
+    return {
+        "valide": not raisons,
+        "raisons": raisons,
+        "seuil_confiance": str(SEUIL_CONFIANCE_PUBLICATION_AUTOMATIQUE),
+        "periode_normalisee": periode_normalisee,
+    }
 
 
 class OrganisationScopedQuerySetMixin:
@@ -90,13 +151,17 @@ class FichierSourceViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
 
     queryset = FichierSource.objects.select_related("organisation", "depose_par").order_by("-date_depot")
     serializer_class = FichierSourceSerializer
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
 
     def perform_create(self, serializer):
         fichier = serializer.validated_data.get("fichier")
-        organisation = self._organisations_de_lutilisateur().first()
+        organisations = self._organisations_de_lutilisateur()
+        organisation = serializer.validated_data.get("organisation") or organisations.first()
 
         if organisation is None:
             raise PermissionDenied("Aucune organisation associée à ce compte.")
+        if not organisations.filter(id=organisation.id).exists():
+            raise PermissionDenied("Vous ne pouvez pas déposer un fichier pour cette organisation.")
 
         hash_fichier = calculer_hash_fichier(fichier)
         # UniqueConstraint (hash, organisation) : redéposer la même facture provoquait
@@ -177,6 +242,8 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
     def lancer(self, request, pk=None):
         import_instance = self.get_object()
         import_instance.lancer_import()
+        import_instance.ocr_erreur = ""
+        import_instance.save(update_fields=("statut", "ocr_erreur"))
 
         enregistrer_evenement(
             action="LANCEMENT_PIPELINE_OCR",
@@ -208,7 +275,10 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         if classification["decision"] == "reject":
             signaux = ", ".join(classification["negative_signals"]) or "aucun signal énergétique reconnu"
             import_instance.statut = ImportDonnees.Statut.HORS_PERIMETRE
-            import_instance.ocr_erreur = f"Document non énergétique détecté ({signaux})."
+            import_instance.ocr_erreur = classification.get(
+                "motif_rejet",
+                f"Document non énergétique détecté ({signaux}).",
+            )
             import_instance.date_traitement = timezone.now()
             import_instance.save(update_fields=(
                 "statut", "ocr_statut", "ocr_erreur", "score_lisibilite",
@@ -230,18 +300,45 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
         validation = service.valider_champs_energetiques(champs)
 
         import_instance.donnees_extraites = champs
-        import_instance.rapport_analyse = {"classification": classification, "validation": validation}
-        import_instance.nombre_lignes = 1
         score_qualite = self._calculer_score_qualite(score_lisibilite, score_pertinence, validation)
+        verification_automatique = _verifier_automatiquement_facture(
+            classification,
+            validation,
+            champs,
+            score_qualite,
+            score_lisibilite,
+        )
+        import_instance.rapport_analyse = {
+            "classification": classification,
+            "validation": validation,
+            "controle_document": {
+                "statut": (
+                    "VERIFICATION_AUTOMATIQUE_PASSEE"
+                    if verification_automatique["valide"]
+                    else "VERIFICATION_AUTOMATIQUE_INSUFFISANTE"
+                ),
+                "verification_officielle": False,
+                "authenticite": "NON_VERIFIEE",
+                "controles_automatiques": verification_automatique,
+            },
+        }
+        import_instance.nombre_lignes = 1
+        import_instance.nombre_erreurs = len(validation["erreurs"])
         import_instance.score_qualite = score_qualite
 
         if not validation["valide"]:
             import_instance.statut = ImportDonnees.Statut.INCOHERENT
             import_instance.ocr_erreur = "; ".join(e["message"] for e in validation["erreurs"])
-        elif (classification.get("decision") == "human_review" or validation.get("requires_review")) and score_qualite < Decimal("80"):
-            import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
-        else:
+        elif verification_automatique["valide"]:
             import_instance.statut = ImportDonnees.Statut.TERMINE
+            import_instance.donnees_extraites.update(verification_automatique["periode_normalisee"])
+            import_instance.rapport_analyse["controle_document"].update({
+                "publication_automatique": True,
+                "date_verification": timezone.now().isoformat(),
+            })
+        else:
+            import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
+            import_instance.ocr_erreur = " ".join(verification_automatique["raisons"])
 
         import_instance.date_traitement = timezone.now()
         import_instance.save(update_fields=(
@@ -250,14 +347,25 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
             "nombre_erreurs", "score_qualite", "date_traitement",
         ))
 
-        if import_instance.statut == ImportDonnees.Statut.TERMINE:
-            # La publication (métriques, anomalie, hypothèse IA) ne doit jamais
-            # faire échouer un import déjà enregistré : on journalise et on continue.
+        if verification_automatique["valide"]:
             try:
                 from analysis.views import _publier_resultat_depuis_import
+
                 _publier_resultat_depuis_import(import_instance)
             except Exception:
-                logger.exception("Publication du résultat métrique impossible pour l'import %s.", import_instance.id)
+                logger.exception(
+                    "Publication automatique du résultat impossible pour l'import %s.",
+                    import_instance.id,
+                )
+                controle = import_instance.rapport_analyse["controle_document"]
+                controle["statut"] = "PUBLICATION_AUTOMATIQUE_ECHOUEE"
+                controle["publication_automatique"] = False
+                import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
+                import_instance.ocr_erreur = (
+                    "Les contrôles sont passés, mais la publication a échoué. "
+                    "Aucune donnée n’a été confirmée comme publiée."
+                )
+                import_instance.save(update_fields=("statut", "ocr_erreur", "rapport_analyse"))
 
         enregistrer_evenement(
             action="TRAITEMENT_IMPORT_TERMINE",
@@ -277,16 +385,109 @@ class ImportDonneesViewSet(OrganisationScopedQuerySetMixin, viewsets.ModelViewSe
 
     @action(detail=True, methods=["post"], url_path="valider-et-publier")
     def valider_et_publier(self, request, pk=None):
-        """Action manuelle : valide un import (même s'il était en REVUE_REQUISE) et publie le résultat métrique."""
+        """Un administrateur révise le document avant toute publication métier."""
+        if getattr(request.user, "role", None) != "ADMIN_ORGANISATION":
+            raise PermissionDenied(
+                "Seul un administrateur de l'organisation peut valider un document."
+            )
         import_instance = self.get_object()
+        if import_instance.statut != ImportDonnees.Statut.REVUE_REQUISE:
+            return Response(
+                {"error": "Seul un document en revue peut être validé."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if request.data.get("origine_senegalaise_confirmee") is not True:
+            return Response(
+                {"error": "Confirmez explicitement l'origine sénégalaise après examen du document."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if request.data.get("authenticite_confirmee") is not True:
+            return Response(
+                {"error": "Confirmez explicitement l'authenticité apparente du document après examen."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        emetteur = request.data.get("emetteur_confirme")
+        if emetteur != "SENELEC":
+            return Response(
+                {"error": "Woyofal est un mode de prépaiement; l'émetteur du document doit être SENELEC."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        rapport = import_instance.rapport_analyse or {}
+        if not isinstance(rapport, dict):
+            return Response(
+                {"error": "Le rapport de traitement est invalide; le document reste en revue."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        validation = rapport.get("validation") or {}
+        if not isinstance(validation, dict):
+            return Response(
+                {"error": "La validation des champs est invalide; le document reste en revue."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if validation.get("valide") is not True:
+            return Response(
+                {"error": "Les valeurs énergétiques doivent être cohérentes avant la revue finale."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            from analysis.views import _extraire_periode_facture
+
+            periode_debut, periode_fin = _extraire_periode_facture(
+                {
+                    "periode_debut": request.data.get("periode_debut"),
+                    "periode_fin": request.data.get("periode_fin"),
+                }
+            )
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        donnees_extraites = dict(import_instance.donnees_extraites or {})
+        donnees_extraites["periode_debut"] = periode_debut.strftime("%Y-%m-%d")
+        donnees_extraites["periode_fin"] = periode_fin.strftime("%Y-%m-%d")
+        controle = rapport.get("controle_document") or {}
+        if not isinstance(controle, dict):
+            return Response(
+                {"error": "Le contrôle documentaire est invalide; le document reste en revue."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        controle.update(
+            {
+                "statut": "REVUE_HUMAINE_ACQUITTEE",
+                "revue_par": str(request.user.id),
+                "date_revue": timezone.now().isoformat(),
+                "origine_senegalaise_confirmee": True,
+                "authenticite_confirmee": True,
+                "emetteur_confirme": emetteur,
+                "verification_officielle": False,
+            }
+        )
+        rapport["controle_document"] = controle
+        import_instance.rapport_analyse = rapport
+        import_instance.donnees_extraites = donnees_extraites
         import_instance.statut = ImportDonnees.Statut.TERMINE
-        import_instance.save(update_fields=("statut",))
+        import_instance.save(update_fields=("statut", "rapport_analyse", "donnees_extraites"))
 
         try:
             from analysis.views import _publier_resultat_depuis_import
             _publier_resultat_depuis_import(import_instance)
+        except ValueError as exc:
+            controle["statut"] = "REVUE_HUMAINE_REQUISE"
+            import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
+            import_instance.save(update_fields=("statut", "rapport_analyse"))
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except Exception:
             logger.exception("Publication du résultat métrique impossible pour l'import %s.", import_instance.id)
+            controle["statut"] = "REVUE_HUMAINE_REQUISE"
+            import_instance.statut = ImportDonnees.Statut.REVUE_REQUISE
+            import_instance.save(update_fields=("statut", "rapport_analyse"))
+            return Response(
+                {"error": "La publication a échoué. Le document reste en revue."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         enregistrer_evenement(
             action="VALIDATION_ET_PUBLICATION_IMPORT",
@@ -582,7 +783,10 @@ class PredictionAchatView(APIView):
             return Response({"error": "montant_fcfa doit être un nombre."}, status=status.HTTP_400_BAD_REQUEST)
         if montant_decimal <= 0:
             return Response({"error": "montant_fcfa doit être supérieur à 0."}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(predire_kwh(compteur, montant_decimal))
+        prediction = predire_kwh(compteur, montant_decimal)
+        if prediction.get("erreur"):
+            return Response(prediction, status=status.HTTP_409_CONFLICT)
+        return Response(prediction)
 
 
 class EtatTrancheView(APIView):
@@ -592,7 +796,11 @@ class EtatTrancheView(APIView):
         compteur = _compteur_de(request, request.query_params.get("compteur"))
         if compteur is None:
             return Response({"error": "Compteur introuvable."}, status=404)
-        return Response(etat_tranche(compteur))
+        etat = etat_tranche(compteur)
+        return Response(
+            etat,
+            status=status.HTTP_409_CONFLICT if etat.get("erreur") else status.HTTP_200_OK,
+        )
 
 
 def _client_id_valide(request):
@@ -716,6 +924,27 @@ CHAMPS_UTILES_CAPTURE = (
     "numero_compteur", "ancien_index", "nouveau_index",
     "consommation_kwh", "montant_net_paye", "date_facture", "unite",
 )
+CHAMPS_NUMERIQUES_FACTURE = (
+    "ancien_index", "nouveau_index", "consommation_kwh", "montant_net_paye",
+)
+
+
+def _valider_champs_facture(champs):
+    champs_normalises = dict(champs)
+    for cle in CHAMPS_NUMERIQUES_FACTURE:
+        valeur = champs_normalises.get(cle)
+        if valeur is None:
+            continue
+        try:
+            nombre = Decimal(str(valeur).strip().replace(" ", "").replace(",", "."))
+        except (InvalidOperation, TypeError, ValueError) as erreur:
+            raise DRFValidationError({cle: ["Valeur numérique invalide."]}) from erreur
+        if not nombre.is_finite() or abs(nombre) > Decimal("999999999999"):
+            raise DRFValidationError({cle: ["Valeur numérique hors limites."]})
+        champs_normalises[cle] = float(nombre)
+
+    validation = OCRService().valider_champs_energetiques(champs_normalises)
+    return champs_normalises, validation
 
 
 class CaptureImageView(APIView):
@@ -811,6 +1040,43 @@ class CreerImportDepuisCaptureView(APIView):
         if not fichier or not isinstance(champs_confirmes, dict) or not champs_confirmes:
             return Response({"error": "Image et champs confirmés requis."}, status=status.HTTP_400_BAD_REQUEST)
 
+        try:
+            valider_fichier_source(fichier)
+        except DRFValidationError as erreur:
+            return Response({"error": erreur.detail}, status=status.HTTP_400_BAD_REQUEST)
+        extension = fichier.name.rsplit(".", 1)[-1].lower() if "." in fichier.name else ""
+        if extension not in {"jpg", "jpeg", "png", "webp"}:
+            return Response(
+                {"error": "La capture doit être une image JPG, PNG ou WebP."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        champs_autorises = {
+            cle: valeur
+            for cle, valeur in champs_confirmes.items()
+            if cle in CHAMPS_UTILES_CAPTURE
+        }
+        if (
+            not champs_autorises
+            or any(
+                not isinstance(valeur, (str, int, float))
+                or len(str(valeur)) > 100
+                for valeur in champs_autorises.values()
+            )
+        ):
+            return Response(
+                {"error": "Les champs confirmés sont invalides ou hors du périmètre facture."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            champs_autorises, validation = _valider_champs_facture(champs_autorises)
+        except DRFValidationError as erreur:
+            return Response({"error": erreur.detail}, status=status.HTTP_400_BAD_REQUEST)
+        if not validation["valide"]:
+            return Response(
+                {"error": "Les valeurs énergétiques sont incohérentes.", "validation": validation},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         hash_fichier = calculer_hash_fichier(fichier)
         if FichierSource.objects.filter(organisation=organisation, hash=hash_fichier).exists():
             return Response({"error": "Cette photo a déjà été importée."}, status=status.HTTP_409_CONFLICT)
@@ -825,21 +1091,33 @@ class CreerImportDepuisCaptureView(APIView):
             )
             import_instance = ImportDonnees.objects.create(
                 fichier_source=fichier_source, organisation=organisation, lance_par=request.user,
-                nom_fichier=fichier.name, format="IMAGE", type_donnees="FACTURE_SENELEC",
-                donnees_extraites=champs_confirmes,
-                statut=ImportDonnees.Statut.TERMINE,
+                nom_fichier=fichier.name, format="IMAGE", type_donnees="DOCUMENT_ENERGETIQUE_A_REVOIR",
+                donnees_extraites=champs_autorises,
+                statut=ImportDonnees.Statut.REVUE_REQUISE,
                 ocr_statut="TERMINE_VIA_CAPTURE",
                 date_traitement=timezone.now(),
                 nombre_lignes=1,
+                rapport_analyse={
+                    "classification": {
+                        "type": "DOCUMENT_ENERGETIQUE_A_REVOIR",
+                        "decision": "human_review",
+                        "emetteur": "NON_VERIFIE",
+                        "authenticite": {
+                            "statut": "NON_VERIFIEE",
+                            "motif": (
+                                "Les champs fournis par l'analyse d'image ne prouvent "
+                                "pas l'émetteur ni l'origine sénégalaise du document."
+                            ),
+                            "verification_officielle_disponible": False,
+                        },
+                    },
+                    "validation": validation,
+                    "controle_document": {
+                        "statut": "REVUE_HUMAINE_REQUISE",
+                        "verification_officielle": False,
+                    },
+                },
             )
-
-        # Hors transaction : la publication peut appeler le service IA (lent) et
-        # ne doit ni bloquer la base ni annuler l'import déjà enregistré.
-        try:
-            from analysis.views import _publier_resultat_depuis_import
-            _publier_resultat_depuis_import(import_instance)
-        except Exception:
-            logger.exception("Publication du résultat métrique impossible pour l'import %s.", import_instance.id)
 
         enregistrer_evenement(
             action="CREATION_IMPORT_DEPUIS_CAPTURE",

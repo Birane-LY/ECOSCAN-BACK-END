@@ -16,10 +16,12 @@ from .services import BillingAccessService, InvoiceService
 
 class BillingSignalTests(TestCase):
 	def test_essai_standard_commence_apres_approbation_de_l_organisation(self):
-		plan = Plan.objects.create(
+		plan, _ = Plan.objects.get_or_create(
 			code="standard",
-			nom="Standard",
-			prix_mensuel="10000",
+			defaults={
+				"nom": "Standard",
+				"prix_mensuel": "10000",
+			},
 		)
 
 		organisation = Organisation.objects.create(

@@ -1,0 +1,11 @@
+services:
+  home-assistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: ecoscan-home-assistant-dev
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+    environment:
+      TZ: UTC
+    volumes:
+      - ./home-assistant/config:/config

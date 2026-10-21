@@ -3,23 +3,51 @@ services:
     image: n8nio/n8n
     container_name: ecoscan-n8n
     restart: unless-stopped
+    init: true
     ports:
-      - "5678:5678"
+      - "127.0.0.1:5678:5678"
     environment:
       TZ: ${TZ:-Africa/Dakar}
       GENERIC_TIMEZONE: ${TZ:-Africa/Dakar}
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
       N8N_WEBHOOK_TOKEN: ${N8N_WEBHOOK_TOKEN:?Set N8N_WEBHOOK_TOKEN to the Django N8N_WEBHOOK_TOKEN in n8n/.env}
+      N8N_SHARED_SECRET: ${N8N_SHARED_SECRET:-}
       ECOSCAN_NOTIFICATION_FROM_EMAIL: ${ECOSCAN_NOTIFICATION_FROM_EMAIL:?Set ECOSCAN_NOTIFICATION_FROM_EMAIL in n8n/.env}
+      BACKEND_BASE_URL: ${BACKEND_BASE_URL:-http://backend:8000}
       GROQ_API_KEY: ${GROQ_API_KEY:?Set GROQ_API_KEY in n8n/.env}
-      ECOSCAN_INGESTION_URL: ${ECOSCAN_INGESTION_URL:-http://host.docker.internal:8000/api/analyses/opportunites-financement/ingestion/}
+      ECOSCAN_INGESTION_URL: ${ECOSCAN_INGESTION_URL:-http://backend:8000/api/analyses/opportunites-financement/ingestion/}
       N8N_INGESTION_TOKEN: ${N8N_INGESTION_TOKEN:?Set N8N_INGESTION_TOKEN in n8n/.env}
       ECOSCAN_LLM_ENDPOINT: ${ECOSCAN_LLM_ENDPOINT:-https://api.groq.com/openai/v1/chat/completions}
       ECOSCAN_FAST_MODEL: ${ECOSCAN_FAST_MODEL:-openai/gpt-oss-20b}
       ECOSCAN_EXTRACTION_MODEL: ${ECOSCAN_EXTRACTION_MODEL:-openai/gpt-oss-20b}
+      HOME_ASSISTANT_URL: ${HOME_ASSISTANT_URL:-}
+      HOME_ASSISTANT_TOKEN: ${HOME_ASSISTANT_TOKEN:-}
+      ECOSCAN_CLIMATE_ENTITY_IDS: ${ECOSCAN_CLIMATE_ENTITY_IDS:-}
+      ECOSCAN_ENERGY_REPORT_TO_EMAIL: ${ECOSCAN_ENERGY_REPORT_TO_EMAIL:-}
     volumes:
       - n8n_data:/home/node/.n8n
+      - ./workflows:/opt/ecoscan/workflows:ro
+    networks:
+      default:
+      ecoscan-automation:
+        aliases:
+          - ecoscan-n8n
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:5678/healthz', response => process.exit(response.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
 volumes:
   n8n_data:
     external: true
+
+networks:
+  ecoscan-automation:
+    external: true
+    name: ecoscan-automation

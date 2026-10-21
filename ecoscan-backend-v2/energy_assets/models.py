@@ -141,6 +141,134 @@ class ProfilFonctionnement(models.Model):
         return f"{self.equipement.nom} — {self.get_jour_semaine_display()}"
 
 
+class PilotageAutonome(models.Model):
+    """Politique d'autonomie simulée, limitée à un site."""
+
+    site = models.OneToOneField(
+        "organizations.Site",
+        on_delete=models.CASCADE,
+        related_name="pilotage_autonome",
+    )
+    actif = models.BooleanField(default=False)
+    arret_urgence = models.BooleanField(default=False)
+    plafond_puissance_kw = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
+    horaires_actifs = models.BooleanField(default=False)
+    heure_debut = models.TimeField(null=True, blank=True)
+    heure_fin = models.TimeField(null=True, blank=True)
+    confort_actif = models.BooleanField(default=False)
+    temperature_min_c = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    temperature_max_c = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    temperature_simulee_c = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    strategie_automatique = models.BooleanField(default=False)
+    occupation_active = models.BooleanField(default=False)
+    equipements_autorises = models.ManyToManyField(
+        Equipement,
+        blank=True,
+        related_name="politiques_autonomes",
+    )
+    zones_autorisees = models.ManyToManyField(
+        Zone,
+        blank=True,
+        related_name="politiques_autonomes",
+    )
+    derniere_evaluation = models.DateTimeField(null=True, blank=True)
+    date_maj = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.site.nom} — autopilotage simulé"
+
+
+class DecisionAutonome(models.Model):
+    """Journal immuable des décisions prises par l'autopilote simulé."""
+
+    class Statut(models.TextChoices):
+        APPLIED = "APPLIED", "Appliquée en simulation"
+        NO_ACTION = "NO_ACTION", "Aucune action nécessaire"
+        BLOCKED = "BLOCKED", "Action bloquée"
+
+    class Strategie(models.TextChoices):
+        POWER_CAP = "POWER_CAP", "Plafond de puissance"
+        SCHEDULE = "SCHEDULE", "Horaires"
+        COMFORT = "COMFORT", "Confort climatique"
+        AUTOMATIC = "AUTOMATIC", "Arbitrage automatique"
+        UNOCCUPIED_ZONE = "UNOCCUPIED_ZONE", "Zone inoccupée"
+        SYSTEM = "SYSTEM", "Garde-fou"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    site = models.ForeignKey(
+        "organizations.Site",
+        on_delete=models.CASCADE,
+        related_name="decisions_autonomes",
+    )
+    equipement = models.ForeignKey(
+        Equipement,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decisions_autonomes",
+    )
+    strategie = models.CharField(max_length=24, choices=Strategie.choices)
+    statut = models.CharField(max_length=12, choices=Statut.choices)
+    action = models.CharField(
+        max_length=3,
+        choices=(("ON", "En marche"), ("OFF", "À l'arrêt")),
+        blank=True,
+    )
+    raison = models.TextField()
+    puissance_avant_kw = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
+    puissance_apres_kw = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
+    temperature_simulee_c = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    simulation = models.BooleanField(default=True, editable=False)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_creation",)
+        indexes = [
+            models.Index(
+                fields=("site", "date_creation"),
+                name="decision_site_date_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.site.nom} — {self.get_strategie_display()} ({self.get_statut_display()})"
+
+
 class Capteur(models.Model):
     """Associe un capteur physique ou simulé à un équipement."""
 
@@ -204,6 +332,71 @@ class MesureCapteur(models.Model):
 
     def __str__(self):
         return f"{self.capteur.identifiant} — {self.valeur} {self.unite}".strip()
+
+
+class CapteurPresence(models.Model):
+    """Capteur d'occupation associé directement à une zone du site."""
+
+    class Mode(models.TextChoices):
+        SIMULATED = "SIMULATED", "Simulé"
+        REAL = "REAL", "Réel"
+
+    class Statut(models.TextChoices):
+        ACTIVE = "ACTIVE", "Actif"
+        INACTIVE = "INACTIVE", "Inactif"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    zone = models.ForeignKey(
+        Zone,
+        on_delete=models.CASCADE,
+        related_name="capteurs_presence",
+    )
+    identifiant = models.CharField(max_length=120, unique=True)
+    mode = models.CharField(max_length=12, choices=Mode.choices, default=Mode.SIMULATED)
+    occupation_simulee = models.BooleanField(null=True, blank=True, default=None)
+    frequence_secondes = models.PositiveIntegerField(default=15)
+    statut = models.CharField(max_length=10, choices=Statut.choices, default=Statut.ACTIVE)
+    derniere_communication = models.DateTimeField(null=True, blank=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("identifiant",)
+        indexes = [
+            models.Index(
+                fields=("zone", "statut", "mode"),
+                name="presence_zone_status_mode_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return self.identifiant
+
+
+class MesurePresence(models.Model):
+    """État d'occupation horodaté transmis par un capteur de présence."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    capteur = models.ForeignKey(
+        CapteurPresence,
+        on_delete=models.CASCADE,
+        related_name="mesures",
+    )
+    occupee = models.BooleanField()
+    date_mesure = models.DateTimeField()
+    date_reception = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-date_mesure",)
+        indexes = [
+            models.Index(
+                fields=("capteur", "date_mesure"),
+                name="mesure_presence_date_idx",
+            ),
+        ]
+
+    def __str__(self):
+        etat = "occupée" if self.occupee else "inoccupée"
+        return f"{self.capteur.identifiant} — {etat}"
 
 
 class EtatEquipement(models.Model):

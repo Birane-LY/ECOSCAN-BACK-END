@@ -1,0 +1,24 @@
+services:
+  home-assistant-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    env_file:
+      - path: ./gateway/.env
+        required: false
+    environment:
+      DJANGO_BASE_URL: http://backend:8000
+      HOME_ASSISTANT_URL: http://home-assistant:8123
+      HOME_ASSISTANT_ENTITY_MAP_FILE: /app/gateway/equipment-entities.json
+      GATEWAY_OUTBOX_PATH: /app/gateway/data/pending-callbacks.json
+    volumes:
+      - ./gateway/equipment-entities.json:/app/gateway/equipment-entities.json:ro
+      - gateway_outbox:/app/gateway/data
+    command: ["python", "gateway/home_assistant_agent.py"]
+
+volumes:
+  gateway_outbox:

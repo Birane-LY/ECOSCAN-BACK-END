@@ -4,6 +4,7 @@ from rest_framework.routers import SimpleRouter
 from .views import (
     ActionVirtuelleViewSet,
     CapteurViewSet,
+    CapteurPresenceViewSet,
     CommandeEquipementViewSet,
     EquipementViewSet,
     EquipmentTelemetryHistoryView,
@@ -12,8 +13,12 @@ from .views import (
     ProfilFonctionnementViewSet,
     SiteCurrentLoadView,
     SiteMonitoringSummaryView,
+    SiteOccupancyDiagnosticsView,
     SiteTopConsumersView,
     SiteAnomaliesView,
+    SiteAutopilotView,
+    PublicDemoView,
+    MesurePresenceViewSet,
     ZoneViewSet,
 )
 
@@ -28,7 +33,17 @@ router.register(
     basename="profil-fonctionnement",
 )
 router.register("capteurs", CapteurViewSet, basename="capteur")
+router.register(
+    "capteurs-presence",
+    CapteurPresenceViewSet,
+    basename="capteur-presence",
+)
 router.register("mesures", MesureCapteurViewSet, basename="mesure")
+router.register(
+    "mesures-presence",
+    MesurePresenceViewSet,
+    basename="mesure-presence",
+)
 router.register(
     "commandes",
     CommandeEquipementViewSet,
@@ -42,10 +57,21 @@ router.register(
 router.register("etats-equipements", EtatEquipementViewSet, basename="etat-equipement")
 
 urlpatterns = [
+    path("demo/", PublicDemoView.as_view(), name="public-demo"),
+    path(
+        "sites/<uuid:site_id>/autonomie/",
+        SiteAutopilotView.as_view(),
+        name="site-autonomie",
+    ),
     path(
         "sites/<uuid:site_id>/monitoring/summary/",
         SiteMonitoringSummaryView.as_view(),
         name="site-monitoring-summary",
+    ),
+    path(
+        "sites/<uuid:site_id>/occupancy-diagnostics/",
+        SiteOccupancyDiagnosticsView.as_view(),
+        name="site-occupancy-diagnostics",
     ),
     path(
         "sites/<uuid:site_id>/monitoring/current-load/",

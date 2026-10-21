@@ -1,3 +1,16 @@
 {
-  "replace-with-equipment-uuid": "switch.replace_with_home_assistant_entity"
+  "4d996303-4a7b-4b97-979c-d859ea2b4f2d": "input_boolean.ecoscan_test_actuator",
+  "8f4b3782-ffa1-49c3-9331-78768e2f12fb": "input_boolean.ecoscan_demo_climatisation_espace_client",
+  "d17b5988-580f-46d9-836d-4a718fa9a44d": "input_boolean.ecoscan_demo_pompe_relevage",
+  "df9f537f-2ff5-4a8e-9a4b-5a68764b33a0": "input_boolean.ecoscan_demo_postes_informatiques",
+  "8595b49f-dc09-49a5-9054-3b9dac17627e": "input_boolean.ecoscan_demo_eclairage_accueil",
+  "c7316ee1-2bf1-4a21-843d-f37c62e709ac": "input_boolean.ecoscan_demo_climatisation_open_space",
+  "9dcb4c02-3cc4-47e9-a888-1e4f4d792e7f": "input_boolean.ecoscan_demo_climatisation_reunion",
+  "aeb0513b-db2a-4863-a09a-31192379b18c": "input_boolean.ecoscan_demo_ecran_hall",
+  "79496f35-a620-49ea-8bec-ebb8a66931ca": "input_boolean.ecoscan_demo_eclairage_bureaux",
+  "0fced477-82ce-49f6-8949-c853f59b0518": "input_boolean.ecoscan_boulangerie_chambre_froide",
+  "606aacbb-246e-4a9b-9862-2bd4591c6b6d": "input_boolean.ecoscan_boulangerie_climatisation_atelier",
+  "a4d98fa2-6b08-4b42-a5ba-ef56e027030a": "input_boolean.ecoscan_boulangerie_four_industriel",
+  "18a1979b-e4c8-4c3f-a8ce-1d89fa78ea83": "input_boolean.ecoscan_boulangerie_petrin",
+  "5dfbfd28-466d-4795-8aa3-0ae5bbdc723c": "input_boolean.ecoscan_boulangerie_eclairage_production"
 }

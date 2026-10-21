@@ -54,11 +54,8 @@ class Recommandation(models.Model):
 
     def marquer_comme_decidee(self):
         """Valide l'adoption de la recommandation, fige la date d'arbitrage, et
-        fait progresser l'Objectif lié d'autant que l'économie estimée — c'est
-        aujourd'hui la SEULE façon dont un Objectif progresse (aucun calcul
-        automatique depuis les métriques réelles n'existe encore, et ce n'est
-        pas ajouté ici pour ne pas présenter une progression déduite comme une
-        mesure certaine)."""
+        fait progresser la valeur déclarée de l'objectif de l'économie estimée.
+        La progression mesurée à partir des capteurs reste un indicateur distinct."""
         if self.statut == self.Statut.DECIDEE:
             # Idempotent : sans cette garde, un second appel (double clic, rejeu
             # réseau) ajoutait l'économie estimée une deuxième fois à l'Objectif.
@@ -82,7 +79,8 @@ class Recommandation(models.Model):
 class Action(models.Model):
     """Étape opérationnelle concrète découlant d'une recommandation d'efficacité énergétique.
 
-    Permet de suivre l'avancement technique sur le terrain et d'affecter un responsable.
+    Permet de suivre l'avancement technique sur le terrain, d'affecter un responsable
+    et de mesurer les économies énergétiques depuis les relevés d'un équipement.
     """
 
     class Statut(models.TextChoices):
@@ -103,15 +101,32 @@ class Action(models.Model):
         blank=True,
         related_name="actions_responsables",
     )
+    equipement = models.ForeignKey(
+        "energy_assets.Equipement",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="actions",
+    )
     date_echeance = models.DateTimeField(null=True, blank=True)
     date_realisation = models.DateTimeField(null=True, blank=True)
 
-    # Mesure d'impact réel (impact_service.py) — distincts de
-    # Recommandation.economie_estimee, qui reste la prévision AVANT exécution.
-    # Restent à None tant qu'aucune mesure n'a été faite 
+    # L'impact financier reste une saisie humaine ; l'impact énergétique est
+    # mesuré séparément à partir des index cumulatifs du capteur ENERGY.
     economie_realisee_fcfa = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     taux_realisation_impact = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     date_mesure_impact = models.DateTimeField(null=True, blank=True)
+    energie_reference_kwh = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
+    energie_post_action_kwh = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
+    economie_energie_kwh = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
+    capteur_impact = models.ForeignKey(
+        "energy_assets.Capteur",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="impacts_actions",
+    )
+    date_mesure_energie = models.DateTimeField(null=True, blank=True)
 
     def suivre(self):
         """Passe l'étape opérationnelle en cours de traitement sur le terrain."""

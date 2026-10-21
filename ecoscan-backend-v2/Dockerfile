@@ -20,7 +20,7 @@ COPY . .
 
 RUN addgroup --system app \
     && adduser --system --ingroup app app \
-    && mkdir -p /app/media \
+    && mkdir -p /app/media /app/gateway/data \
     && chown -R app:app /app
 
 USER app

@@ -555,10 +555,12 @@ class AccountsModuleTests(APITestCase):
 
     @patch.dict("os.environ", {"BREVO_API_KEY": "", "BREVO_SENDER_EMAIL": ""})
     def test_echec_brevo_laisse_la_demande_en_attente(self):
-        Plan.objects.create(
+        Plan.objects.get_or_create(
             code="standard",
-            nom="Standard",
-            prix_mensuel="10000",
+            defaults={
+                "nom": "Standard",
+                "prix_mensuel": "10000",
+            },
         )
         demandeur = Utilisateur.objects.create_user(
             email="demandeur-brevo@example.com",

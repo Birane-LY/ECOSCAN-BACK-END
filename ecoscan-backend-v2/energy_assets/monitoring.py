@@ -66,13 +66,26 @@ def _consommation_periode(capteurs, debut, fin):
     total = Decimal("0")
     total_capteurs = len(capteurs)
     capteurs_complets = 0
+    debut_couverture = debut
 
     for capteur in capteurs:
-        baseline = (
-            capteur.mesures.filter(date_mesure__lt=debut)
-            .order_by("-date_mesure", "-date_reception")
-            .first()
-        )
+        if capteur.mode == Capteur.Mode.SIMULATED:
+            baseline = (
+                capteur.mesures.filter(
+                    date_mesure__gte=debut,
+                    date_mesure__lt=fin,
+                )
+                .order_by("date_mesure", "date_reception")
+                .first()
+            )
+            if baseline:
+                debut_couverture = max(debut_couverture, baseline.date_mesure)
+        else:
+            baseline = (
+                capteur.mesures.filter(date_mesure__lt=debut)
+                .order_by("-date_mesure", "-date_reception")
+                .first()
+            )
         derniere = (
             capteur.mesures.filter(date_mesure__lt=fin)
             .order_by("-date_mesure", "-date_reception")
@@ -105,11 +118,27 @@ def _consommation_periode(capteurs, debut, fin):
         return None, {
             "complete_sensors": capteurs_complets,
             "total_sensors": total_capteurs,
-        }
+        }, None
     return total, {
         "complete_sensors": capteurs_complets,
         "total_sensors": total_capteurs,
+    }, debut_couverture
+
+
+def _mode_telemetrie(capteurs):
+    modes = {
+        capteur.mode
+        for capteur in capteurs
+        if capteur.statut == Capteur.Statut.ACTIVE
+        and capteur.type.strip().upper() in ("POWER", "ENERGY")
     }
+    if not modes:
+        return "NONE"
+    if modes == {Capteur.Mode.SIMULATED}:
+        return "SIMULATED"
+    if modes == {Capteur.Mode.REAL}:
+        return "REAL"
+    return "MIXED"
 
 
 def obtenir_indicateurs_site(site):
@@ -128,21 +157,34 @@ def obtenir_indicateurs_site(site):
             type__iexact="ENERGY",
         )
     )
-    energie_aujourd_hui, couverture_aujourd_hui = _consommation_periode(
+    (
+        energie_aujourd_hui,
+        couverture_aujourd_hui,
+        energie_aujourd_hui_depuis,
+    ) = _consommation_periode(
         capteurs_energie,
         debut_aujourd_hui,
         maintenant,
     )
-    energie_hier, couverture_hier = _consommation_periode(
+    energie_hier, couverture_hier, _ = _consommation_periode(
         capteurs_energie,
         debut_hier,
         debut_aujourd_hui,
     )
-    energie_mois, couverture_mois = _consommation_periode(
+    energie_mois, couverture_mois, _ = _consommation_periode(
         capteurs_energie,
         debut_mois,
         maintenant,
     )
+    capteurs_site = [
+        capteur
+        for equipement in equipements
+        for capteur in equipement.capteurs.all()
+    ]
+    modes_par_equipement = {
+        equipement.id: _mode_telemetrie(equipement.capteurs.all())
+        for equipement in equipements
+    }
     puissances = {
         equipement.id: _puissance_actuelle(equipement)
         for equipement in equipements
@@ -164,6 +206,7 @@ def obtenir_indicateurs_site(site):
                     etat.etat_rapporte if etat else Equipement.Etat.UNKNOWN
                 ),
                 "is_online": not _est_hors_ligne(equipement, date_limite),
+                "telemetry_mode": modes_par_equipement[equipement.id],
             }
         )
 
@@ -194,6 +237,8 @@ def obtenir_indicateurs_site(site):
         "site_name": site.nom,
         "current_power_kw": puissance_totale,
         "today_energy_kwh": energie_aujourd_hui,
+        "today_energy_since": energie_aujourd_hui_depuis,
+        "telemetry_mode": _mode_telemetrie(capteurs_site),
         "yesterday_energy_kwh": energie_hier,
         "month_energy_kwh": energie_mois,
         "energy_coverage": {
