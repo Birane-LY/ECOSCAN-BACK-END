@@ -23,7 +23,7 @@ services:
       - key: PROVISION_DEMO_READER
         value: "false"
       - key: AI_SERVICE_URL
-        value: http://127.0.0.1:8001
+        value: https://ecoscan-ai-63na.onrender.com
       - key: AI_SERVICE_INTERNAL_TOKEN
         generateValue: true
       - key: DJANGO_INTERNAL_TOKEN

@@ -202,7 +202,11 @@ réciproquement.
   internes prévues pour les services EcoScan.
 - `AI_SERVICE_URL`, `AI_SERVICE_INTERNAL_TOKEN` et `AI_SERVICE_TIMEOUT`
   configurent l’accès au service d’IA. Dans le Compose principal, l’URL est
-  remplacée par `http://ai-service:8001`.
+  remplacée par `http://ai-service:8001`. Sur Render, Django doit utiliser
+  l’URL HTTPS publique du service IA (`https://ecoscan-ai-63na.onrender.com`),
+  car `localhost` désigne le conteneur Django lui-même. La valeur du secret
+  `AI_SERVICE_INTERNAL_TOKEN` côté Django doit correspondre à `INTERNAL_TOKEN`
+  côté IA.
 - `PAYDUNYA_MASTER_KEY`, `PAYDUNYA_PRIVATE_KEY`, `PAYDUNYA_PUBLIC_KEY` et
   `PAYDUNYA_TOKEN` sont les identifiants PayDunya; `PAYDUNYA_MODE=test` permet
   de rester en mode de test.
