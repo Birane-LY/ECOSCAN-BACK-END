@@ -29,4 +29,4 @@ services:
       - key: DJANGO_INTERNAL_TOKEN
         generateValue: true
       - key: CORS_ALLOWED_ORIGINS
-        value: https://ecoscan-front-end-ecoscan-front-end.vercel.app
+        value: https://ecoscan-front-end-ecoscan-front-end.vercel.app,https://ecoscan-mobile.vercel.app
