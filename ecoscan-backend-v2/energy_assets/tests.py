@@ -2971,3 +2971,165 @@ class DemoScenarioSimulatorSelectionTests(TestCase):
 
         energy.assert_called_once_with(organisation_id=demo.id)
         presence.assert_called_once_with(organisation_id=demo.id)
+
+    def test_demo_simulator_reduces_stale_simulated_energy_sensor_frequency(self):
+        demo = Organisation.objects.create(
+            nom="Organisation simulation",
+            secteur="Services",
+            localisation="Dakar",
+            statut=Organisation.Statut.ACTIVE,
+            details_demande={"ecoscan_demo_scenario": "hotel"},
+        )
+        site = Site.objects.create(
+            organisation=demo,
+            nom="Site de démonstration",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        equipment = Equipement.objects.create(
+            site=site,
+            nom="Compteur simulé",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="5.000",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="DEMO-ENERGY-CADENCE-001",
+            type="ENERGY",
+            mode=Capteur.Mode.SIMULATED,
+            frequence_secondes=3600,
+        )
+        real_sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="DEMO-REAL-ENERGY-CADENCE-001",
+            type="ENERGY",
+            mode=Capteur.Mode.REAL,
+            frequence_secondes=3600,
+        )
+        power_sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="DEMO-POWER-CADENCE-001",
+            type="POWER",
+            mode=Capteur.Mode.SIMULATED,
+            frequence_secondes=3600,
+        )
+        client = Organisation.objects.create(
+            nom="Organisation client",
+            secteur="Services",
+            localisation="Dakar",
+            statut=Organisation.Statut.ACTIVE,
+        )
+        client_site = Site.objects.create(
+            organisation=client,
+            nom="Site client",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        client_equipment = Equipement.objects.create(
+            site=client_site,
+            nom="Compteur client",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="5.000",
+        )
+        client_sensor = Capteur.objects.create(
+            equipement=client_equipment,
+            identifiant="CLIENT-ENERGY-CADENCE-001",
+            type="ENERGY",
+            mode=Capteur.Mode.SIMULATED,
+            frequence_secondes=3600,
+        )
+
+        with (
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_capteurs_simules",
+                return_value=0,
+            ),
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_presence_simulees",
+                return_value=0,
+            ),
+        ):
+            call_command(
+                "simuler_capteurs",
+                "--once",
+                "--demo-scenarios",
+                "--no-autopilot",
+            )
+
+        sensor.refresh_from_db()
+        real_sensor.refresh_from_db()
+        power_sensor.refresh_from_db()
+        client_sensor.refresh_from_db()
+        self.assertEqual(sensor.frequence_secondes, 15)
+        self.assertEqual(real_sensor.frequence_secondes, 3600)
+        self.assertEqual(power_sensor.frequence_secondes, 3600)
+        self.assertEqual(client_sensor.frequence_secondes, 3600)
+
+    def test_simulator_adjusts_explicitly_selected_simulated_energy_sensors(self):
+        organisation = Organisation.objects.create(
+            nom="Organisation ciblée",
+            secteur="Services",
+            localisation="Dakar",
+            statut=Organisation.Statut.ACTIVE,
+        )
+        site = Site.objects.create(
+            organisation=organisation,
+            nom="Site ciblé",
+            adresse="Dakar",
+            pays="Sénégal",
+            fuseau_horaire="Africa/Dakar",
+        )
+        equipment = Equipement.objects.create(
+            site=site,
+            nom="Compteur simulé",
+            categorie="COMPTEUR",
+            puissance_nominale_kw="5.000",
+        )
+        sensor = Capteur.objects.create(
+            equipement=equipment,
+            identifiant="TARGETED-ENERGY-CADENCE-001",
+            type="ENERGY",
+            mode=Capteur.Mode.SIMULATED,
+            frequence_secondes=3600,
+        )
+
+        with (
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_capteurs_simules",
+                return_value=0,
+            ),
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_presence_simulees",
+                return_value=0,
+            ),
+        ):
+            call_command(
+                "simuler_capteurs",
+                "--once",
+                "--organisation-id",
+                str(organisation.id),
+                "--no-autopilot",
+            )
+
+        sensor.refresh_from_db()
+        self.assertEqual(sensor.frequence_secondes, 15)
+
+    def test_demo_simulator_can_skip_autopilot_evaluation(self):
+        with (
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_capteurs_simules",
+                return_value=0,
+            ),
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.generer_mesures_presence_simulees",
+                return_value=0,
+            ),
+            patch(
+                "energy_assets.management.commands.simuler_capteurs.evaluer_pilotage_autonome"
+            ) as autopilot,
+        ):
+            call_command("simuler_capteurs", "--once", "--no-autopilot")
+
+        autopilot.assert_not_called()
